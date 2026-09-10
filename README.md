@@ -3,12 +3,14 @@
 The hard-task bar for [`ripen`](https://github.com/codimango/ripen) loops.
 
 Ripen owns the loop — rounds, signals, classification, the pre-push gate, the journal, the
-wait, the endings. Assay owns the three things ripen has no opinion about:
+wait, the endings. Assay owns the four things ripen has no opinion about:
 
 - **what counts as hard** — pooled band with a Wilson interval, strongest-cohort mixedness,
   two-family and two-category hardness, per-step pass-and-failure, single-gate coverage;
 - **the integrity checks ripen's gate does not carry** — the `tests/config.json` config-integrity
   block, and reward unforgeability where a candidate-controlled pre-grade execution point exists;
+- **the AAI Labs tag set** — the recipe, team, provenance and 1P tags, only one of which any
+  gate enforces (see below);
 - **how ripen's endings map to a reportable terminal state** — `converged` / `escalated` /
   `abandoned` / `blocked-on-platform` → GREEN — HARD / GREEN — MEDIUM / IMPROVED / ESCALATED /
   REJECTED — NOT HARD / BLOCKED — PLATFORM.
@@ -32,6 +34,30 @@ invoked at named points inside ripen's loop:
 
 Ripen's journal (`.ripen/<task>.json`) stays the only ledger. Assay writes one file, the intake
 hypothesis at `$REPO_ROOT/.ripen/<task>-intake.md`, deliberately outside the task tree.
+
+## Tags
+
+Every task assay gates carries these in `[metadata].tags`, appended to whatever ripen already
+wrote (`ripen-v1` stays):
+
+| Tag | What it is | Enforced by |
+|---|---|---|
+| `assay-v1` | The recipe name | nothing |
+| `aai-labs` | Labs throughput attribution | ripen's gate |
+| `aai-labs-<project>` | The team tag, derived from the repo slug `codimango/swe-bench-aai-labs-<project>` — e.g. `aai-labs-ollo` | nothing |
+| `semi-synthetic` | Produced through an assisted recipe | nothing |
+| `private_repos_1p` | Every AAI Labs task is 1P | nothing |
+| `long-horizon` | Only at 10k+ LOC or 1hr+ | nothing |
+
+Plus the track's base tags (`swe-bench-pro`, `SWEBench-External`) and the descriptive ones —
+language, task type, framework.
+
+**Five of the six are unenforced.** Ripen's gate blocks a push missing `ripen-v1` or `aai-labs`
+via `labs_scope.sh`; nothing checks the rest, and a missing `private_repos_1p` is a High finding
+at review (`review-task-swebench-licensed`). §4 and the §5 checklist carry the detail. The
+durable fix is a gate row — the same argument §6 makes for the config-integrity block.
+
+Convention verified against `swebench-meta-project-guide` and `swebench-licensed-guide`.
 
 ## Composes with
 
