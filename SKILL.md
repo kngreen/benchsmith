@@ -106,6 +106,39 @@ Ripen STEP S governs. Three additions:
 - If behavioural requirements are absent, stop after scaffolding and ask for them. Do not
   invent them.
 
+### Tags — set on the first round, before the first push
+
+`[metadata].tags` in `task.toml` must carry all of these, **added to** whatever is already there.
+Never replace the existing list: ripen writes `ripen-v1` and it stays.
+
+| Tag | What it is | Enforced by |
+|---|---|---|
+| `assay-v1` | The recipe name — this task was built and gated under assay | **nothing — you** |
+| `aai-labs` | Labs attributes throughput by this tag; an untagged Labs task is invisible | ripen's gate |
+| `aai-labs-<project>` | **The team tag.** Derive it from the task repo slug: `codimango/swe-bench-aai-labs-<project>` → `aai-labs-<project>`. For `swe-bench-aai-labs-ollo` that is `aai-labs-ollo` | **nothing — you** |
+| `semi-synthetic` | Provenance: produced through an assisted recipe, not hand-authored end to end | **nothing — you** |
+| `private_repos_1p` | Every AAI Labs task is 1P | **nothing — you** |
+| `long-horizon` | Only when the task is 10k+ LOC or 1hr+ of work | conditional, **you** |
+
+Plus the track's own base tags — `swe-bench-pro` and `SWEBench-External` on SWE-Bench Pro — and
+the ordinary descriptive ones: language, task type, framework. A complete Labs line looks like:
+
+```toml
+tags = ["swe-bench-pro", "SWEBench-External", "private_repos_1p", "aai-labs", "aai-labs-ollo",
+        "semi-synthetic", "assay-v1", "ripen-v1"]
+```
+
+**Only `aai-labs` is enforced.** Ripen's gate blocks a push missing `ripen-v1` or `aai-labs` (via
+`labs_scope.sh`) and knows nothing about the rest. Nothing will tell you the team tag is absent —
+add them at scaffold time and check them before every push.
+
+`long-horizon` here is a scope tag and **never** a routing signal — the track comes from the
+platform (§2), not from this list.
+
+**Declared `difficulty` must not silently disagree with the measured classification.** Leave it
+unchanged while the measurement is in flux; set it in the same commit that records the
+measured-difficulty evidence, and never set it to satisfy a metadata requirement (§8).
+
 Freeze the participant-visible behavioural contract before the first cloud round. Every later
 assertion must be entailed by that contract. **Adding an independently shippable requirement to
 push the rate down is conjunction inflation, not hardening.**
@@ -135,6 +168,9 @@ not converged until they hold on the exact final SHA:
       not missing.
 - [ ] The task stays hard when the wording is clear. A task that becomes easy once ambiguity
       and leakage are removed was never hard.
+- [ ] `[metadata].tags` carries `assay-v1`, `aai-labs`, the `aai-labs-<project>` team tag,
+      `semi-synthetic` and `private_repos_1p` (§4), and declared `difficulty` matches the
+      measured classification. Only `aai-labs` is gate-enforced — check the rest by eye.
 
 ### Measurement discipline
 
