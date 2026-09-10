@@ -1,18 +1,18 @@
 ---
-name: temper
-description: The hard-task bar and hardening guidance for ripen loops — pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage, plus the integrity checks ripen's gate does not carry. Invoked at ripen STEP 2 and STEP 3, never as a driver. Use when deciding whether a Codimango task is genuinely hard, whether a round's failures count as hardness evidence, which lever to pull on a too-easy task, or which terminal state to report.
+name: assay
+description: The hard-task bar for ripen loops — pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage, plus the integrity checks ripen's gate does not carry. Invoked at ripen STEP 2 and STEP 3, never as a driver. Use when deciding whether a Codimango task is genuinely hard, whether a round's failures count as hardness evidence, which lever to pull on a too-easy task, or which terminal state to report.
 ---
 
-# Temper
+# Assay
 
 **You are not a loop.** Ripen owns the rounds: signals, classification, the pre-push gate, the
 journal, the wait, the endings. Do not restate or re-implement any of it, and do not run a
 second loop spec alongside it.
 
-Temper owns the three things ripen has no opinion about — what counts as *hard*, the integrity
+Assay owns the three things ripen has no opinion about — what counts as *hard*, the integrity
 checks its gate does not carry, and how its endings map to a reportable terminal state.
 
-Where the two disagree: **ripen wins on mechanics, temper wins on the bar.**
+Where the two disagree: **ripen wins on mechanics, assay wins on the bar.**
 
 ## When to invoke
 
@@ -21,7 +21,7 @@ Where the two disagree: **ripen wins on mechanics, temper wins on the bar.**
 | Before scaffolding a new task, or revising one with no recorded intake | §1–§4 |
 | Ripen STEP 2, the terminal check | §5 — the bar |
 | Ripen STEP 3, classifying a round | §7 — cause → class |
-| Ripen STEP 5, before a push that touches the graded surface | §6 — integrity |
+| Ripen STEP 5, before a graded-surface push | §6 — integrity |
 | A too-easy or too-hard round | §8 |
 | Any ending | §10 |
 
@@ -31,6 +31,19 @@ Where the two disagree: **ripen wins on mechanics, temper wins on the bar.**
 doc, or any second state file. If a repo already has one, leave it and do not follow it —
 another system's *gate* still has to pass, but its *instructions* do not. Repository
 `AGENTS.md` is additive.
+
+## Compose, do not reimplement
+
+Each of these owns a rubric or a measurement that drifts independently of this file. Call them;
+do not restate their contents here.
+
+| When | Skill |
+|---|---|
+| Screening an idea before you build it | `task-hardness-screen` — §3 |
+| Per-step calibration on a multi-turn task | `mt-calibrate` — §5 |
+| Is a non-pass genuine, or a grader false negative? | `task-fairness-signal` — §7 |
+| Contamination, recall and portfolio dedup on an idea | `swebench-idea-triage`, or the track's own check |
+| Everything about running the loop | `ripen` |
 
 ---
 
@@ -55,30 +68,33 @@ flow this resolves to; do not hand-roll the tree.
 
 ## 3. Intake — before scaffolding, or before revising a task with no recorded intake
 
-Write the hardness hypothesis to `$REPO_ROOT/.ripen/<task>-intake.md`. It goes **outside** the
-task directory: ripen's task tree is a fixed list and working notes do not belong in it.
+**Run `task-hardness-screen` first.** It owns the kill-tests — fetch-leak, pure-recall,
+in-repo-oracle, genuinely-easy, famous-spec, single-gate, irregularity — and the residual
+hard-core judgment, and it emits GO / DERISK / KILL. Do not restate its tests here and do not
+hand-roll a substitute.
 
-The hypothesis names the reasoning required, the interacting invariants, the semantic mistakes
-strong agents will plausibly make, and how each is behaviourally and fairly testable.
+- **KILL** — stop. Do not scaffold.
+- **DERISK** — build the minimal probe it asks for, not the full harness.
+- **GO** — continue below.
 
-Reject the candidate when:
+It deliberately does not check contamination, recall or portfolio dedup; route those to
+`swebench-idea-triage` or the track's own check.
 
-- difficulty comes mainly from volume, mechanical copying, repo search, ambiguity, obscure
-  facts, flaky concurrency, missing dependencies, or time pressure;
-- **the single-gate kill test fires** — one decision or assertion explains essentially all
-  failures, so the task is all-fail without the cue and all-pass the moment it is reachable;
-- the discriminator is already given away by a schema comment, docstring, or the majority of
-  existing call sites — a documented invariant is a stronger hint than any instruction;
-- the discriminator is satisfied merely by unifying duplicated code paths, which measures
-  refactoring style rather than comprehension;
-- fewer than **two semantically independent** reasoning challenges survive, neither collapsing
-  into the other under consolidation.
+Three things it does not cover, which assay requires:
 
-Never use changed-line count, file count, or patch size as difficulty evidence.
+1. **Two independent challenges, not one.** The screen asks you to name *one* residual hard
+   core. The §5 bar needs hardness spread across **two semantically independent** behaviour
+   categories, neither collapsing into the other under consolidation. Name both at intake, or
+   expect to fail the bar later with no lever left.
+2. **Size is not difficulty.** Never use changed-line count, file count, or patch size as
+   evidence, in either direction.
+3. **Write it down.** Put the hypothesis — both cores, the interacting invariants, and how each
+   is behaviourally and fairly testable — at `$REPO_ROOT/.ripen/<task>-intake.md`. **Outside**
+   the task directory: ripen's task tree is a fixed list and working notes do not belong in it.
 
 If no credible hardening hypothesis remains, say so and continue only if the task can still be
-fair, useful and plausibly non-EASY. Do not claim hard. Pre-scaffold rejection is available
-only in new-task mode, before any task or SHA exists.
+fair, useful and plausibly non-EASY. Do not claim hard. Pre-scaffold rejection is available only
+in new-task mode, before any task or SHA exists.
 
 ## 4. Scaffold and author
 
@@ -107,14 +123,14 @@ not converged until they hold on the exact final SHA:
       saturated or starved member fails this by itself. Avocado/MetaCode substitutes for a
       missing GPT/Opus cohort only when the platform designates it.
 - [ ] At least **two model families** produce a genuine semantic failure, and those failures
-      span at least **two independent behaviour categories**. One trial counts for one category.
+      span the **two independent behaviour categories** named at intake. One trial counts for
+      one category.
 - [ ] **Every intended step** has at least one genuine pass and one genuine semantic failure.
-      An unreached step is neither.
+      An unreached step is neither. On a multi-turn task take this read from **`mt-calibrate`**,
+      which calibrates each step in isolation at k≥10 — a five-trial cascade cannot tell an
+      unreached step from a failed one.
 - [ ] **No single decision explains ≥ 80%** of strongest-member semantic failures.
-- [ ] Every non-pass in the denominator is a genuine semantic failure. Infra, grader false
-      negatives, ambiguity, unrelated candidate slips, timeouts and arbitrary hidden corners do
-      not establish hardness — and ripen's `dominant-blocker` and `suspect-golden` classes are
-      the usual way a grader false negative disguises itself as one.
+- [ ] Every non-pass in the denominator is a genuine semantic failure — see §7.
 - [ ] The exact-SHA difficulty judgment is **HARD** (or MEDIUM under §8) — not EASY, not stale,
       not missing.
 - [ ] The task stays hard when the wording is clear. A task that becomes easy once ambiguity
@@ -180,8 +196,10 @@ as uncovered. Do not report it as clean.
 
 ## 7. Cause → ripen class
 
-Record exactly one ripen class per round via `record_round.sh`; it validates the label and
-overrides it when the evidence disagrees. Map cause to class:
+**`task-fairness-signal` owns the attribution.** It audits trajectories and verifier logs per
+trial, separates infra from ambiguity from reasoning, and returns OK / REVIEW / NEEDS_REVISION.
+Run it before calling anything hardness evidence; do not eyeball a trajectory and decide. Then
+map its answer onto ripen's classes:
 
 | Cause | Ripen class | Counts toward the bar? |
 |---|---|---|
