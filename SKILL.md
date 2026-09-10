@@ -263,14 +263,74 @@ null` and `[]` are different answers and must never be classified alike.
 Signals: pooled above 0.50, any strongest member above 0.60, only one failing family, or an
 EASY/MEDIUM verdict.
 
-Audit leakage and over-specification first. Then derive **one** general discriminator from the
-frozen contract, preregister it, replay it against every available trajectory, and submit only
-if it catches a **majority** of the target cohort without rejecting golden or any valid
-alternative. Never pick a discriminator by kill count, or against an outcome-selected subset.
+**Hardening is a campaign, not a shot.** A too-easy task with a clean oracle is sound and
+under-hardened, which is a job. Audit leakage and over-specification first — that is free — then
+run the cycle below. Do not derive a lever, replay it, and stop.
 
-**One lever per push, and the budget is per task** (`RIPEN_HARDENING_BUDGET`, default 5). A lever
-that fails locally spends nothing — try another. **Stopping with budget unspent is an unfinished
-job, not a finding.**
+#### H1 — Mine the repo's own calibrated hard tasks
+
+Before proposing anything, read **two or three tasks in this repo that measured HARD and were
+accepted**. Extract the *mechanism* each used, never the content: what behaviour the
+discriminator turned on, why the contract already entailed it, what made it survive
+consolidation. Add the Harvester difficulty-levers catalogue. Write the patterns to
+`$REPO_ROOT/.ripen/<task>-hardening.md` — a working note, outside the task tree.
+
+A lever invented from first principles when three calibrated neighbours are sitting in the same
+repo is a wasted round.
+
+#### H2 — Freeze a ranked slate, not a single lever
+
+Produce **at least three** candidate levers, ranked, each with: the behaviour it targets, the
+contract clause that already entails it, the predicted per-cohort catch, and the way it could
+fail. Record declared levers in `.loop/levers.md` per ripen.
+
+**Freeze the whole slate before the first replay**, and hash it. This is what makes falling
+through to lever 2 legitimate: you are executing a plan that predates the evidence, not choosing
+against it. What preregistration forbids is *revising a lever after seeing how it did on that
+corpus* — it has never forbidden the next lever on a frozen list. A loop that reads it that way
+turns the first miss into task death.
+
+#### H3 — Validate the slate with a second agent
+
+Hand a fresh agent the frozen contract, the measured gap as integer counts, and the slate —
+**not** the trajectories, not the replay results, not the corpus. Ask one question per lever:
+does this actually close the named gap, and is it entailed by the contract as written?
+
+It rejects any lever that is a hidden test (fires on a convention nobody stated), that
+re-measures what an existing assertion already covers, or that would starve a strongest cohort.
+Rejections happen before any replay, so they cost nothing.
+
+#### H4 — Execute down the slate
+
+Replay lever 1 against the frozen corpus. Adopt it only if it catches a **majority** of every
+target cohort without rejecting golden, rejecting a valid alternative, or pushing any strongest
+member below 0.20. If it fails, record why and **take the next lever off the slate** — no
+re-derivation, no revision of the one that failed.
+
+One lever per *push*; `RIPEN_HARDENING_BUDGET` (default 5) counts pushes, not attempts. **A lever
+that dies at local replay spends nothing.**
+
+#### What does not stop the campaign
+
+Each of these has ended a run early. None of them is a finding:
+
+- a lever failing local replay — no budget was spent, and the slate has more;
+- one cohort under the catch threshold, or a lever that would starve the strongest member — that
+  rejects the *lever*, which is the mechanism working;
+- "selecting another lever would be outcome selection" — not when the slate was frozen first
+  (H2). Say which lever you are on and keep going;
+- round count, or a long `corrective` / `infra` / `platform-stale` streak.
+
+#### What does stop it
+
+- **Slate exhausted and budget spent** → `escalated` with the evidence pack: every lever
+  declared, what the band did, what you would try next. Never `abandoned`.
+- **The premise is wrong** → `abandoned`, and say it on round 2, not round 12.
+
+**Stopping with budget unspent is an unfinished job, not a finding.** Ripen enforces the floor —
+`record_round.sh` refuses `--status abandoned` while the oracle passes and budget remains — so a
+run that reports REJECTED from an unspent budget bypassed the recorder. Treat that report as a
+bug in the run, not a verdict on the task.
 
 ### Three rules that override intuition
 
@@ -352,6 +412,11 @@ Ripen's ending is the mechanism; the terminal state is what you report.
 
 Keep `blocked-on-platform`. A known-stale gate is not a finding, not a clearance and not an
 escalation, and the same blocker has otherwise produced three different endings on three tasks.
+
+**REJECTED — NOT HARD has a precondition.** It requires a wrong premise, or a spent hardening
+budget *and* an exhausted slate (§8). A too-easy task with a passing oracle and unspent budget is
+not rejected — it is unfinished, and the correct report is which lever you are on. If a run
+produced REJECTED from an unspent budget, re-open it at §8 H1 rather than accepting the verdict.
 
 **Refresh the task README before any ending** — latest run only, per-model rates over the scored
 denominator, trials split passed / failed / errored, the failure pattern where
