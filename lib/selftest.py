@@ -4176,5 +4176,44 @@ check("the rendering says nothing was submitted",
       "Nothing has been submitted" in rrp.render(_res), True)
 
 
+# --- publishing a skill so a session can resolve it ---------------------------
+#
+# `~/.claude/skills/` is a Claude Code root, not an AgentCloud one. A skill that
+# lives only there works in the terminal and not in a session, and the failure
+# is not clear: an agent hunts the registry, finds nothing, and asks for an
+# alias that does not exist. One waited three hours.
+
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location(
+    "publish_skill", "/home/kngreen/.claude/skills/benchsmith/scripts/publish_skill.py")
+_pub_mod = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_pub_mod)
+
+_sk = Path(tempfile.mkdtemp()) / "demo-skill"
+(_sk / "references").mkdir(parents=True)
+(_sk / "lib").mkdir()
+(_sk / "SKILL.md").write_text("---\nname: demo-skill\ndescription: A demo.\n---\n\nBody.\n")
+(_sk / "references" / "tpl.md").write_text("template\n")
+
+_files = _pub_mod.build(_sk)
+check("SKILL.md is published", _files[0]["path"], "SKILL.md")
+check("references ship", [f["path"] for f in _files[1:]], ["references/tpl.md"])
+_bind = _files[0]["content"]
+check("the preamble searches the reader's own HOME first",
+      _bind.index("$HOME/.claude/skills") < _bind.index(str(_sk)), True)
+check("...and names unshipped directories", "lib" in _bind, True)
+check("...and says what to do when nothing resolves", "not installed on this host" in _bind, True)
+
+# The service reads frontmatter with a hand-rolled parser: a quoted scalar reads
+# as empty and publish is rejected. Cheaper to catch before the API call.
+(_sk / "SKILL.md").write_text('---\nname: d\ndescription: Use for "x".\n---\n\nBody.\n')
+try:
+    _pub_mod.build(_sk)
+    check("a quoted description is refused before publishing", "accepted", "refused")
+except SystemExit as e:
+    check("a quoted description is refused before publishing", "double quotes" in str(e), True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
