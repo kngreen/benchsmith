@@ -1,7 +1,7 @@
 # Open-ended (continuous-reward) tasks
 
 **Read this before applying §5 or §8 to a task whose `[metadata].reward_type` is
-`bounded_continuous` or `unbounded_continuous`.** Most of assay's difficulty machinery assumes
+`bounded_continuous` or `unbounded_continuous`.** Most of benchsmith's difficulty machinery assumes
 binary reward and is wrong here.
 
 ## What changes

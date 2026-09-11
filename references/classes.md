@@ -1,6 +1,6 @@
 # Round classes
 
-One class per round, validated by `assay record --class` against this list. A label the budget
+One class per round, validated by `benchsmith record --class` against this list. A label the budget
 cannot count is rejected at the command line rather than written into the journal.
 
 ## Read from evidence
@@ -10,7 +10,7 @@ cannot count is rejected at the command line rather than written into the journa
 | errored/inconclusive trials above threshold | `infra` | Re-run the affected stage. Spends no budget, advances no stall counter, and the round's rate is **not** a difficulty reading |
 | jobs unreadable, or no trials at this commit | `not-measured` | Nothing ran to be classified. Re-fetch; do not re-run a stage on the strength of it |
 | every trial truncated (`balanceIsMeasurement: false`) | `not-measured` | A partial measurement does not gate and is also not a rate |
-| the cloud measured a different commit than you pushed | `not-measured` | Written automatically — `assay record` rewrites the class, blanks the counts and records `classOverriddenFrom` |
+| the cloud measured a different commit than you pushed | `not-measured` | Written automatically — `benchsmith record` rewrites the class, blanks the counts and records `classOverriddenFrom` |
 | file-not-found, bad shebang, reward file not written | `contract` | Fix the harness — cheap, high value |
 | one shared failure and `n_minus_1` | `suspect-golden` | Validity-check that case. **Not** a difficulty signal |
 | one test is the **sole** failure in over half the failing trials | `dominant-blocker` | Validity-check that assertion first: those trials would pass if it did, so the round measured the assertion, not the task. **Not** a difficulty signal |
@@ -32,7 +32,7 @@ cannot count is rejected at the command line rather than written into the journa
 
 ## Two precedence rules the recorder enforces for you
 
-**A measurement from another commit is not this round's.** `assay record` compares
+**A measurement from another commit is not this round's.** `benchsmith record` compares
 `validationCommitSha` against the pushed SHA and, on mismatch, rewrites the class to
 `not-measured`, blanks the rate and evidence, and records the original in `classOverriddenFrom`.
 Numbers from another tree read as this one's and are worse than no numbers.

@@ -1,6 +1,6 @@
-# assay/lib
+# benchsmith/lib
 
-Assay's own implementation, so the skill does not depend on a repository we do not own.
+Benchsmith's own implementation, so the skill does not depend on a repository we do not own.
 
 Stdlib-only Python 3.11+. No install step, no virtualenv, no third-party packages — it has to
 run from a skill directory on whatever a devserver happens to have.
@@ -9,13 +9,13 @@ run from a skill directory on whatever a devserver happens to have.
 
 | Module | State | Owns |
 |---|---|---|
-| `assay/model.py` | done | measurement types and the outcome classifier |
-| `assay/bar.py` | done | the §5 difficulty computation |
-| `assay/adapter.py` | done | CLI discovery, uncached reads, identity verification |
-| `assay/snapshot.py` | done | platform records → measurement, evidence, review manifest |
-| `assay/journal.py` | done | rounds, streaks, excursions, surface hashes, budget |
-| `assay/gate.py` | done | the pre-push gate and hook installation |
-| `assay/cli.py` | done | `bin/assay` |
+| `benchsmith/model.py` | done | measurement types and the outcome classifier |
+| `benchsmith/bar.py` | done | the §5 difficulty computation |
+| `benchsmith/adapter.py` | done | CLI discovery, uncached reads, identity verification |
+| `benchsmith/snapshot.py` | done | platform records → measurement, evidence, review manifest |
+| `benchsmith/journal.py` | done | rounds, streaks, excursions, surface hashes, budget |
+| `benchsmith/gate.py` | done | the pre-push gate and hook installation |
+| `benchsmith/cli.py` | done | `bin/benchsmith` |
 | `selftest.py` | done | 112 fixtures, mutation-verified |
 
 Deliberately out of scope: platform-family specialisations (macOS VM / iOS), the mutation probe,

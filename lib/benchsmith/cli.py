@@ -1,4 +1,4 @@
-"""`assay <subcommand>` — the one entry point.
+"""`benchsmith <subcommand>` — the one entry point.
 
 Subcommands are deliberately thin: they resolve inputs, call a module, and print
 JSON or a rendered report. Judgement lives in SKILL.md; arithmetic lives in the
@@ -27,10 +27,10 @@ def _out(obj) -> None:
 def _identity(args) -> Identity:
     return Identity(
         task_name=args.task,
-        task_id=args.task_id or os.environ.get("ASSAY_TASK_ID", ""),
-        task_uuid=args.task_uuid or os.environ.get("ASSAY_TASK_UUID", ""),
-        source_repo=args.source_repo or os.environ.get("ASSAY_SOURCE_REPO", ""),
-        active_sha=args.sha or os.environ.get("ASSAY_ACTIVE_SHA", ""),
+        task_id=args.task_id or os.environ.get("BENCHSMITH_TASK_ID", ""),
+        task_uuid=args.task_uuid or os.environ.get("BENCHSMITH_TASK_UUID", ""),
+        source_repo=args.source_repo or os.environ.get("BENCHSMITH_SOURCE_REPO", ""),
+        active_sha=args.sha or os.environ.get("BENCHSMITH_ACTIVE_SHA", ""),
     )
 
 
@@ -148,7 +148,7 @@ def cmd_trailers(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="assay", description="The hard-task bar for benchmark tasks.")
+    p = argparse.ArgumentParser(prog="benchsmith", description="The hard-task bar for benchmark tasks.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp, *, task=True, repo=True):
@@ -169,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("bar", help="compute the hardness bar from a read payload")
     s.add_argument("input", nargs="?", default="-")
     s.add_argument("--sha", default="")
-    s.add_argument("--target", default=os.environ.get("ASSAY_TARGET", "hard-preferred"),
+    s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"),
                    choices=("hard-only", "hard-preferred"))
     s.set_defaults(fn=cmd_bar)
 
@@ -186,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
 
     s = common(sub.add_parser("gate", help="run the pre-push gate"))
     s.add_argument("--measured", default=None)
-    s.add_argument("--oracle", default=os.environ.get("ASSAY_ORACLE", ""))
+    s.add_argument("--oracle", default=os.environ.get("BENCHSMITH_ORACLE", ""))
     s.add_argument("--json", action="store_true")
     s.add_argument("--verify-receipt", action="store_true",
                    help="check an existing receipt against the exact clean HEAD")
@@ -208,5 +208,5 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except (ValueError, FileNotFoundError) as e:
         # A refused operation is a result, not a crash. The message is the point.
-        print(f"assay: {e}", file=sys.stderr)
+        print(f"benchsmith: {e}", file=sys.stderr)
         return 2

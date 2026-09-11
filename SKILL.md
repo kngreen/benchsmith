@@ -1,19 +1,19 @@
 ---
-name: assay
+name: benchsmith
 description: Iterate one Codimango benchmark task until it is genuinely hard and every exact-head gate is green — reading the platform fresh, classifying each round, gating the push, and stopping only on a real finding. Owns the difficulty bar (pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage), the integrity checks, provenance tagging, and the terminal verdict. Use for "loop this task", "iterate until it passes", "is this task hard enough", "harden this task", "why did this round fail", or "what terminal state should I report".
 ---
 
-# Assay
+# Benchsmith
 
-Assay owns the whole cycle for one benchmark task: read the platform, classify what is failing,
+Benchsmith owns the whole cycle for one benchmark task: read the platform, classify what is failing,
 fix what it is allowed to fix, gate the push, record the round, wait, repeat — and stop when the
 task is genuinely hard, or say plainly why it is not.
 
 It has no external loop engine and no runtime dependency on another repository. The mechanics
-live in `lib/` and run through `bin/assay`; this file holds the judgement.
+live in `lib/` and run through `bin/benchsmith`; this file holds the judgement.
 
 **One driver, one ledger.** Do not run a second iteration system against the same task. The
-journal at `.assay/<task>.json` is written only by `assay record` — never by hand, because a
+journal at `.benchsmith/<task>.json` is written only by `benchsmith record` — never by hand, because a
 hand-written journal produces none of the fields the loop reads back, and stall detection, the
 budget, regression comparison and excursion detection all go blind at once.
 
@@ -46,14 +46,14 @@ that a round was uninteresting.**
 ```
 (idea only) scaffold the tree, prove it            STEP S   ← once, if no task yet
         │
-read every signal for the last pushed commit      STEP 1    assay read | assay bar
+read every signal for the last pushed commit      STEP 1    benchsmith read | benchsmith bar
         │
         ├─ terminal? ──────────► stop: §10          STEP 2   §5 + references/gates.md
         │
    classify what is failing                        STEP 3   references/classes.md
    fix everything determinable, batched            STEP 4   §6, §8
-   gate the resulting tree                         STEP 5   assay gate
-   push ONCE, record the round                     STEP 6   assay record
+   gate the resulting tree                         STEP 5   benchsmith gate
+   push ONCE, record the round                     STEP 6   benchsmith record
    block until the platform is terminal            STEP 7
         │
         └──────► back to STEP 1, same turn
@@ -62,11 +62,11 @@ read every signal for the last pushed commit      STEP 1    assay read | assay b
 ### STEP 0 — bind, once
 
 ```bash
-assay probe                      # resolve the CLI surface; never hardcode a subcommand
-assay install-hooks --repo .     # pre-push gate, into the hooks dir the repo already uses
+benchsmith probe                      # resolve the CLI surface; never hardcode a subcommand
+benchsmith install-hooks --repo .     # pre-push gate, into the hooks dir the repo already uses
 ```
 
-Record `TASK_ID`, `TASK_UUID`, `SOURCE_REPO`, `ACTIVE_SHA` and `ASSAY_TARGET` (§1). An
+Record `TASK_ID`, `TASK_UUID`, `SOURCE_REPO`, `ACTIVE_SHA` and `BENCHSMITH_TARGET` (§1). An
 unresolved capability is **declared and degraded, never substituted with a command you have not
 run**; a command that errors is `not_run`, not a pass.
 
@@ -77,10 +77,10 @@ the pathspec you passed to `add`, so scoping only the add protects nothing when 
 stages work in between. Then:
 
 ```bash
-assay record --task <name> --sha <pushed> --class <class> --fix "<one line>" [--hardening]
+benchsmith record --task <name> --sha <pushed> --class <class> --fix "<one line>" [--hardening]
 ```
 
-Not optional, and not hand-written: `assay record` derives the graded hash, the streaks, the
+Not optional, and not hand-written: `benchsmith record` derives the graded hash, the streaks, the
 excursions and the budget, and it rewrites a class the evidence does not support. **A round that
 is not recorded did not happen.**
 
@@ -152,7 +152,7 @@ it, and treat a mismatch as `not-measured`.
 
 ### Pick the target profile at intake
 
-`ASSAY_TARGET` selects the terminal mapping in §10, and it is chosen **before** the first
+`BENCHSMITH_TARGET` selects the terminal mapping in §10, and it is chosen **before** the first
 measurement so it cannot be relaxed to fit an outcome:
 
 - **`hard-only`** — GREEN — HARD, IMPROVED, or REJECTED — NOT HARD. `GREEN — MEDIUM` does not
@@ -172,7 +172,7 @@ codimango task show <task> --json | jq '{format, track}'
 
 `swe_bench_single_turn` / `swe-bench-pro` → `swebench-flow`; T-bench formats → `tbench-flow`;
 Long Horizon formats → `aai-long-horizon`. **Free-text tags never choose a track** —
-`long-horizon` as a tag is not the track. assay's STEP S delegates scaffolding to whichever
+`long-horizon` as a tag is not the track. benchsmith's STEP S delegates scaffolding to whichever
 flow this resolves to; do not hand-roll the tree.
 
 ## 3. Intake — before scaffolding, or before revising a task with no recorded intake
@@ -189,7 +189,7 @@ hand-roll a substitute.
 It deliberately does not check contamination, recall or portfolio dedup; route those to
 `swebench-idea-triage` or the track's own check.
 
-Three things it does not cover, which assay requires:
+Three things it does not cover, which benchsmith requires:
 
 1. **Two independent challenges, not one.** The screen asks you to name *one* residual hard
    core. The §5 bar needs hardness spread across **two semantically independent** behaviour
@@ -198,7 +198,7 @@ Three things it does not cover, which assay requires:
 2. **Size is not difficulty.** Never use changed-line count, file count, or patch size as
    evidence, in either direction.
 3. **Write it down.** Put the hypothesis — both cores, the interacting invariants, and how each
-   is behaviourally and fairly testable — at `$REPO_ROOT/.assay/<task>-intake.md`. **Outside**
+   is behaviourally and fairly testable — at `$REPO_ROOT/.benchsmith/<task>-intake.md`. **Outside**
    the task directory: the task tree is a fixed list and working notes do not belong in it.
 
 If no credible hardening hypothesis remains, say so and continue only if the task can still be
@@ -221,11 +221,11 @@ STEP S governs. Three additions:
 ### Tags — set on the first round, before the first push
 
 `[metadata].tags` in `task.toml` must carry all of these, **added to** whatever is already there.
-Never replace the existing list: assay writes it stays.
+Never replace the existing list: benchsmith writes it stays.
 
 | Tag | What it is | Enforced by |
 |---|---|---|
-| `assay-v1` | The recipe name — this task was built and gated under assay | **nothing — you** |
+| `benchsmith-v1` | The recipe name — this task was built and gated under benchsmith | **nothing — you** |
 | `aai-labs` | Labs attributes throughput by this tag; an untagged Labs task is invisible | the gate |
 | `aai-labs-<project>` | **The team tag.** Derive it from the task repo slug: `codimango/swe-bench-aai-labs-<project>` → `aai-labs-<project>`. For `swe-bench-aai-labs-ollo` that is `aai-labs-ollo` | **nothing — you** |
 | `semi-synthetic` | Provenance: produced through an assisted recipe, not hand-authored end to end | **nothing — you** |
@@ -237,16 +237,16 @@ the ordinary descriptive ones: language, task type, framework. A complete Labs l
 
 ```toml
 tags = ["swe-bench-pro", "SWEBench-External", "private_repos_1p", "aai-labs", "aai-labs-ollo",
-        "semi-synthetic", "assay-v1"]
+        "semi-synthetic", "benchsmith-v1"]
 ```
 
-**All six are gate-enforced.** `assay gate` fails the push when any of `assay-v1`, `aai-labs`,
+**All six are gate-enforced.** `benchsmith gate` fails the push when any of `benchsmith-v1`, `aai-labs`,
 `semi-synthetic` or `private_repos_1p` is absent, and separately when no `aai-labs-<project>`
-team tag is present — see `REQUIRED_TAGS` and `TEAM_TAG_PREFIX` in `lib/assay/gate.py`. The
+team tag is present — see `REQUIRED_TAGS` and `TEAM_TAG_PREFIX` in `lib/benchsmith/gate.py`. The
 `long-horizon` scope tag is conditional and is not gated.
 
-**These gates apply to tasks assay builds or modifies.** They are not a review rubric: a task
-authored before assay existed, carrying an earlier recipe tag, is not a finding, and the tag set
+**These gates apply to tasks benchsmith builds or modifies.** They are not a review rubric: a task
+authored before benchsmith existed, carrying an earlier recipe tag, is not a finding, and the tag set
 is never applied retroactively to someone else's task.
 
 **Gate the full set before the first push, not at the terminal check.** A task that reaches its
@@ -258,10 +258,10 @@ blocking; the durable version is a `bin/` script and a gate row, same argument a
 platform (§2), not from this list.
 
 **Commit trailers.** Tags mark the task; trailers mark the commits, and survive a rename or a
-move that tags do not. Every commit an assay run creates carries `Created-Via: assay`,
-`assay-Version: 1`, `assay-Run-ID` and `assay-Workflow`, preserved across amend and rebase.
+move that tags do not. Every commit a benchsmith run creates carries `Created-Via: benchsmith`,
+`benchsmith-Version: 1`, `benchsmith-Run-ID` and `benchsmith-Workflow`, preserved across amend and rebase.
 Install the `commit-msg` hook **into the hooks directory the repo already uses** — never repoint
-`core.hooksPath`, which silently disables assay's `pre-push` gate. Script and chaining rule:
+`core.hooksPath`, which silently disables benchsmith's `pre-push` gate. Script and chaining rule:
 `references/provenance.md`.
 
 **Declared `difficulty` must not silently disagree with the measured classification.** Leave it
@@ -276,11 +276,11 @@ push the rate down is conjunction inflation, not hardening.**
 
 ## 5. The bar — extends STEP 2, does not replace it
 
-Every box in assay's STEP 2 checklist must be ticked. These are **additional**, and a task is
+Every box in benchsmith's STEP 2 checklist must be ticked. These are **additional**, and a task is
 not converged until they hold on the exact final SHA:
 
 - [ ] Pooled participant completion **0.20–0.50 inclusive**, as an exact fraction over the
-      scored denominator from `assay bar` (the `infra` block) — never the naive one.
+      scored denominator from `benchsmith bar` (the `infra` block) — never the naive one.
 - [ ] Every member of the **frozen strongest set** is mixed, **0.20–0.60 inclusive**. One
       saturated or starved member fails this by itself. Avocado/MetaCode substitutes for a
       missing GPT/Opus cohort only when the platform designates it.
@@ -297,7 +297,7 @@ not converged until they hold on the exact final SHA:
       not missing.
 - [ ] The task stays hard when the wording is clear. A task that becomes easy once ambiguity
       and leakage are removed was never hard.
-- [ ] `[metadata].tags` carries `assay-v1`, `aai-labs`, the `aai-labs-<project>` team tag,
+- [ ] `[metadata].tags` carries `benchsmith-v1`, `aai-labs`, the `aai-labs-<project>` team tag,
       `semi-synthetic` and `private_repos_1p` (§4), and declared `difficulty` matches the
       measured classification. Only `aai-labs` is gate-enforced — check the rest by eye.
 - [ ] **Every validity gate in `references/gates.md` passes on this exact commit** — head equals
@@ -320,7 +320,7 @@ points. So:
 - Report the **Wilson** interval beside every rate (`z = 1.96`, no continuity correction — Wald
   is degenerate at 0/5 and 5/5).
 - Gate on the pooled point estimate.
-- Pool only measurements whose graded **and** agent-visible hashes are identical. `assay hash` computes both; use those, not a judgment call.
+- Pool only measurements whose graded **and** agent-visible hashes are identical. `benchsmith hash` computes both; use those, not a judgment call.
 - When the estimate sits within one trial of a band edge, **say "boundary-adjacent" and do not
   make a corrective commit on that basis alone.**
 - Never describe one five-trial cohort as establishing a rate to better than about 20 points.
@@ -329,7 +329,7 @@ points. So:
 
 ## 6. Integrity — add these to the gate, do not merely remember them
 
-assay's Tier 1 does not carry these. **Port them into `bin/` and the gate rather than checking
+benchsmith's Tier 1 does not carry these. **Port them into `bin/` and the gate rather than checking
 them by hand** — our own rule is that a check done differently every round is not a check.
 Until they are scripted, run them explicitly before every push and record the result; an unrun
 check is `not_run`, never a pass.
@@ -362,14 +362,14 @@ as uncovered. Do not report it as clean.
 
 ---
 
-## 7. Cause → assay class
+## 7. Cause → benchsmith class
 
 **`task-fairness-signal` owns the attribution.** It audits trajectories and verifier logs per
 trial, separates infra from ambiguity from reasoning, and returns OK / REVIEW / NEEDS_REVISION.
 Run it before calling anything hardness evidence; do not eyeball a trajectory and decide. Then
 map its answer onto the classes:
 
-| Cause | assay class | Counts toward the bar? |
+| Cause | benchsmith class | Counts toward the bar? |
 |---|---|---|
 | Spec ambiguity or defect | `contract-disagreement`, or the spec fix | No — invalidates the measurement |
 | Valid alternative rejected / grader false negative | `grader-false-negative`, `suspect-golden`, `dominant-blocker` | No — never harden on it |
@@ -378,7 +378,7 @@ map its answer onto the classes:
 | Genuine semantic failure | `in-band` / `too-easy` by rate | **Yes** — the only hardness evidence |
 | Unknown attribution | `not-measured` | No |
 
-Read `assay bar` (the `infra` block) **first**, before any difficulty reading — errored trials sit in the
+Read `benchsmith bar` (the `infra` block) **first**, before any difficulty reading — errored trials sit in the
 denominator and drag the rate down, which reads as a harder task. Exit 2 is a third answer, not
 a quieter 1.
 
@@ -405,7 +405,7 @@ Before proposing anything, read **two or three tasks in this repo that measured 
 accepted**. Extract the *mechanism* each used, never the content: what behaviour the
 discriminator turned on, why the contract already entailed it, what made it survive
 consolidation. Add the Harvester difficulty-levers catalogue. Write the patterns to
-`$REPO_ROOT/.assay/<task>-hardening.md` — a working note, outside the task tree.
+`$REPO_ROOT/.benchsmith/<task>-hardening.md` — a working note, outside the task tree.
 
 A lever invented from first principles when three calibrated neighbours are sitting in the same
 repo is a wasted round.
@@ -414,7 +414,7 @@ repo is a wasted round.
 
 Produce **at least three** candidate levers, ranked, each with: the behaviour it targets, the
 contract clause that already entails it, the predicted per-cohort catch, and the way it could
-fail. Record declared levers in `.loop/levers.md` per assay.
+fail. Record declared levers in `.loop/levers.md` per benchsmith.
 
 **Freeze the whole slate before the first replay**, and hash it. This is what makes falling
 through to lever 2 legitimate: you are executing a plan that predates the evidence, not choosing
@@ -439,17 +439,17 @@ target cohort without rejecting golden, rejecting a valid alternative, or pushin
 member below 0.20. If it fails, record why and **take the next lever off the slate** — no
 re-derivation, no revision of the one that failed.
 
-One lever per *push*; `ASSAY_HARDENING_BUDGET` (default 5) counts pushes, not attempts. **A lever
+One lever per *push*; `BENCHSMITH_HARDENING_BUDGET` (default 5) counts pushes, not attempts. **A lever
 that dies at local replay spends nothing** — nothing was measured, so nothing was spent.
 
 **Two caps run concurrently; the stricter one governs.**
 
 | Cap | Counts | Fires when |
 |---|---|---|
-| Hardening budget | pushed levers | `ASSAY_HARDENING_BUDGET` reached (default 5) |
+| Hardening budget | pushed levers | `BENCHSMITH_HARDENING_BUDGET` reached (default 5) |
 | Ineffective-round cap | **measured** corrective rounds | three consecutive rounds move the pooled rate less than one trial-equivalent toward the band |
 
-The second is the tighter one in practice and assay previously omitted it. Three measured rounds
+The second is the tighter one in practice and benchsmith previously omitted it. Three measured rounds
 that do not move `d(p)` by at least `1/N` stop the campaign even with budget left — unless an
 audit of the preceding rounds identifies the root cause and records a *mechanically different*
 correction strategy, not merely a different file or a reworded rationale.
@@ -474,7 +474,7 @@ Each of these has ended a run early. None of them is a finding:
   declared, what the band did, what you would try next. Never `abandoned`.
 - **The premise is wrong** → `abandoned`, and say it on round 2, not round 12.
 
-**Stopping with budget unspent is an unfinished job, not a finding.** `assay record` refuses `--status abandoned` while the oracle passes and budget remains — so a
+**Stopping with budget unspent is an unfinished job, not a finding.** `benchsmith record` refuses `--status abandoned` while the oracle passes and budget remains — so a
 run that reports REJECTED from an unspent budget bypassed the recorder. Treat that report as a
 bug in the run, not a verdict on the task.
 
@@ -558,9 +558,9 @@ too easy is a calibration lever in disguise.
 
 ## 10. Endings
 
-assay's ending is the mechanism; the terminal state is what you report.
+benchsmith's ending is the mechanism; the terminal state is what you report.
 
-| assay status | Terminal state |
+| benchsmith status | Terminal state |
 |---|---|
 | `converged`, §5 bar holds at hard | **GREEN — HARD** |
 | `converged`, §8 medium conditions hold | **GREEN — MEDIUM** — *`hard-preferred` only* |
@@ -569,7 +569,7 @@ assay's ending is the mechanism; the terminal state is what you report.
 | `abandoned` | **REJECTED — NOT HARD** |
 | `blocked-on-platform` | **BLOCKED — PLATFORM**, naming the gate and the evidence below |
 
-Under **`ASSAY_TARGET=hard-only`** (§1) the medium row does not exist: a task that would have
+Under **`BENCHSMITH_TARGET=hard-only`** (§1) the medium row does not exist: a task that would have
 finalised GREEN — MEDIUM reports **IMPROVED — ABOVE BAND** instead, with its measured
 classification stated plainly. Do not silently upgrade it, and do not switch profile to make it
 fit.

@@ -1,4 +1,4 @@
-"""The round journal: `.assay/<task>.json`, machine-written, never hand-edited.
+"""The round journal: `.benchsmith/<task>.json`, machine-written, never hand-edited.
 
 A hand-written journal produces none of the fields the loop reads back, so stall
 detection, the hardening budget, regression comparison and excursion detection
@@ -57,7 +57,7 @@ def _now() -> tuple[str, str]:
 
 
 def journal_dir(repo_root: Path) -> Path:
-    d = Path(repo_root) / ".assay"
+    d = Path(repo_root) / ".benchsmith"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -158,7 +158,7 @@ class Journal:
         return self.data["rounds"]
 
     def budget(self) -> int:
-        return int(os.environ.get("ASSAY_HARDENING_BUDGET", DEFAULT_BUDGET))
+        return int(os.environ.get("BENCHSMITH_HARDENING_BUDGET", DEFAULT_BUDGET))
 
     # -- excursions ---------------------------------------------------------
 
@@ -340,10 +340,10 @@ class Journal:
 
 def git_trailers(run_id: str, workflow: str) -> list[str]:
     return [
-        "Created-Via: assay",
-        "assay-Version: 1",
-        f"assay-Run-ID: {run_id}",
-        f"assay-Workflow: {workflow}",
+        "Created-Via: benchsmith",
+        "benchsmith-Version: 1",
+        f"benchsmith-Run-ID: {run_id}",
+        f"benchsmith-Workflow: {workflow}",
     ]
 
 

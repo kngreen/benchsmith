@@ -1,11 +1,11 @@
-# assay
+# benchsmith
 
 Iterate one Codimango benchmark task until it is genuinely hard and every exact-head gate is
 green — or say plainly, with evidence, why it is not.
 
-Assay is self-contained. It owns the round loop, the journal, the pre-push gate, the difficulty
+Benchsmith is self-contained. It owns the round loop, the journal, the pre-push gate, the difficulty
 bar, provenance tagging and the terminal verdict, with **no runtime dependency on any other
-repository**. Judgement lives in `SKILL.md`; arithmetic lives in `lib/`; `bin/assay` is the entry
+repository**. Judgement lives in `SKILL.md`; arithmetic lives in `lib/`; `bin/benchsmith` is the entry
 point. Stdlib-only Python 3.11+, no install step.
 
 ## What it decides
@@ -26,16 +26,16 @@ is what this skill exists to close.
 ## Usage
 
 ```bash
-assay probe                                   # resolve the platform CLI surface
-assay install-hooks --repo .                  # pre-push gate
-assay read --task <name> --task-id <id>       # fresh, identity-checked
-assay bar payload.json --target hard-only     # the difficulty verdict
-assay gate --repo . --task <name>             # before every push
-assay record --repo . --task <name> --sha <sha> --class in-band --fix "..."
+benchsmith probe                                   # resolve the platform CLI surface
+benchsmith install-hooks --repo .                  # pre-push gate
+benchsmith read --task <name> --task-id <id>       # fresh, identity-checked
+benchsmith bar payload.json --target hard-only     # the difficulty verdict
+benchsmith gate --repo . --task <name>             # before every push
+benchsmith record --repo . --task <name> --sha <sha> --class in-band --fix "..."
 ```
 
-`assay --help` lists everything. `ASSAY_TARGET`, `ASSAY_HARDENING_BUDGET`, `ASSAY_TASK_ID`,
-`ASSAY_SOURCE_REPO` and `ASSAY_ORACLE` are read from the environment when the flags are omitted.
+`benchsmith --help` lists everything. `BENCHSMITH_TARGET`, `BENCHSMITH_HARDENING_BUDGET`, `BENCHSMITH_TASK_ID`,
+`BENCHSMITH_SOURCE_REPO` and `BENCHSMITH_ORACLE` are read from the environment when the flags are omitted.
 
 ## Design commitments
 
@@ -54,7 +54,7 @@ denominator it reads as a harder task.
 so it is `null`, never `[]`.
 
 **Never hardcode a subcommand.** The platform CLI announces itself as legacy and points at a
-replacement. `assay probe` resolves the surface once by probing `--help`.
+replacement. `benchsmith probe` resolves the surface once by probing `--help`.
 
 **Never trust a name lookup.** Basenames collide across repos and survive renames, and the read
 surface is name-only, so identity is verified on the way back: a record whose id disagrees with
@@ -66,8 +66,8 @@ the one bound at intake is another task.
 
 ```
 SKILL.md              the loop and the judgement
-bin/assay             entry point
-lib/assay/            model · bar · snapshot · journal · gate · adapter · cli
+bin/benchsmith             entry point
+lib/benchsmith/            model · bar · snapshot · journal · gate · adapter · cli
 references/           gates · classes · continuous · provenance · authorship
 ```
 
@@ -77,18 +77,18 @@ assumes binary reward, and applying it to a continuously-scored task measures th
 ## Install
 
 ```bash
-git clone git@github.com:kngreen/assay.git ~/.claude/skills/assay
-ln -s ~/.claude/skills/assay ~/.codex/skills/assay
+git clone git@github.com:codimango/benchsmith.git ~/.claude/skills/benchsmith
+ln -s ~/.claude/skills/benchsmith ~/.codex/skills/benchsmith
 ```
 
-`/assay` in Claude Code on the next session, and available to Codex via its skills directory.
+`/benchsmith` in Claude Code on the next session, and available to Codex via its skills directory.
 `~/.llms/skills/claude-templates` is a symlink to `~/.claude/skills`, so one clone also surfaces
 through the devmate mirror. Muse resolves through the agent marketplace rather than a local path,
-so reaching it means landing the skill in `fbcode/claude-templates/components/skills/assay/`.
+so reaching it means landing the skill in `fbcode/claude-templates/components/skills/benchsmith/`.
 
 ## Prerequisites
 
-An authenticated `codimango` CLI, a checkout of the task repository, and — for the skills assay
+An authenticated `codimango` CLI, a checkout of the task repository, and — for the skills benchsmith
 delegates to at intake and attribution — the `team-aai` bundle.
 
 ## Acknowledgement

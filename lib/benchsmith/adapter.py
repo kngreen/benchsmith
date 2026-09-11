@@ -80,12 +80,12 @@ def discover(binary: str | None = None, site: str | None = None) -> Surface:
     Probing costs a few seconds at session start and removes an entire class of
     silent breakage when the platform ships its replacement CLI.
     """
-    binary = binary or os.environ.get("ASSAY_CODIMANGO", "codimango")
+    binary = binary or os.environ.get("BENCHSMITH_CODIMANGO", "codimango")
     path = shutil.which(binary)
     if not path:
         raise Unresolved(f"{binary} is not on PATH")
 
-    site = site or os.environ.get("ASSAY_SITE", "nest")
+    site = site or os.environ.get("BENCHSMITH_SITE", "nest")
     root = _help(binary)
     surface = Surface(binary=binary)
     surface.legacy = "LEGACY" in root.upper()

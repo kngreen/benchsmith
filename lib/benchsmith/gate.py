@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .journal import Journal, surface_hashes
 
-REQUIRED_TAGS = ("assay-v1", "aai-labs", "semi-synthetic", "private_repos_1p")
+REQUIRED_TAGS = ("benchsmith-v1", "aai-labs", "semi-synthetic", "private_repos_1p")
 TEAM_TAG_PREFIX = "aai-labs-"
 
 PASS, FAIL, NOT_RUN = "PASS", "FAIL", "NOT_RUN"
@@ -182,7 +182,7 @@ def check_test_ratchet(task_dir: Path, journal: Journal, report: Report) -> None
         report.add("test-ratchet", PASS, f"{count} (first observation)")
         return
     if count < prior[-1]:
-        proof = (Path(task_dir) / ".assay" / "removals.md").is_file()
+        proof = (Path(task_dir) / ".benchsmith" / "removals.md").is_file()
         report.add(
             "test-ratchet",
             PASS if proof else FAIL,
@@ -248,7 +248,7 @@ def check_scope(repo_root: Path, task_name: str, report: Report) -> None:
     if not staged:
         report.add("scope", NOT_RUN, "nothing staged")
         return
-    stray = [p for p in staged if not (p.startswith(f"{task_name}/") or p.startswith(".assay/"))]
+    stray = [p for p in staged if not (p.startswith(f"{task_name}/") or p.startswith(".benchsmith/"))]
     report.add(
         "scope",
         FAIL if stray else PASS,
@@ -327,7 +327,7 @@ def receipt_path(repo_root: Path, task_name: str) -> Path:
     Keyed by repo path so two checkouts of the same repo cannot share one.
     """
     key = hashlib.sha256(str(Path(repo_root).resolve()).encode()).hexdigest()[:12]
-    base = Path(os.environ.get("ASSAY_RECEIPT_DIR", Path.home() / ".cache" / "assay" / "receipts"))
+    base = Path(os.environ.get("BENCHSMITH_RECEIPT_DIR", Path.home() / ".cache" / "benchsmith" / "receipts"))
     return base / key / f"{task_name}.receipt.json"
 
 
@@ -370,7 +370,7 @@ def write_receipt(repo_root: Path, task_name: str, report: Report) -> dict:
         "ok": True,
         "checks": {c.name: c.state for c in report.checks},
         "notRun": [c.name for c in report.checks if c.state == NOT_RUN],
-        "source": "canonical" if canonical_receipt(repo_root) else "assay-native-fallback",
+        "source": "canonical" if canonical_receipt(repo_root) else "benchsmith-native-fallback",
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     body["digest"] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
@@ -411,10 +411,10 @@ def verify_receipt(repo_root: Path, task_name: str) -> tuple[bool, str]:
 # --- hook installation ------------------------------------------------------
 
 PRE_PUSH = """#!/bin/sh
-# assay pre-push gate. Never bypass with --no-verify.
+# benchsmith pre-push gate. Never bypass with --no-verify.
 set -eu
-exec python3 "$ASSAY_LIB/../bin/assay" gate --repo "$(git rev-parse --show-toplevel)" \\
-     --task "${ASSAY_TASK:?set ASSAY_TASK to the task directory name}"
+exec python3 "$BENCHSMITH_LIB/../bin/benchsmith" gate --repo "$(git rev-parse --show-toplevel)" \\
+     --task "${BENCHSMITH_TASK:?set BENCHSMITH_TASK to the task directory name}"
 """
 
 
@@ -447,10 +447,10 @@ def install_hooks(repo_root: Path, lib_dir: Path) -> list[str]:
 
     hooks.mkdir(parents=True, exist_ok=True)
     target = hooks / "pre-push"
-    body = PRE_PUSH.replace("$ASSAY_LIB", str(lib_dir))
+    body = PRE_PUSH.replace("$BENCHSMITH_LIB", str(lib_dir))
     if target.exists():
         existing = target.read_text()
-        if "assay pre-push gate" in existing:
+        if "benchsmith pre-push gate" in existing:
             out.append(f"pre-push already ours at {target}")
         else:
             out.append(f"FOREIGN pre-push hook at {target} — left alone; chain it manually")

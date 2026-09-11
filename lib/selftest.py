@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression fixtures for assay.
+"""Regression fixtures for benchsmith.
 
 Every case here is a failure that actually happened — in a reported run, in a
 review of this skill, or in another loop's incident log. A case with no incident
@@ -21,13 +21,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from assay import gate as gate_mod  # noqa: E402
-from assay.adapter import Identity, IdentityMismatch, Platform, Surface  # noqa: E402
-from assay.bar import completeness, evaluate, single_gate_share, wilson  # noqa: E402
-from assay.journal import Journal, surface_hashes  # noqa: E402
-from assay.model import Kind, Measurement, Plan, Review, Row, SlotKey  # noqa: E402
-from assay.replacement import ReplacementRefused, apply, eligible, plan  # noqa: E402
-from assay.snapshot import classify, evidence, graded_pass, is_participant  # noqa: E402
+from benchsmith import gate as gate_mod  # noqa: E402
+from benchsmith.adapter import Identity, IdentityMismatch, Platform, Surface  # noqa: E402
+from benchsmith.bar import completeness, evaluate, single_gate_share, wilson  # noqa: E402
+from benchsmith.journal import Journal, surface_hashes  # noqa: E402
+from benchsmith.model import Kind, Measurement, Plan, Review, Row, SlotKey  # noqa: E402
+from benchsmith.replacement import ReplacementRefused, apply, eligible, plan  # noqa: E402
+from benchsmith.snapshot import classify, evidence, graded_pass, is_participant  # noqa: E402
 
 VERBOSE = "-v" in sys.argv
 PASSED = FAILED = 0
@@ -312,7 +312,7 @@ check("frequency table still available", ev["failureFrequency"]["freq"], 2)
 # ------------------------------------------------------- job selection -----
 section("Job selection — the headline fields lie by omission")
 
-from assay.snapshot import agent_name, job_stage, select_jobs  # noqa: E402
+from benchsmith.snapshot import agent_name, job_stage, select_jobs  # noqa: E402
 
 check("agentName is the cohort identity", agent_name({"config": {"agentName": "codex"}}), "codex")
 check("reviewIdentity.stage is the stage", job_stage({"reviewIdentity": {"stage": "agentic-review"}}), "agentic-review")
@@ -343,7 +343,7 @@ jobs = [
 ]
 chosen, notes = select_jobs(jobs, SHA)
 check("three participant cohorts selected", sorted(agent_name(j) for j in chosen), ["claude-code", "codex", "metacode"])
-from assay.snapshot import family_of  # noqa: E402
+from benchsmith.snapshot import family_of  # noqa: E402
 check("harness names normalise to model families", sorted(family_of(j) for j in chosen), ["avocado", "gpt", "opus"])
 check("codex cohort is not lost", "codex" in {agent_name(j) for j in chosen}, True)
 check("agentic-review dropped", "j-review" not in {j["id"] for j in chosen}, True)
@@ -367,7 +367,7 @@ trials = {
     "j-meta": [{"reward": 0.0, "reachedVerifier": True} for _ in range(5)],
     "j-codex": [{"reward": 1.0} for _ in range(5)],
 }
-from assay.snapshot import build as build_measurement  # noqa: E402
+from benchsmith.snapshot import build as build_measurement  # noqa: E402
 
 m = build_measurement(
     {"validationCommitSha": SHA},
@@ -445,7 +445,7 @@ def scratch_repo(tmp: Path) -> Path:
     (repo / "mytask" / "tests").mkdir(parents=True)
     (repo / "mytask" / "task.toml").write_text(
         'difficulty = "hard"\n[metadata]\ntags = ["aai-labs","aai-labs-ollo",'
-        '"assay-v1","semi-synthetic","private_repos_1p"]\n'
+        '"benchsmith-v1","semi-synthetic","private_repos_1p"]\n'
     )
     (repo / "mytask" / "tests" / "config.json").write_text(
         json.dumps({"patch": "a", "test_patch": "b", "fail_to_pass": ["t1"], "pass_to_pass": ["t2"]})
@@ -563,8 +563,8 @@ with tempfile.TemporaryDirectory() as td:
     rep = gate_mod.run(repo_root=repo, task_dir=task_dir, task_name="mytask")
     tags = next(c.detail for c in rep.checks if c.name == "tags")
     check("missing team tag caught", "aai-labs-<project>" in tags, True)
-    check("missing recipe tag caught", "assay-v1" in tags, True)
+    check("missing recipe tag caught", "benchsmith-v1" in tags, True)
 
 
-print(f"\nassay selftest: {PASSED} passed, {FAILED} failed")
+print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

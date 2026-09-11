@@ -10,8 +10,8 @@ announcing it is legacy and pointing at a replacement fbcode CLI that keeps the 
 command and changes the subcommand shape. Treat every literal invocation here as an *example of
 the invariant*, never as the contract.
 
-Resolve the surface once with `assay probe`, which reads `--help` and caches the result, and
-route every read through `assay read`. **An unresolved capability is declared and degraded,
+Resolve the surface once with `benchsmith probe`, which reads `--help` and caches the result, and
+route every read through `benchsmith read`. **An unresolved capability is declared and degraded,
 never substituted with a command you have not run**, and a command that errors is `not_run`,
 not a pass.
 
@@ -31,14 +31,14 @@ further tasks showed the same distortion (50% -> 60%, and one more).
 
 Rates come from the job list, scoped and deduplicated: `status == "completed"`, job commit equal
 to the validation commit, the one-attempt `reviewIdentity.stage == "agentic-review"` job excluded,
-and the newest batch kept per `config.agentName`. `assay bar` does this in `select_jobs` and keeps
+and the newest batch kept per `config.agentName`. `benchsmith bar` does this in `select_jobs` and keeps
 an auditable note for every job it drops — a silently dropped cohort is indistinguishable from one
 that never ran.
 
 ## Read fresh, always
 
 **Every Codimango read carries `--no-cache`.** A cached read after a push is how one commit's
-numbers get attributed to another. `assay record` detects it after the fact — it compares the
+numbers get attributed to another. `benchsmith record` detects it after the fact — it compares the
 validation commit against the pushed SHA and blanks the round — but `--no-cache` prevents most
 of it upfront.
 
@@ -116,7 +116,7 @@ Every item, on one exact commit, from fresh reads:
   at 3/3 with reward exactly 1.0 where the format supports it
 - agent results satisfy the format's difficulty requirement — **and §5's bar**
 - AI Assessment / Quality Review: Accept
-- Contamination LOW *(assay treats this as blocking; see §5 note)*
+- Contamination LOW *(benchsmith treats this as blocking; see §5 note)*
 - required quality dimensions and TBR Build / Eval GT pass
 - TBR GOOD / Accept, no error, no unresolved significant issue
 - Agentic Full-Task Review GOOD, 17/17

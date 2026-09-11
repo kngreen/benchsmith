@@ -1,7 +1,7 @@
 # Provenance
 
 Two layers: the task carries tags, the commits carry trailers. Tags say *this task was built
-under assay*; trailers say *this commit was*. Neither substitutes for the other — tags survive
+under benchsmith*; trailers say *this commit was*. Neither substitutes for the other — tags survive
 into Codimango, trailers survive into `git log` after a task is renamed or moved.
 
 ## Task tags
@@ -14,7 +14,7 @@ A worked check, since only `aai-labs` is gate-enforced:
 ```bash
 python3 - "$TASK_DIR/task.toml" <<'EOF'
 import sys, tomllib
-required = {"assay-v1", "aai-labs", "semi-synthetic", "private_repos_1p"}
+required = {"benchsmith-v1", "aai-labs", "semi-synthetic", "private_repos_1p"}
 doc = tomllib.load(open(sys.argv[1], "rb"))
 tags = set(doc.get("metadata", {}).get("tags") or [])
 missing = sorted(required - tags)
@@ -25,18 +25,18 @@ print("MISSING:", ", ".join(missing) if missing else "none")
 EOF
 ```
 
-`assay gate` runs this check and **blocks the push** on a missing tag — a task that reaches its
+`benchsmith gate` runs this check and **blocks the push** on a missing tag — a task that reaches its
 first cloud round untagged is already mis-attributed, and Labs cannot see it at all.
 
 ## Commit trailers
 
-Every commit an assay-driven run creates carries exactly one of each:
+Every commit a benchsmith-driven run creates carries exactly one of each:
 
 ```text
-Created-Via: assay
-assay-Version: 1
-assay-Run-ID: <run id>
-assay-Workflow: <flow from the §0 entry-point table>
+Created-Via: benchsmith
+benchsmith-Version: 1
+benchsmith-Run-ID: <run id>
+benchsmith-Workflow: <flow from the §0 entry-point table>
 ```
 
 Preserve them across amend and rebase. Do not bypass with `--no-verify`.
@@ -45,7 +45,7 @@ Preserve them across amend and rebase. Do not bypass with `--no-verify`.
 
 **Do not set `core.hooksPath` to a new directory.** Another tool's gate may already live in the
 repo's hooks directory, and repointing `core.hooksPath` silently disables it — which is the one
-thing worse than not having trailers. `assay install-hooks` resolves the existing path and
+thing worse than not having trailers. `benchsmith install-hooks` resolves the existing path and
 installs alongside.
 
 Install `commit-msg` **into whatever hooks directory the repo already uses**:
@@ -58,10 +58,10 @@ cat > "$HOOKS/commit-msg" <<EOF
 set -eu
 message_file="\$1"
 git interpret-trailers --in-place --if-exists=replace --if-missing=add \\
-  --trailer 'Created-Via: assay' \\
-  --trailer 'assay-Version: 1' \\
-  --trailer "assay-Run-ID: \$ASSAY_RUN_ID" \\
-  --trailer "assay-Workflow: \$ASSAY_WORKFLOW" \\
+  --trailer 'Created-Via: benchsmith' \\
+  --trailer 'benchsmith-Version: 1' \\
+  --trailer "benchsmith-Run-ID: \$BENCHSMITH_RUN_ID" \\
+  --trailer "benchsmith-Workflow: \$BENCHSMITH_WORKFLOW" \\
   "\$message_file"
 EOF
 chmod 755 "$HOOKS/commit-msg"
@@ -78,4 +78,4 @@ Record the actual model identifier where the repository's metadata convention ha
 generating models, and **preserve the task's real human authors**.
 
 Add `human-reviewed` only when a human actually reviewed or curated the task. An Agentic Review
-is not a human review, and neither is an assay run.
+is not a human review, and neither is a benchsmith run.
