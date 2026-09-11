@@ -1151,7 +1151,49 @@ printed as a pass.
 Cost: pure Python plus a couple of `git show` calls, scoped to graded files. Sub-millisecond when
 the staged diff has no graded Python in it.
 
-### 15b. The formatters
+### 15b. Snapshot integrity
+
+| Check | Catches | Push-required |
+|---|---|---|
+| `contamination` | a `solve.sh` symlink; a `solve.sh` blob carrying `variant overlay` / `mutant overlay` / `mutant (` / `mutant applied`; a tracked `.solve.sh.*` or `.run-*.lock` | **yes** |
+| `untracked-deps` | a committed tooling file that invokes a path nobody committed | no |
+| `structural` | upstream `codimango bench validate --structural-only` | no |
+| `task-author` | whether this task is yours to change | n/a — never blocks |
+
+**Contamination reads git blobs, never the working tree.** That is the point: a `solve.sh` restored
+on disk after a mutant run still ships the mutant if the index holds the contaminated blob.
+`gate-fixtures/` is excluded — those are contaminated on purpose. Only paths that could possibly be
+a finding are inspected; the original scanned every index entry and cost ~9.5 s per commit.
+
+**`untracked-deps` is anchored on invocation, not on path-shaped text.** Matching any path-like
+substring false-positives on docstrings and message strings *and* misses the real defect, whose
+line is `source "$GATE_SCRIPT_DIR/gate-status.sh"` — a variable-built path matching no literal. So:
+match the verb, then resolve by basename. The defect it ends is a tracked gate script sourcing an
+untracked helper — shipped, and dead on every machine but the author's.
+
+**`structural` exemptions are named, never silent.** A macOS VM task has no Dockerfile by design.
+There is deliberately **no** exemption for a missing `*.pem`: an earlier one claimed the key was
+injected at build time; it is not, and the build dies at that `COPY`. An undocumented exemption is
+indistinguishable from a bug, and a gate that fires known false positives is one people learn to
+skim.
+
+### 15c. Whose task is this?
+
+Two independent answers, and benchsmith uses both:
+
+- **`currentUserIsTaskOwner`** — computed by the platform for your credential (§12). Authoritative,
+  needs the network.
+- **`task-author`** — `task.toml`'s `authors[].name` against `git config user.name`. Works in a
+  fresh clone with no connectivity, which is exactly where a worker is when it decides whether to
+  touch a directory.
+
+A foreign task is **skipped, never failed**, and that distinction is load-bearing. Failing it
+deadlocks the moment you merge a colleague's commits: their directory appears in the range, the
+gate refuses to assess a task whose intent you do not hold, so the required receipt can never
+exist, and the only escape is a bypass that disables the check for *your* tasks too. A gate that
+cannot go green is not a gate.
+
+### 15d. The formatters
 
 The scratch and base-tree clones also carry a `.githooks/pre-commit` running prettier and eslint
 over `web/src`. Benchsmith reproduces it so the repo copy can be deleted and every worker gets the

@@ -2055,5 +2055,115 @@ check("the diff checks are push-required",
       {"diff-ratchet", "diff-weakening"} <= set(gate_mod.PUSH_REQUIRED), True)
 
 
+# --- contamination, untracked deps, task author, structural ------------------
+
+from benchsmith import contamination as cont  # noqa: E402
+from benchsmith import deps as depsmod  # noqa: E402
+
+_cr2 = Path(tempfile.mkdtemp()) / "contrepo"
+(_cr2 / "mytask").mkdir(parents=True)
+
+
+def _cg(*a):
+    return subprocess.run(["git", "-C", str(_cr2), *a], capture_output=True, text=True)
+
+
+_cg("init", "-q", "-b", "main"); _cg("config", "user.email", "t@t"); _cg("config", "user.name", "Kristin Green")
+(_cr2 / "mytask" / "solve.sh").write_text("#!/bin/sh\napply_the_fix\n")
+(_cr2 / "README.md").write_text("docs\n")
+_cg("add", "-A"); _cg("commit", "-qm", "base")
+check("a clean solve.sh passes", cont.check(_cr2)["state"], "PASS")
+
+# The working tree is deliberately ignored: restoring solve.sh on disk after a
+# mutant run still ships the mutant if the INDEX holds the contaminated blob.
+(_cr2 / "mytask" / "solve.sh").write_text("#!/bin/sh\n# mutant applied\napply_the_fix\n")
+_cg("add", "-A")
+(_cr2 / "mytask" / "solve.sh").write_text("#!/bin/sh\napply_the_fix\n")  # "cleaned" on disk
+_c1 = cont.check(_cr2)
+check("an overlay marker in the index is caught despite a clean worktree",
+      _c1["state"], "FAIL")
+check("...and names the marker", "mutant applied" in _c1["detail"], True)
+_cg("reset", "-q", "--hard")
+
+for artifact in [".solve.sh.restore.1", ".solve.sh.bak"]:
+    (_cr2 / "mytask" / artifact).write_text("x\n")
+    _cg("add", "-A")
+    check(f"a tracked transaction artifact is caught ({artifact})",
+          cont.check(_cr2)["state"], "FAIL")
+    _cg("reset", "-q", "--hard"); _cg("clean", "-qfd")
+
+# Intentional negative controls are contaminated on purpose.
+(_cr2 / "gate-fixtures").mkdir(exist_ok=True)
+(_cr2 / "gate-fixtures" / "solve.sh").write_text("# mutant applied\n")
+_cg("add", "-A")
+check("gate-fixtures are excluded", cont.check(_cr2)["state"], "PASS")
+_cg("reset", "-q", "--hard"); _cg("clean", "-qfd")
+
+# --- untracked deps ---
+(_cr2 / "scripts").mkdir(exist_ok=True)
+(_cr2 / "scripts" / "gate.sh").write_text(
+    '#!/bin/sh\nGATE_SCRIPT_DIR=scripts\nsource "$GATE_SCRIPT_DIR/helper.sh"\n')
+_cg("add", "-A")
+_d1 = depsmod.check(_cr2)
+check("a source of an uncommitted helper is caught", _d1["state"], "FAIL")
+check("...and names it", "helper.sh" in _d1["detail"], True)
+check("...and says a fresh clone will not have it",
+      "fresh clone" in _d1["detail"], True)
+
+(_cr2 / "scripts" / "helper.sh").write_text("#!/bin/sh\n:\n")
+_cg("add", "-A")
+check("committing the helper clears it", depsmod.check(_cr2)["state"], "PASS")
+
+# Path-shaped text that is not an invocation must not false-positive -- that is
+# what made an earlier cut of this check unusable.
+(_cr2 / "scripts" / "prose.sh").write_text(
+    '#!/bin/sh\necho "see scripts/nonexistent.sh for details"\n'
+    'skip "no gate-fixtures/run.sh - NO CHECK HAS A FALSIFIER"\n')
+_cg("add", "-A")
+check("path-shaped text in a message is not an invocation", depsmod.check(_cr2)["state"], "PASS")
+_cg("reset", "-q", "--hard"); _cg("clean", "-qfd")
+
+check("a repo with no tooling file is NOT_RUN, not clean",
+      depsmod.check(Path(tempfile.mkdtemp()))["state"], "NOT_RUN")
+
+# --- task author (works offline; complements the platform's owner field) ---
+_ar = Path(tempfile.mkdtemp()) / "authrepo"
+(_ar / "mytask").mkdir(parents=True)
+subprocess.run(["git", "-C", str(_ar), "init", "-q", "-b", "main"], capture_output=True)
+subprocess.run(["git", "-C", str(_ar), "config", "user.name", "Kristin Green"], capture_output=True)
+
+_rep = gate_mod.Report()
+gate_mod.check_task_author(_ar, _ar / "mytask", "mytask", _rep)
+check("no task.toml is NOT_RUN", {c.name: c for c in _rep.checks}["task-author"].state, "NOT_RUN")
+
+(_ar / "mytask" / "task.toml").write_text('authors = [{ name = "Kristin Green" }]\n')
+_rep = gate_mod.Report()
+gate_mod.check_task_author(_ar, _ar / "mytask", "mytask", _rep)
+check("our own task passes", {c.name: c for c in _rep.checks}["task-author"].state, "PASS")
+
+# A colleague's task is SKIPPED, never FAILED. Failing it deadlocks the moment
+# you merge their commits: the gate cannot assess a task whose intent you do not
+# hold, so the receipt can never exist, and the only escape disables the check
+# for your own tasks too.
+(_ar / "mytask" / "task.toml").write_text('authors = [{ name = "Someone Else" }]\n')
+_rep = gate_mod.Report()
+gate_mod.check_task_author(_ar, _ar / "mytask", "mytask", _rep)
+_ta = {c.name: c for c in _rep.checks}["task-author"]
+check("a colleague's task is not gated here", _ta.state, "NOT_RUN")
+check("...and does not block", _ta.blocks, False)
+check("...and says whose it is", "Someone Else" in _ta.detail, True)
+
+# --- structural (G4) ---
+_sr = Path(tempfile.mkdtemp()) / "vmtask"
+(_sr / "environment").mkdir(parents=True)
+(_sr / "environment" / "vm.conf").write_text("image=abc\n")
+_rep = gate_mod.Report()
+gate_mod.check_structural(_sr, _rep, binary="definitely-not-a-binary")
+check("an unavailable validator is NOT_RUN, not a pass",
+      {c.name: c for c in _rep.checks}["structural"].state, "NOT_RUN")
+
+check("contamination is push-required", "contamination" in gate_mod.PUSH_REQUIRED, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

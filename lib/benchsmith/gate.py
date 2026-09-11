@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tomllib
 from datetime import datetime, timezone
@@ -31,7 +32,7 @@ PASS, FAIL, NOT_RUN = "PASS", "FAIL", "NOT_RUN"
 # are the ones where NOT_RUN and FAIL have the same consequence: you do not know
 # the thing you would have to know in order to push.
 PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags",
-                 "diff-ratchet", "diff-weakening")
+                 "diff-ratchet", "diff-weakening", "contamination")
 
 
 @dataclass
@@ -435,6 +436,114 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
         report.add("single-lever", PASS, f"one lever: {hit.pop()}")
 
 
+TOML_AUTHOR = re.compile(
+    r'authors\s*=\s*\[\s*\{\s*name\s*=\s*"([^"]*)"', re.S)
+
+
+def check_task_author(repo_root: Path, task_dir: Path, task_name: str, report: Report) -> None:
+    """Is this our task to be changing?
+
+    Complements the platform's `currentUserIsTaskOwner`, which needs the network
+    and a credential. This works in a fresh clone with no connectivity, which is
+    exactly where a worker is when it decides whether to touch a directory.
+
+    Foreign tasks are SKIPPED, not failed, and the distinction is load-bearing.
+    The original hook records why: demanding a green receipt for every touched
+    task deadlocks the moment you merge a colleague's commits -- their directory
+    appears in the range, the gate refuses to assess a task whose intent you do
+    not hold, so the receipt can never exist, and the only way out is a bypass
+    that disables the check for YOUR tasks too. A gate that cannot go green is
+    not a gate.
+    """
+    toml = Path(task_dir) / "task.toml"
+    if not toml.is_file():
+        report.add("task-author", NOT_RUN, "no task.toml to read an author from")
+        return
+    try:
+        m = TOML_AUTHOR.search(toml.read_text(errors="replace"))
+    except OSError as e:
+        report.add("task-author", NOT_RUN, f"could not read task.toml: {e}")
+        return
+    author = (m.group(1).strip() if m else "")
+    if not author:
+        report.add("task-author", NOT_RUN, "task.toml declares no author")
+        return
+    r = subprocess.run(["git", "-C", str(repo_root), "config", "user.name"],
+                       capture_output=True, text=True)
+    me = r.stdout.strip()
+    if not me:
+        report.add("task-author", NOT_RUN, "git user.name is unset; cannot tell whose task this is")
+        return
+    if author != me:
+        report.add("task-author", NOT_RUN,
+                   f"{task_name} is authored by {author}, not {me} — out of scope, not gated here",
+                   blocking=False)
+        return
+    report.add("task-author", PASS, f"authored by {me}")
+
+
+def check_contamination(repo_root: Path, report: Report) -> None:
+    """Overlay markers and transaction artifacts, read from the git snapshot."""
+    from . import contamination
+
+    res = contamination.check(Path(repo_root))
+    report.add("contamination", res["state"], res["detail"])
+
+
+def check_untracked_deps(repo_root: Path, report: Report) -> None:
+    """A committed file may not invoke a path that is not committed."""
+    from . import deps
+
+    res = deps.check(Path(repo_root))
+    report.add("untracked-deps", res["state"], res["detail"])
+
+
+def check_structural(task_dir: Path, report: Report, binary: str = "codimango") -> None:
+    """Upstream structural validation (G4).
+
+    Exemptions are named, never silent. An undocumented exemption is
+    indistinguishable from a bug, and a gate that fires known false positives is
+    one people learn to skim -- which is how a real finding gets missed.
+    """
+    is_vm = (Path(task_dir) / "environment" / "vm.conf").is_file()
+    try:
+        r = subprocess.run(
+            [binary, "bench", "validate", "-p", str(task_dir), "--structural-only", "--json"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        report.add("structural", NOT_RUN, f"could not run upstream validation: {e}")
+        return
+    body = r.stdout[r.stdout.find("{"):] if "{" in r.stdout else ""
+    if not body:
+        report.add("structural", NOT_RUN, "upstream validation returned no JSON")
+        return
+    try:
+        checks = json.loads(body)["structural"]["checks"]
+    except (ValueError, KeyError, TypeError) as e:
+        report.add("structural", NOT_RUN, f"could not parse structural JSON: {e}")
+        return
+
+    failed, exempted = [], []
+    for c in checks:
+        if str(c.get("status", "")).lower() in ("pass", "ok", "passed"):
+            continue
+        detail = str(c.get("details") or "")
+        # A macOS VM task has no Dockerfile by design -- the environment is
+        # vm.conf plus an image digest, and the upstream check cannot tell the
+        # difference. There is deliberately NO exemption for a missing *.pem:
+        # an earlier one claimed the key was injected at build time; it is not,
+        # and the build dies at that COPY.
+        if is_vm and "Dockerfile" in detail and "missing" in detail.lower():
+            exempted.append(f"{c.get('name')} (VM task: no Dockerfile by design)")
+            continue
+        failed.append(f"{c.get('name')}: {detail[:100]}")
+    note = f"; exempted: {', '.join(exempted)}" if exempted else ""
+    report.add("structural", FAIL if failed else PASS,
+               ("; ".join(failed[:4]) + note) if failed
+               else f"{len(checks)} upstream check(s) pass{note}")
+
+
 def check_diff(repo_root: Path, report: Report) -> None:
     """Staged-vs-HEAD checks: is this change worse than the last one?
 
@@ -513,6 +622,9 @@ def run(
     check_budget(journal, report)
     check_scope(repo_root, task_name, report)
     check_single_lever(repo_root, task_name, journal.mode, report)
+    check_task_author(repo_root, task_dir, task_name, report)
+    check_contamination(repo_root, report)
+    check_untracked_deps(repo_root, report)
     check_diff(repo_root, report)
     check_formatting(repo_root, report, hook_specs)
     check_hygiene(task_dir, report)
