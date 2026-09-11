@@ -1136,7 +1136,7 @@ check("local codex workers get no host preamble",
 check("the host preamble is forceable for a local worker",
       any("NOT ON THE HOST" in a
           for a in dsp.plan("t1", _REPO, backend="codex", bootstrap=True).argv), True)
-check("plan is shell-quotable", "benchsmith harden: t1" in _p.shell, True)
+check("plan is shell-quotable", "[benchsmith][harden]: t1" in _p.shell, True)
 check("task appears in the prompt, not just the title",
       any("t1" in a and "YOU MAY NOT PUSH" in a for a in _p.argv), True)
 # "Use the benchsmith skill" sends the agent hunting for a Skillbook alias that
@@ -2599,9 +2599,9 @@ except dsp.DispatchRefused as e:
 
 # Twelve identically-titled sessions are unreadable in a fleet view.
 check("the session title names the mode",
-      any(a == "benchsmith harden: real-task" for a in dsp.plan("real-task", str(_dr2)).argv), True)
+      any(a == "[benchsmith][harden]: real-task" for a in dsp.plan("real-task", str(_dr2)).argv), True)
 check("...and differs by mode",
-      any(a == "benchsmith repair: real-task"
+      any(a == "[benchsmith][revise]: real-task"
           for a in dsp.plan("real-task", str(_dr2), mode="repair").argv), True)
 
 
@@ -2724,8 +2724,8 @@ _missing = dsp.collect("s1", repo=str(_hf), task="absent",
                        runner=_pages(([_block("no answer"), {"type": "run_finished"}], False)))
 check("no file falls back to the session", _missing["state"], "finished-without-handoff")
 
-_prompt = [a for a in dsp.plan("real", "/tmp/bsdemo").argv if "handoff" in a][0]
-check("the worker writes the handoff to a file", ".benchsmith/handoff/real.json" in _prompt, True)
+_prompt = [a for a in dsp.plan("t1", _REPO).argv if "handoff" in a][0]
+check("the worker writes the handoff to a file", ".benchsmith/handoff/t1.json" in _prompt, True)
 check("...and is told not to print the JSON", "Do not print the JSON itself" in _prompt, True)
 check("...but to say one plain sentence", "one plain sentence" in _prompt, True)
 
@@ -2750,6 +2750,42 @@ for _s in ("blocked", "needs_human", "failed"):
     check(f"{_s} needs a person", _s in dsp.NEEDS_A_HUMAN, True)
 check("ready_to_publish does not", "ready_to_publish" in dsp.NEEDS_A_HUMAN, False)
 check("no_change does not", "no_change" in dsp.NEEDS_A_HUMAN, False)
+
+
+# --- titles and orchestrator reporting ---------------------------------------
+
+check("harden titles read as a fleet row",
+      [a for a in dsp.plan("t1", _REPO).argv if a.startswith("[benchsmith]")],
+      ["[benchsmith][harden]: t1"])
+# `needs_revision` is the platform's word, so `revise` is the operator's; the
+# journal keeps recording `repair`, which is the internal mode name.
+check("repair is labelled revise", dsp.mode_label("repair"), "revise")
+check("revise is accepted on input too",
+      [a for a in dsp.plan("t1", _REPO, mode="revise").argv
+       if a.startswith("[benchsmith]")],
+      ["[benchsmith][revise]: t1"])
+check("...and maps back to the recorded mode", dsp.MODE_ALIASES["revise"], "repair")
+check("the orchestrator has a name of its own", dsp.ORCHESTRATOR_TITLE, "[benchsmith] orchestrator")
+
+_calls2 = []
+
+
+def _spy_rename(argv):
+    _calls2.append(argv)
+    class R:
+        returncode = 0
+    return R()
+
+
+check("a session can be retitled",
+      dsp.rename("s1", dsp.ORCHESTRATOR_TITLE, runner=_spy_rename)["renamed"], True)
+check("...through the ui surface", "rename" in _calls2[-1], True)
+
+_s3 = " ".join(Path("/home/kngreen/.claude/skills/benchsmith/SKILL.md").read_text().split())
+check("the orchestrator is told to name itself", "[benchsmith] orchestrator" in _s3, True)
+check("...and to report as it goes", "benchsmith status --repo" in _s3, True)
+# Twenty minutes of silence while eight workers run looks exactly like a hang.
+check("...and why", "indistinguishable from a hang" in _s3, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

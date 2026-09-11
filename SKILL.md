@@ -103,6 +103,28 @@ Concurrency on **one** repository is safe, and it is worth knowing why, because 
 Under the old exact-SHA rule neither was true, which is why a low worker count used to be the only
 safe setting. `workersPerRepo` in the output tells you how much is landing in each.
 
+**Name yourself first.** You are the orchestrator, and your session should say so in the inbox
+next to the workers you start:
+
+```bash
+meta agentcloud.ui rename --session-id YOUR-SESSION-ID --title '[benchsmith] orchestrator'
+```
+
+Workers are titled `[benchsmith][harden]: <task>`, `[benchsmith][revise]: <task>` or
+`[benchsmith][scaffold]: <task>` automatically, so the fleet view reads as a list of what is being
+done to what.
+
+**Report as you go.** You are the only place the operator can see the fleet, so narrate it: say
+what you started, and post a short update whenever a worker changes state. Not a transcript — one
+line each.
+
+```bash
+benchsmith status --repo REPO
+```
+
+That returns every dispatched worker with its task, mode and current state. Post it as a short
+table. Silence for twenty minutes while eight workers run is indistinguishable from a hang.
+
 **Announce, then go.** Before the first worker's first round, say plainly which tasks you picked
 and why each is on the list — "I'm going to start iterating on these three: X (needs revision),
 Y (needs revision), Z (draft, validation failing)". That is a statement, not a question. Do not

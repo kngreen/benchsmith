@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -425,6 +426,16 @@ def cmd_fleet(args) -> int:
         payload["needsGsdBoard"] = needs_board
     if clamp_note:
         payload["clamped"] = clamp_note
+    if args.apply and started:
+        # Written down because a coordinator that only remembers its workers
+        # in-context forgets them on compaction, and an unremembered worker is
+        # one nobody collects.
+        run_dir = repo / ".benchsmith" / "fleet"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "current.json").write_text(json.dumps(
+            {"started": started, "at": time.time(),
+             "plans": [{k: v for k, v in pl.items() if k in ("task", "repo", "mode", "session")}
+                       for pl in plans if "session" in pl]}, indent=1))
     if not args.apply:
         payload["hint"] = "re-run with --apply to start these"
     _out(payload)
@@ -475,6 +486,27 @@ def cmd_scaffold(args) -> int:
         out["shell"] = p.shell
         out["hint"] = "re-run with --apply to start it"
     _out(out)
+    return 0
+
+
+def cmd_status(args) -> int:
+    """What every dispatched worker is doing right now, in one line each."""
+    repo = Path(args.repo).resolve()
+    try:
+        run = json.loads((repo / ".benchsmith" / "fleet" / "current.json").read_text())
+    except (OSError, ValueError):
+        _out({"workers": [], "reason": "no fleet run recorded in this checkout"})
+        return 0
+    rows = []
+    for pl in run.get("plans") or []:
+        sid = pl.get("session") or ""
+        res = dispatch_mod.collect(sid, repo=pl.get("repo", ""), task=pl.get("task", ""))
+        hand = res.get("handoff") or {}
+        rows.append({"task": pl.get("task"), "mode": pl.get("mode"), "session": sid,
+                     "state": hand.get("state") or res.get("state"),
+                     "note": (hand.get("note") or res.get("reason") or "")[:110]})
+    done = [r for r in rows if r["state"] not in ("running", "starting")]
+    _out({"workers": rows, "running": len(rows) - len(done), "finished": len(done)})
     return 0
 
 
@@ -790,6 +822,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="codex by default: it runs on this host, where benchsmith is installed")
     s.add_argument("--apply", action="store_true")
     s.set_defaults(fn=cmd_scaffold)
+
+    s = sub.add_parser("status", help="what every dispatched worker is doing")
+    s.add_argument("--repo", default=".")
+    s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("collect", help="read a worker session and return its handoff")
     s.add_argument("--session-id", required=True)

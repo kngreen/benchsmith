@@ -63,6 +63,17 @@ HANDOFF_STATES = frozenset({
 # Names that are almost certainly an unsubstituted placeholder rather than a
 # task. Twelve sessions were once started as `benchsmith: t`, from a `--task <t>`
 # in the skill text that an agent copied literally.
+# What a mode is called in a session title. `needs_revision` is the platform's
+# word for the state, so `revise` is the operator-facing label for the work;
+# `repair` stays the internal mode name because the journal records it.
+MODE_LABELS = {"harden": "harden", "repair": "revise", "revise": "revise", "scaffold": "scaffold"}
+MODE_ALIASES = {"revise": "repair"}
+
+
+def mode_label(mode: str) -> str:
+    return MODE_LABELS.get(mode or "harden", mode or "harden")
+
+
 PLACEHOLDERS = frozenset({
     "t", "f", "n", "x", "task", "name", "taskname", "task-name", "task_name",
     "repo", "handoff", "session", "id", "foo", "bar", "example", "todo",
@@ -272,6 +283,7 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
     if bootstrap is None:
         # A local worker already has the files. A remote one does not.
         bootstrap = backend == "agentcloud"
+    mode = MODE_ALIASES.get(mode, mode)
     bad = _placeholder(task)
     if bad:
         raise DispatchRefused(bad)
@@ -314,10 +326,11 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
                 "metacode and claude are not agentcloud harnesses -- run those locally."
             )
         # Twelve identically-named sessions are unreadable in a fleet view, so
-        # the title carries what tells them apart: the task and what is being
+        # the title carries what tells them apart: the task, and what is being
         # done to it.
         argv = ["meta", "agentcloud.session", "create",
-                "--title", f"benchsmith {mode}: {task}", "--message", prompt, "--output", "json"]
+                "--title", f"[benchsmith][{mode_label(mode)}]: {task}",
+                "--message", prompt, "--output", "json"]
         if harness:
             argv[3:3] = ["--harness", harness]
         if skills:
@@ -402,6 +415,18 @@ def poll_session(sid: str, *, limit: int = 400, max_pages: int = 20,
         if not cursor:
             return events, ""
     return events, f"stopped after {max_pages} pages; the journal may be longer"
+
+
+ORCHESTRATOR_TITLE = "[benchsmith] orchestrator"
+
+
+def rename(sid: str, title: str, *, runner=None) -> dict:
+    """Retitle a session. Used to mark the coordinator's own."""
+    argv = ["meta", "agentcloud.ui", "rename", "--session-id", sid, "--title", title]
+    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=120))
+    r = run(argv)
+    code = r[0] if isinstance(r, tuple) else r.returncode
+    return {"session": sid, "title": title, "renamed": code == 0}
 
 
 def snooze(sid: str, duration: str = "24h", *, runner=None) -> dict:
