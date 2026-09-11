@@ -20,6 +20,13 @@ MIXED = (0.20, 0.60)  # per strongest member
 MEDIUM_BAND = (0.50, 0.80)
 SINGLE_GATE_KILL = 0.80
 MIN_FAMILIES = 2
+
+# The 1P model the corpus exists to train. It is deliberately NOT in the frozen
+# strongest set -- it never substitutes for a missing GPT/Opus member -- which
+# left it entirely unchecked: a task where avocado passed every trial scored HARD
+# with no findings at all. A task the model under test already solves carries no
+# training signal, whatever the other cohorts do.
+MODEL_UNDER_TEST = frozenset({"avocado", "metacode"})
 MIN_CATEGORIES = 2
 
 from .snapshot import REVIEW_PASSING  # noqa: E402  (single source of truth)
@@ -224,6 +231,22 @@ def evaluate(m: Measurement, target: str = "hard-preferred") -> dict:
                     Finding("strongest-not-mixed", f"{member[0]}@{member[1]} {mp}/{mn} = {mrate:.4f} ({state})")
                 )
 
+    # The model under test must record at least one genuine failure.
+    mut_rows = [r for r in _live(m) if r.counts and r.slot.family in MODEL_UNDER_TEST]
+    if mut_rows:
+        mut_fail = [r for r in mut_rows if r.kind.is_hardness_evidence]
+        if not mut_fail:
+            fam = sorted({r.slot.family for r in mut_rows})
+            mp = sum(1 for r in mut_rows if r.kind.is_pass)
+            findings.append(
+                Finding(
+                    "model-under-test-saturated",
+                    f"{'/'.join(fam)} {mp}/{len(mut_rows)} with no genuine semantic failure: "
+                    "the model this corpus trains already solves the task, so it carries no "
+                    "training signal regardless of the other cohorts",
+                )
+            )
+
     fams = {
         r.slot.family for r in _live(m) if r.counts and r.kind.is_hardness_evidence
     }
@@ -324,6 +347,7 @@ def _verdict(findings: list[Finding], p: float, m: Measurement, target: str) -> 
         "unrelated-nonpass",
         "no-strongest-set",
         "strongest-missing",
+        "model-under-test-saturated",
         "step-no-pass",
     }
     if codes & blocking:
