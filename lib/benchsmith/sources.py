@@ -34,11 +34,34 @@ def _run(argv: list[str], timeout: int = 300) -> tuple[int, str, str]:
     return r.returncode, r.stdout, r.stderr
 
 
+def task_list_argv(binary: str = "codimango") -> tuple[list[str] | None, str]:
+    """Ask the installed CLI how to list tasks, never assume.
+
+    `codimango api tasks list` is the legacy spelling; the current CLI exposes
+    `codimango task list` and has dropped `api`. Hardcoding either one means the
+    backlog silently becomes empty on the machine that has the other -- which is
+    what happened, on a fresh runtime, with a real invocation. `adapter.discover`
+    already resolves this; the mistake was going around it.
+    """
+    try:
+        from .adapter import Unresolved, discover
+
+        surface = discover(binary)
+    except Exception as e:  # noqa: BLE001 - discovery failing is a reportable state
+        return None, f"{type(e).__name__}: {e}"
+    if not surface.tasks_list:
+        return None, "the installed CLI exposes no task-list subcommand"
+    return [binary, *surface.site, *surface.tasks_list, "--json"], ""
+
+
 def fetch_codimango(binary: str = "codimango") -> tuple[list[dict], list[str]]:
     """Every task the platform says is ours."""
-    code, out, err = _run([binary, "api", "tasks", "list", "--json"])
+    argv, why = task_list_argv(binary)
+    if argv is None:
+        return [], [f"could not resolve the task-list surface: {why}"]
+    code, out, err = _run(argv)
     if code != 0:
-        return [], [f"codimango task list failed: {err.strip()[:200]}"]
+        return [], [f"`{' '.join(argv)}` failed: {err.strip()[:200]}"]
     try:
         doc = json.loads(out[out.index("{"):]) if "{" in out else {}
     except ValueError as e:

@@ -43,6 +43,7 @@ class Surface:
     binary: str
     site: tuple[str, ...] = ()  # e.g. ("--site", "nest")
     task_show: tuple[str, ...] = ()
+    tasks_list: tuple[str, ...] = ()
     jobs_list: tuple[str, ...] = ()
     trials_list: tuple[str, ...] = ()
     trials_artifacts: tuple[str, ...] = ()
@@ -56,6 +57,7 @@ class Surface:
         return {
             "binary": self.binary,
             "site": list(self.site),
+            "tasks_list": list(self.tasks_list),
             "legacy": self.legacy,
             "supportsNoCache": self.supports_no_cache,
             "supportsAgenticReview": self.supports_agentic_review,
@@ -136,6 +138,7 @@ def discover(binary: str | None = None, site: str | None = None) -> Surface:
         api = _commands(_help(binary, "api"))
         if {"tasks", "jobs", "trials"} <= api:
             surface.task_show = ("api", "tasks", "show")
+            surface.tasks_list = ("api", "tasks", "list")
             surface.jobs_list = ("api", "jobs", "list")
             surface.trials_list = ("api", "trials", "list")
             surface.trials_artifacts = ("api", "trials", "artifacts")
@@ -150,6 +153,7 @@ def discover(binary: str | None = None, site: str | None = None) -> Surface:
                 f"missing {sorted(missing)}. Commands seen: {sorted(commands)}"
             )
         surface.task_show = ("task", "show")
+        surface.tasks_list = ("task", "list")
         surface.jobs_list = ("job", "list")
         surface.trials_list = ("trial", "list")
         surface.trials_artifacts = ("trial", "artifacts")

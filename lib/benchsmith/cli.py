@@ -331,8 +331,17 @@ def cmd_fleet(args) -> int:
         entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
                  "repo": target, "mode": mode}
         if args.apply:
-            entry["result"] = dispatch_mod.run(p, apply=True)
-            started.append(item.task)
+            res = dispatch_mod.run(p, apply=True)
+            # The session id is the only thing that makes a dispatch followable.
+            # Returning the raw stdout and leaving the caller to dig it out is
+            # how a supervisor loses track of a worker it started.
+            sid = dispatch_mod.session_id(res.get("stdout") or "")
+            entry["ok"] = res.get("ok")
+            entry["session"] = sid
+            if not sid:
+                entry["warning"] = "started but returned no session id; it cannot be followed"
+            entry["error"] = res.get("error") or (res.get("stderr") or "")[:200] or None
+            started.append({"task": item.task, "session": sid})
         else:
             entry["shell"] = p.shell
         plans.append(entry)
@@ -342,6 +351,13 @@ def cmd_fleet(args) -> int:
           "started": started, "plans": plans, "notes": raw.get("notes") or [],
           "hint": None if args.apply else "re-run with --apply to start these"})
     return 0
+
+
+def cmd_collect(args) -> int:
+    """Read one worker's session and return its handoff, if it produced one."""
+    res = dispatch_mod.collect(args.session_id)
+    _out(res)
+    return 0 if res.get("state") == "done" else 1
 
 
 def cmd_config(args) -> int:
@@ -632,6 +648,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--bench", default="codimango")
     s.add_argument("--timeout", type=int, default=3600)
     s.set_defaults(fn=cmd_corpus)
+
+    s = sub.add_parser("collect", help="read a worker session and return its handoff")
+    s.add_argument("--session-id", required=True)
+    s.set_defaults(fn=cmd_collect)
 
     s = sub.add_parser("resolve", help="task name, id, or submissions URL -> a bound task")
     s.add_argument("ref")

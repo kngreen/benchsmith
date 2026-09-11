@@ -17,47 +17,70 @@ journal at `.benchsmith/<task>.json` is written only by `benchsmith record` — 
 hand-written journal produces none of the fields the loop reads back, and stall detection, the
 budget, regression comparison and excursion detection all go blind at once.
 
-## On invocation — route, do not ask
+## On invocation — run it, do not describe it
 
-**You were invoked with an argument or without one. That decides everything, and neither case
-involves asking the user what to work on.** "Benchsmith is ready, send me a task" is a failed
-invocation: they already told you, or they meant the backlog.
+**You execute. The user does not.** They invoked a skill, not a manual. Never print a command for
+them to run, never ask which task, never stop to confirm before starting work. If you find yourself
+writing "you can run…", you have already failed the invocation — run it.
 
-### With an argument — one task
+"Benchsmith is ready, send me a task" is the specific failure to avoid. They either named a task or
+they meant the backlog. Those are the only two cases.
 
-The argument may be a task name, a numeric id, or a submissions URL pasted from the browser. Do
-not parse it yourself:
+### Case 1 — they gave you something
+
+A task name, a numeric id, or a submissions URL pasted from the browser. Do not parse it yourself:
 
 ```bash
 benchsmith resolve "<whatever they gave you>"
 ```
 
-That returns the canonical `task`, the `repo` that holds it, whether you `owned` it, and the `mode`
-to run in — `repair` when the platform says `needs_revision`, `harden` otherwise. Then run **the
-round** below against exactly that task, and nothing else.
+Then **start the round immediately** against exactly that task, in the `repo` and `mode` it
+returned (`repair` when the platform says `needs_revision`, else `harden`). Keep looping rounds in
+this session until a terminal state; do not report after round one and wait.
 
-Three things it tells you that you must honour:
+Stop only for these, and say which:
 
-- **`owned: false`** — stop. Say who owns it. Hardening somebody else's task is not recoverable.
-- **`repo: null`** — no checkout on this host holds it. Say so; do not scaffold a new one.
-- **`otherRepos`** — the task exists in several clones and you are getting the canonical-looking
-  one. If the work is about a specific clone, the user has to say which.
+| Resolver says | You stop because |
+|---|---|
+| `owned: false` | it is someone else's task; name the owner |
+| `repo: null` | no checkout on this host holds it |
+| unresolved | the reference matches nothing; quote what you tried |
 
-### Without an argument — the backlog
+`otherRepos` is not a stop. Proceed in the canonical one and mention the others exist.
 
-You are the coordinator. The queue answers "what next", so do not ask it.
+### Case 2 — they gave you nothing
+
+You are the coordinator. Start work; do not present a plan and wait.
 
 ```bash
-benchsmith fleet --workers 3            # discover, order, and show what it would start
-benchsmith fleet --workers 3 --apply    # actually start them
+benchsmith fleet --workers 3 --apply
 ```
 
-`fleet` fetches from Codimango and the GSD board, orders by tier — needs-revision, then failing
-drafts, pending, passing, then board cards — resolves each task to the checkout that actually holds
-it, and dispatches one non-publishing worker per task. **Plan first and show it.** Starting three
-agents is worth one round-trip; asking which of thirty-two tasks to work on is not.
+That discovers from Codimango and the GSD board, orders by tier, resolves each task to the checkout
+that holds it, and starts one non-publishing worker per task. It returns a `session` per worker.
 
-Workers prepare and stop. **You hold the publish lane** — see `references/coordinator.md`.
+Then **supervise, in a loop, without being asked**:
+
+```bash
+benchsmith collect --session-id <session>     # per worker, until state is not "running"
+```
+
+| Handoff state | What you do |
+|---|---|
+| `ready_to_publish` | `benchsmith publish --repo <repo> --task <t> --handoff <f> --apply` |
+| `blocked` / `needs_human` | record it, move on, report at the end |
+| `no_change` / `failed` | record it, move on |
+| `finished-without-handoff` | the worker did not answer; treat as failed, do not guess |
+
+When a worker finishes, dispatch the next queue item into the free slot. Keep going until the queue
+drains or every remaining item needs a human, then report once: what published, what is blocked,
+and why.
+
+**Do not ask permission to start workers.** The safety is structural, not conversational — workers
+cannot push, publishing requires a gate receipt, and one lane per repository is enforced in code.
+A confirmation round-trip buys nothing those do not already guarantee.
+
+**Publishing is yours alone.** Workers prepare and stop; see `references/coordinator.md`.
 
 ### The flows, once you know which task
 

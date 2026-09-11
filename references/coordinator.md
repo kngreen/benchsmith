@@ -115,8 +115,9 @@ benchsmith dispatch --repo <path> --task <name>            # plan only; writes n
 benchsmith dispatch --repo <path> --task <name> --apply    # actually start it
 ```
 
-Planning is the default and printing a plan is free, so **read the command before you run fifteen
-of them.**
+Planning is the default so a plan can always be inspected, but **you are not waiting for anyone to
+read it.** Dispatch, then supervise. The safety is structural — workers cannot push, publishing
+needs a gate receipt, one lane per repository — not a confirmation step.
 
 Three backends, and the choice is a capability question, not a preference:
 

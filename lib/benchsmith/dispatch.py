@@ -228,6 +228,94 @@ def run(p: Plan, *, apply: bool = False, timeout: int = 900) -> dict:
             "stdout": r.stdout[-4000:], "stderr": r.stderr[-2000:]}
 
 
+def session_id(stdout: str) -> str:
+    """The id `agentcloud.session create` returned, so a caller can follow it."""
+    try:
+        doc = json.loads(stdout[stdout.index("{"):]) if "{" in stdout else {}
+    except ValueError:
+        return ""
+    return str(doc.get("session_id") or "")
+
+
+def poll_session(sid: str, *, limit: int = 400, max_pages: int = 20,
+                 runner=None) -> tuple[list[dict], str]:
+    """Read a session journal to the end.
+
+    Seq numbers are NOT contiguous, so the end cannot be computed -- it has to be
+    walked. A single page looks complete and is usually the beginning.
+    """
+    def _call(argv):
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+        return r.returncode, r.stdout, r.stderr
+
+    call = runner or _call
+    events: list[dict] = []
+    cursor, pages = "", 0
+    while pages < max_pages:
+        argv = ["meta", "agentcloud.session", "poll", "--session-id", sid,
+                "--output", "json", "--limit", str(limit)]
+        if cursor:
+            argv += ["--cursor", cursor]
+        code, out, err = call(argv)
+        if code != 0:
+            return events, f"poll failed: {err.strip()[:160]}"
+        docs, i, dec = [], 0, json.JSONDecoder()
+        while i < len(out):
+            while i < len(out) and out[i] in " \n\r\t":
+                i += 1
+            if i >= len(out):
+                break
+            try:
+                obj, i = dec.raw_decode(out, i)
+            except ValueError:
+                break
+            docs.append(obj)
+        if docs and isinstance(docs[0], list):
+            events.extend(docs[0])
+        meta = docs[1] if len(docs) > 1 and isinstance(docs[1], dict) else {}
+        if str(meta.get("has_more")) != "yes":
+            return events, ""
+        cursor, pages = str(meta.get("next_cursor") or ""), pages + 1
+        if not cursor:
+            return events, ""
+    return events, f"stopped after {max_pages} pages; the journal may be longer"
+
+
+def collect(sid: str, *, runner=None) -> dict:
+    """Everything a supervisor needs from one worker, in one call."""
+    events, why = poll_session(sid, runner=runner)
+    if why and not events:
+        return {"session": sid, "state": "unreadable", "reason": why}
+
+    finished = any(str(e.get("type")) in ("run_finished", "session_archived") for e in events)
+    texts: list[str] = []
+    for e in events:
+        ev = e.get("event")
+        if isinstance(ev, str):
+            try:
+                ev = json.loads(ev)
+            except ValueError:
+                continue
+        if isinstance(ev, dict):
+            block = ev.get("block") or {}
+            txt = block.get("text") or block.get("content") or ""
+            if isinstance(txt, str) and txt.strip():
+                texts.append(txt)
+
+    # Newest first: a worker may reason about the handoff shape before emitting
+    # it, and an earlier mention must not be mistaken for the answer.
+    for txt in reversed(texts):
+        try:
+            return {"session": sid, "state": "done", "handoff": parse_handoff(txt)}
+        except DispatchRefused:
+            continue
+    return {"session": sid,
+            "state": "finished-without-handoff" if finished else "running",
+            "reason": ("the worker finished but emitted no valid handoff"
+                       if finished else "still working"),
+            "events": len(events)}
+
+
 def parse_handoff(text: str) -> dict:
     """Read a worker's answer, and refuse one that is not an answer."""
     if text is None:

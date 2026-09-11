@@ -27,10 +27,14 @@ class Unresolved(Exception):
 
 
 def _tasks(binary: str = "codimango") -> list[dict]:
-    r = subprocess.run([binary, "api", "tasks", "list", "--json"],
-                       capture_output=True, text=True, timeout=300)
+    from .sources import task_list_argv
+
+    argv, why = task_list_argv(binary)
+    if argv is None:
+        raise Unresolved(f"could not resolve the task-list surface: {why}")
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
     if r.returncode != 0 or "{" not in r.stdout:
-        raise Unresolved(f"could not list tasks: {r.stderr.strip()[:160]}")
+        raise Unresolved(f"`{' '.join(argv)}` failed: {r.stderr.strip()[:160]}")
     return json.loads(r.stdout[r.stdout.index("{"):]).get("tasks") or []
 
 

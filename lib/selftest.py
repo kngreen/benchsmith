@@ -2337,5 +2337,117 @@ except rv.Unresolved:
     check("an empty reference is refused", True, True)
 
 
+# --- collecting a worker's answer --------------------------------------------
+
+check("a session id is lifted from create output",
+      dsp.session_id('{"session_id":"abc-123","in_metamate_catalog":"not yet"}'), "abc-123")
+check("garbage yields no session id", dsp.session_id("boom"), "")
+
+
+def _pages(*pages):
+    """Fake `agentcloud.session poll`: seq numbers are not contiguous, so the
+    end of a journal has to be walked, never computed."""
+    seq = {"n": 0}
+
+    def run(argv):
+        i = seq["n"]; seq["n"] += 1
+        if i >= len(pages):
+            return 0, json.dumps([]) + "\n" + json.dumps({"has_more": "no"}), ""
+        events, more = pages[i]
+        meta = {"has_more": "yes", "next_cursor": str(i + 1)} if more else {"has_more": "no"}
+        return 0, json.dumps(events) + "\n" + json.dumps(meta), ""
+    return run
+
+
+def _block(txt, seq=1):
+    return {"seq": str(seq), "type": "block", "event": json.dumps({"block": {"text": txt}})}
+
+
+_hand = ('{"work_item":"t1","state":"ready_to_publish","commit_sha":"abc",'
+         '"base_sha":"b","gate_receipt":"r","next_action":"publish"}')
+
+# One page looks complete and is usually the beginning.
+_r = dsp.collect("s1", runner=_pages(([_block("thinking")], True),
+                                     ([_block(_hand), {"type": "run_finished"}], False)))
+check("a handoff on a later page is still found", _r["state"], "done")
+check("...and parses", _r["handoff"]["commit_sha"], "abc")
+
+# A worker often reasons about the handoff shape before emitting it; the last
+# valid one is the answer, not the first mention.
+_r2 = dsp.collect("s1", runner=_pages((
+    [_block('I will emit {"state":"ready_to_publish"} when done'),
+     _block(_hand), {"type": "run_finished"}], False)))
+check("the last valid handoff wins", _r2["handoff"]["commit_sha"], "abc")
+
+check("a still-running worker is not mistaken for a failed one",
+      dsp.collect("s1", runner=_pages(([_block("working")], False)))["state"], "running")
+check("a finished worker with no handoff is called out",
+      dsp.collect("s1", runner=_pages(([_block("done!"), {"type": "run_finished"}], False)))["state"],
+      "finished-without-handoff")
+
+
+def _dead(argv):
+    return 1, "", "no such session"
+
+
+check("an unreadable session is not silently empty",
+      dsp.collect("s1", runner=_dead)["state"], "unreadable")
+
+
+# --- the task-list surface is discovered, never assumed ----------------------
+#
+# `codimango api tasks list` is the legacy spelling; the current CLI exposes
+# `codimango task list` and has dropped `api`. Hardcoding either one makes the
+# backlog silently empty on the machine that has the other -- observed on a
+# fresh runtime during a real invocation.
+
+from benchsmith import sources as _src2  # noqa: E402
+from benchsmith.adapter import discover as _disc  # noqa: E402
+
+_LEGACY_LIST = """Usage: codimango api tasks [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  list    List your tasks.
+  show    Show full details.
+"""
+_BARE_ROOT = """Usage: codimango [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  task      Task commands.
+  job       Job commands.
+  trial     Trial commands.
+"""
+
+
+def _surface_help(shape):
+    def fake(binary, *args):
+        key = " ".join(args)
+        if shape == "bare":
+            if not args: return _BARE_ROOT
+            return "Options:\n  --json\n"
+        if not args: return _LEGACY_ROOT
+        if key == "api": return _LEGACY_API
+        return "Options:\n  --json\n"
+    return fake
+
+
+_saved_help = _ad_mod._help
+try:
+    _ad_mod._help = _surface_help("bare")
+    _s = _disc("codimango")
+    check("a CLI without `api` resolves the bare list surface", _s.tasks_list, ("task", "list"))
+    _ad_mod._help = _surface_help("legacy")
+    _s2 = _disc("codimango")
+    check("a CLI with `api` resolves the legacy list surface", _s2.tasks_list, ("api", "tasks", "list"))
+finally:
+    _ad_mod._help = _saved_help
+
+# Discovery failing is a reportable state, never an empty backlog.
+_rows, _notes = _src2.fetch_codimango(binary="definitely-not-a-binary")
+check("an unresolvable CLI yields no rows", _rows, [])
+check("...and says the surface could not be resolved",
+      any("surface" in n or "failed" in n for n in _notes), True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
