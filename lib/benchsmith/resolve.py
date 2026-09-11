@@ -13,6 +13,7 @@ happens not to exist yet.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -20,6 +21,24 @@ from pathlib import Path
 # https://codimango.internalmeta.com/submissions/210976?jobId=...&trialId=...
 URL_ID = re.compile(r"/submissions/(\d+)")
 BARE_ID = re.compile(r"^\d+$")
+# A GSD card. It is an IDEA, not a task: it has no slug, no directory and no
+# oracle, so binding it as though it were a task name points a worker at a
+# checkout with nothing in it.
+GSD_ID = re.compile(r"^T(\d+)$|/tasks/?\?t=(\d+)|internalfb\.com/(T\d+)")
+
+# Track -> the canonical checkout to scaffold into. Read off the card's title
+# prefix, because a T-Bench seed scaffolded into the swe-bench repo is a
+# mistake nobody notices until validation.
+TRACK_REPOS = {
+    "t-bench": ("t-bench-aai-labs",),
+    "swe-bench": ("swe-bench-aai-labs",),
+}
+TRACK_HINTS = ((("t-bench", "tbench", "terminal bench"), "t-bench"),
+               (("swe-bench", "swebench", "swe bench"), "swe-bench"))
+
+STOPWORDS = {"a", "an", "the", "so", "no", "of", "for", "to", "in", "on", "and", "or",
+             "that", "with", "when", "is", "are", "be", "by", "at", "from", "into",
+             "without", "not", "its", "it"}
 
 
 class Unresolved(Exception):
@@ -68,11 +87,71 @@ def _default_roots() -> list[str]:
     return [str(p) for p in sorted(base.glob("*")) if (p / ".git").exists()] if base.is_dir() else []
 
 
+def _gsd_card(number: str) -> dict:
+    r = subprocess.run(["meta", "tasks.task", "describe", "--task", number, "--output", "json"],
+                       capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise Unresolved(f"could not read GSD card {number}: {r.stderr.strip()[:160]}")
+    body = r.stdout[r.stdout.index("{"):] if "{" in r.stdout else ""
+    if not body:
+        raise Unresolved(f"GSD card {number} returned no JSON")
+    doc = json.loads(body)
+    return doc[0] if isinstance(doc, list) else doc
+
+
+def track_of(text: str) -> str:
+    low = (text or "").lower()
+    for needles, track in TRACK_HINTS:
+        if any(n in low for n in needles):
+            return track
+    return ""
+
+
+def slugify(title: str, *, words: int = 4) -> str:
+    """A candidate task name from a card title. Deterministic, so two runs agree."""
+    # Drop a leading bracketed tag: "[T-Bench seed #221] Ordering a schema..."
+    body = re.sub(r"^\s*\[[^\]]*\]\s*", "", title or "")
+    parts = [w for w in re.split(r"[^a-z0-9]+", body.lower()) if w and w not in STOPWORDS]
+    return "-".join(parts[:words])
+
+
+def resolve_gsd(number: str, *, roots: list[str] | None = None) -> dict:
+    """Bind a GSD card as what it is: an idea that has not been scaffolded."""
+    card = _gsd_card(number)
+    title = str(card.get("title") or "")
+    track = track_of(title) or track_of(str(card.get("description") or ""))
+    repo = None
+    if track:
+        markers = TRACK_REPOS.get(track, ())
+        repo = next((r for r in (roots or _default_roots())
+                     if any(Path(r).name.startswith(m) for m in markers)), None)
+    return {
+        "kind": "idea",
+        "gsd": number,
+        "title": title,
+        "section": str(card.get("my_tasks_section") or ""),
+        "owner": str(card.get("owner") or ""),
+        "owned": str(card.get("owner") or "") in ("", os.environ.get("USER", "")),
+        "track": track,
+        # A proposal, not a decision that has been made. It is stated so the flow
+        # continues; a task name is permanent, so it is stated LOUDLY.
+        "suggestedSlug": slugify(title),
+        "repo": repo,
+        "needsScaffold": True,
+        "mode": "scaffold",
+        "description": str(card.get("description") or "")[:4000],
+    }
+
+
 def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = None) -> dict:
     """`ref` may be a task name, a numeric id, or a submissions URL."""
     ref = (ref or "").strip()
     if not ref:
         raise Unresolved("no task reference given")
+
+    g = GSD_ID.search(ref)
+    if g:
+        return resolve_gsd(next(x for x in g.groups() if x).lstrip("T").join(("T", "")), roots=roots)
 
     m = URL_ID.search(ref)
     wanted_id = m.group(1) if m else (ref if BARE_ID.match(ref) else "")

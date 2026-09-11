@@ -350,21 +350,33 @@ def cmd_fleet(args) -> int:
     for item in ready:
         # Each worker is dispatched against the checkout that actually holds its
         # task, not against one repo assumed to hold them all.
+        info = {}
         try:
             info = resolve_mod.resolve(item.task)
             target, mode = info.get("repo"), info.get("mode", "harden")
-        except resolve_mod.Unresolved:
-            target, mode = None, "harden"
-        if not target:
-            plans.append({"task": item.task, "skipped": "no checkout on this host holds it"})
+        except resolve_mod.Unresolved as e:
+            plans.append({"task": item.task, "skipped": f"unresolved: {e}"})
             continue
+        if not target:
+            plans.append({"task": item.task,
+                          "skipped": ("no checkout for track "
+                                      f"{info.get('track') or 'unknown'}" if mode == "scaffold"
+                                      else "no checkout on this host holds it")})
+            continue
+        # An idea is dispatched under its PROPOSED SLUG, not the card number: the
+        # worker is creating that directory, and a card number is not a name.
+        name = info.get("suggestedSlug") or item.task if mode == "scaffold" else item.task
         try:
-            p = dispatch_mod.plan(item.task, target, mode=mode, target=args.target)
+            p = dispatch_mod.plan(name, target, mode=mode, target=args.target, idea=info)
         except dispatch_mod.DispatchRefused as e:
             plans.append({"task": item.task, "skipped": str(e)})
             continue
         entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
                  "repo": target, "mode": mode}
+        if mode == "scaffold":
+            entry["card"] = info.get("gsd")
+            entry["proposedName"] = name
+            entry["title"] = info.get("title", "")[:90]
         if args.apply:
             res = dispatch_mod.run(p, apply=True)
             # The session id is the only thing that makes a dispatch followable.

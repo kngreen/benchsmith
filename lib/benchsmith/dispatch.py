@@ -139,6 +139,39 @@ def bootstrap_block(root: str | None = None) -> str:
     )
 
 
+def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
+    """The brief for an IDEA, which is not a task yet.
+
+    A GSD card has no slug, no directory and no oracle. Handing it to the repair
+    loop points a worker at a checkout with nothing in it -- observed on
+    T288273925, where dispatch bound the card number as though it were a task
+    name. An idea goes through intake and scaffolding, and intake can say KILL.
+    """
+    return (
+        f"This is an IDEA CARD, not an existing task. {info.get('gsd', '')} has no task "
+        f"directory, no oracle and no measurements. Do NOT run the repair or hardening "
+        f"loop on it.\n\n"
+        f"Card: {info.get('title', '')}\n"
+        f"Track: {info.get('track') or 'unknown — determine it from the card before scaffolding'}\n"
+        f"Scaffold into: {repo}\n"
+        f"Proposed task name: {slug}\n"
+        f"  This name is a PROPOSAL derived from the card title. It is permanent once "
+        f"scaffolded, so if it misdescribes the task, choose a better one and say why "
+        f"in your handoff.\n\n"
+        f"--- card body ---\n{(info.get('description') or '')[:2500]}\n--- end card ---\n\n"
+        "Route: §3 intake first — run the kill tests and reach GO / DERISK / KILL. "
+        "**A KILL is a successful outcome**; report it and stop rather than scaffolding "
+        "something the screen rejected. On GO, scaffold from the official skeleton for the "
+        "track (STEP S), then §4.\n\n"
+        "YOU MAY NOT PUSH. Prepare the commit, run the gate, and stop.\n\n"
+        "Finish by emitting ONLY this JSON, under 4096 bytes. Use `work_item` for the card "
+        "number and `note` for the task name you actually used:\n"
+        '{"work_item":"...","state":"ready_to_publish|blocked|needs_human|no_change|failed",'
+        '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
+        '"note":"<=200 chars"}'
+    )
+
+
 def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "hard-preferred",
                   bootstrap: bool = False, resume: bool = True) -> str:
     """The instruction a stage-3 worker gets. Deliberately narrow."""
@@ -171,7 +204,7 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
 
 def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DEFAULT_HARNESS,
          skills: str | None = None, mode: str = "harden", target: str = "hard-preferred",
-         bootstrap: bool | None = None) -> Plan:
+         bootstrap: bool | None = None, idea: dict | None = None) -> Plan:
     """Build the exact command. Runs nothing, writes nothing.
 
     `skills` is off by default and stays that way until benchsmith is actually
@@ -182,7 +215,21 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
     if bootstrap is None:
         # A local worker already has the files. A remote one does not.
         bootstrap = backend == "agentcloud"
-    prompt = worker_prompt(task, repo, mode=mode, target=target, bootstrap=bootstrap)
+    if mode == "scaffold":
+        if not isinstance(idea, dict) or not idea:
+            raise DispatchRefused(
+                "scaffold mode needs the resolved card; dispatching an idea by name alone "
+                "is what points a worker at an empty checkout"
+            )
+        if not repo:
+            raise DispatchRefused(
+                f"no checkout for track {idea.get('track') or 'unknown'}; scaffolding into the "
+                "wrong repo is not visible until validation"
+            )
+        prompt = ((bootstrap_block() if bootstrap else "")
+                  + scaffold_prompt(idea, repo, task))
+    else:
+        prompt = worker_prompt(task, repo, mode=mode, target=target, bootstrap=bootstrap)
     notes: list[str] = []
     if bootstrap:
         notes.append("worker clones benchsmith itself; --skills cannot deliver a package")

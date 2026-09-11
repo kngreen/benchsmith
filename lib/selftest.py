@@ -2501,5 +2501,53 @@ check("...while the sibling's own task did change",
       cov.attribute(_cov_repo, "task-b", _A, _TIP).verdict, cov.DIVERGENT)
 
 
+# --- a GSD card is an idea, not a task ---------------------------------------
+#
+# Observed on T288273925: dispatch bound the card number as a task name and
+# would have pointed a worker at a checkout with no such directory.
+
+check("a bare GSD id is recognised", bool(rv.GSD_ID.search("T288273925")), True)
+check("a GSD task URL is recognised",
+      bool(rv.GSD_ID.search("https://www.internalfb.com/tasks?t=288273925")), True)
+check("a codimango id is not a GSD id", bool(rv.GSD_ID.search("210976")), False)
+check("a task name is not a GSD id", bool(rv.GSD_ID.search("ollo-scholar-paused")), False)
+
+check("the bracketed seed tag is dropped from the slug",
+      rv.slugify("[T-Bench seed #221] Ordering a schema rollout so no consumer breaks mid-deploy"),
+      "ordering-schema-rollout-consumer")
+check("slugging is deterministic",
+      rv.slugify("[X] Alpha beta gamma delta epsilon"), rv.slugify("[X] Alpha beta gamma delta epsilon"))
+check("stopwords are dropped", "the" in rv.slugify("Fix the thing in the place").split("-"), False)
+
+check("a T-Bench seed routes to the t-bench track", rv.track_of("[T-Bench seed #4] x"), "t-bench")
+check("a SWE-Bench seed routes to swe-bench", rv.track_of("[SWE-Bench] y"), "swe-bench")
+check("an unmarked card has no track", rv.track_of("Just a title"), "")
+
+# Scaffolding needs the card and the right repo; neither may be inferred away.
+_idea = {"gsd": "T1", "title": "[T-Bench seed #1] Do a thing", "track": "t-bench",
+         "description": "seed body"}
+try:
+    dsp.plan("some-slug", "", mode="scaffold", idea=_idea)
+    check("scaffold refuses without a repo", "accepted", "refused")
+except dsp.DispatchRefused as e:
+    check("scaffold refuses without a repo", "wrong repo" in str(e), True)
+try:
+    dsp.plan("some-slug", "/r", mode="scaffold")
+    check("scaffold refuses without the card", "accepted", "refused")
+except dsp.DispatchRefused as e:
+    check("scaffold refuses without the card", "empty checkout" in str(e), True)
+
+_sp = dsp.plan("some-slug", "/r", mode="scaffold", idea=_idea)
+_txt = [a for a in _sp.argv if "IDEA CARD" in a][0]
+check("the brief says it is not a task", "not an existing task" in _txt, True)
+check("...and forbids the repair loop", "Do NOT run the repair or hardening loop" in _txt, True)
+check("...and routes through intake", "§3 intake first" in _txt, True)
+# Intake exists to be able to say no; a KILL reported as a failure teaches the
+# loop to scaffold everything.
+check("...and treats KILL as a success", "A KILL is a successful outcome" in _txt, True)
+check("...and marks the name as a proposal", "This name is a PROPOSAL" in _txt, True)
+check("...and still forbids pushing", "YOU MAY NOT PUSH" in _txt, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

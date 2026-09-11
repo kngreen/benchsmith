@@ -34,9 +34,27 @@ A task name, a numeric id, or a submissions URL pasted from the browser. Do not 
 benchsmith resolve "<whatever they gave you>"
 ```
 
-Then **start the round immediately** against exactly that task, in the `repo` and `mode` it
-returned (`repair` when the platform says `needs_revision`, else `harden`). Keep looping rounds in
-this session until a terminal state; do not report after round one and wait.
+It handles a **task** or an **idea**, and the two go different places. Read `kind` and `mode`:
+
+| `kind` | What you were given | Route |
+|---|---|---|
+| task | a name, a Codimango id, or a submissions URL | the round, in `repair` or `harden` |
+| idea | a GSD card (`T288273925`) | §3 intake → STEP S scaffold → §4 |
+
+**A GSD card is not a task.** It has no slug, no directory, no oracle and no measurements. Running
+the repair loop on one points a worker at a checkout with nothing in it. The resolver returns
+`needsScaffold: true`, the `track` read off the card, the canonical checkout for that track, and a
+`suggestedSlug` derived from the title.
+
+That slug is a **proposal, and permanent once scaffolded** — say it out loud when you announce, and
+change it if it misdescribes the task. Do not stop to ask for it.
+
+Intake comes first and **intake can say KILL. That is a successful outcome**, not a failure to
+work around: report it and stop rather than scaffolding something the screen rejected.
+
+For a task, **start the round immediately** in the `repo` and `mode` returned (`repair` when the
+platform says `needs_revision`, else `harden`). Keep looping rounds in this session until a
+terminal state; do not report after round one and wait.
 
 Stop only for these, and say which:
 
@@ -45,6 +63,7 @@ Stop only for these, and say which:
 | `owned: false` | it is someone else's task; name the owner |
 | `repo: null` | no checkout on this host holds it |
 | unresolved | the reference matches nothing; quote what you tried |
+| `kind: idea` with `repo: null` | no checkout for that track; scaffolding into the wrong repo is invisible until validation |
 
 `otherRepos` is not a stop. Proceed in the canonical one and mention the others exist.
 
