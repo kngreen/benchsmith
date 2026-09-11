@@ -99,7 +99,9 @@ def _help(binary: str, *words: str) -> str:
         r = _run([binary, *words, "--help"], timeout=90)
     except (subprocess.TimeoutExpired, OSError):
         return ""
-    return (r.stdout or "") + (r.returncode and r.stderr or "")
+    # Deprecation and migration notices may be printed to stderr even when
+    # `--help` exits successfully. They are part of capability discovery.
+    return (r.stdout or "") + (r.stderr or "")
 
 
 def discover(binary: str | None = None, site: str | None = None) -> Surface:
@@ -108,15 +110,32 @@ def discover(binary: str | None = None, site: str | None = None) -> Surface:
     Probing costs a few seconds at session start and removes an entire class of
     silent breakage when the platform ships its replacement CLI.
     """
-    binary = binary or os.environ.get("BENCHSMITH_CODIMANGO", "codimango")
+    configured_binary = binary or os.environ.get("BENCHSMITH_CODIMANGO")
+    binary = configured_binary or "codimango"
     path = shutil.which(binary)
     if not path:
         raise Unresolved(f"{binary} is not on PATH")
 
     site = site or os.environ.get("BENCHSMITH_SITE", "nest")
     root = _help(binary)
+    replacement_note = ""
+    if configured_binary is None and "THIS IS THE LEGACY CODIMANGO CLI" in root.upper():
+        replacement = "/usr/local/bin/codimango"
+        replacement_path = shutil.which(replacement)
+        replacement_root = _help(replacement) if replacement_path and replacement_path != path else ""
+        replacement_commands = _commands(replacement_root)
+        if {"task", "job", "trial"} <= replacement_commands:
+            binary = replacement
+            path = replacement_path
+            root = replacement_root
+            replacement_note = (
+                f"PATH resolved the retired CLI at {shutil.which('codimango')}; "
+                f"using {replacement}"
+            )
     surface = Surface(binary=binary)
     surface.legacy = "LEGACY" in root.upper()
+    if replacement_note:
+        surface.notes.append(replacement_note)
 
     # Site selection is global on the legacy CLI and may vanish on the new one.
     if "--site" in root:

@@ -92,16 +92,13 @@ def matching(paths: list[str], globs: list[str]) -> list[str]:
 
 
 def staged(repo_root: Path) -> tuple[list[str], str]:
+    """The change under review: staged if anything is, else the commit itself."""
     try:
-        r = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-            capture_output=True, text=True, timeout=60,
-        )
+        from .diffcheck import changeset
+
+        return changeset(Path(repo_root), filt="ACMR").paths, ""
     except (OSError, subprocess.TimeoutExpired) as e:
         return [], f"git unavailable: {e}"
-    if r.returncode != 0:
-        return [], f"git failed: {r.stderr.strip()[:120]}"
-    return [p for p in r.stdout.splitlines() if p.strip()], ""
 
 
 @dataclass

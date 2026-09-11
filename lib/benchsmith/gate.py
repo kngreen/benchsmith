@@ -360,25 +360,23 @@ def check_budget(journal: Journal, report: Report) -> None:
 
 def check_scope(repo_root: Path, task_name: str, report: Report) -> None:
     """Every staged path must be inside the task directory."""
+    from .diffcheck import changeset
+
     try:
-        r = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", "--cached", "--name-only"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        cs = changeset(Path(repo_root))
     except (subprocess.CalledProcessError, OSError) as e:
         report.add("scope", NOT_RUN, f"git unavailable: {e}")
         return
-    staged = [p for p in r.stdout.split() if p]
-    if not staged:
-        report.add("scope", NOT_RUN, "nothing staged")
+    if cs.empty:
+        report.add("scope", NOT_RUN, f"nothing to review ({cs.source})")
         return
-    stray = [p for p in staged if not (p.startswith(f"{task_name}/") or p.startswith(".benchsmith/"))]
+    stray = [p for p in cs.paths
+             if not (p.startswith(f"{task_name}/") or p.startswith(".benchsmith/"))]
     report.add(
         "scope",
         FAIL if stray else PASS,
-        ("reaches outside the task: " + ", ".join(stray[:5])) if stray else f"{len(staged)} paths",
+        ("reaches outside the task: " + ", ".join(stray[:5])) if stray
+        else f"{len(cs.paths)} path(s) ({cs.source})",
     )
 
 
@@ -421,27 +419,29 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
     if mode != "harden":
         report.add("single-lever", NOT_RUN, f"mode is {mode!r}; batching corrective work is allowed")
         return
+    from .diffcheck import changeset
+
     try:
-        r = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", "--cached", "--name-only"],
-            capture_output=True, text=True, check=True,
-        )
+        cs = changeset(Path(repo_root))
     except (subprocess.CalledProcessError, OSError) as e:
         report.add("single-lever", NOT_RUN, f"git unavailable: {e}")
         return
-    staged = [p for p in r.stdout.split() if p]
-    if not staged:
-        report.add("single-lever", NOT_RUN, "nothing staged")
+    if cs.empty:
+        report.add("single-lever", NOT_RUN, f"nothing to review ({cs.source})")
         return
-    base_task = subprocess.run(
-        ["git", "-C", str(repo_root), "cat-file", "-e", f"HEAD:{task_name}/task.toml"],
-        capture_output=True,
-        text=True,
+    # A task being created for the first time legitimately establishes every
+    # surface at once. There is no prior measurement to make unattributable,
+    # so the one-lever rule has nothing to protect yet. Checked against the
+    # BASELINE of this change, not always HEAD, so it holds for a scaffold that
+    # has already been committed.
+    existed = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{cs.old or 'HEAD'}:{task_name}/task.toml"],
+        capture_output=True, text=True,
     )
-    if base_task.returncode != 0:
+    if existed.returncode != 0:
         report.add("single-lever", PASS, "initial scaffold; no measured round to attribute")
         return
-    hit = levers_touched(staged, task_name)
+    hit = levers_touched(cs.paths, task_name)
     if len(hit) > 1:
         report.add("single-lever", FAIL,
                    "moves " + ", ".join(sorted(hit)) + " in one hardening round; "

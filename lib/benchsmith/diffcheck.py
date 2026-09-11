@@ -68,9 +68,47 @@ def blob(repo: Path, rev: str, path: str) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
+@dataclass(frozen=True)
+class ChangeSet:
+    """The change under review, wherever it currently lives.
+
+    A gate that only reads the index cannot evaluate a committed tree, and
+    `commit, then gate, then push` is the natural order -- so every push-required
+    diff check reported NOT_RUN at exactly the moment it mattered. Observed on a
+    real run: "the push-strict gate cannot evaluate a committed tree because its
+    scope checks only staged changes."
+
+    `new`/`old` are the revisions to read blobs from: the index against HEAD when
+    something is staged, HEAD against its parent once it is committed.
+    """
+
+    paths: list
+    new: str
+    old: str
+    source: str
+
+    @property
+    def empty(self) -> bool:
+        return not self.paths
+
+
+def changeset(repo: Path, filt: str = "ACMRD") -> ChangeSet:
+    r = _git(repo, "diff", "--cached", "--name-only", f"--diff-filter={filt}")
+    staged = [p for p in r.stdout.splitlines() if p.strip()] if r.returncode == 0 else []
+    if staged:
+        return ChangeSet(staged, "", "HEAD", "index")
+    # Nothing staged: review the commit itself. A root commit has no parent, so
+    # everything in it is new and there is nothing to ratchet against.
+    has_parent = _git(repo, "rev-parse", "--verify", "HEAD~1").returncode == 0
+    if not has_parent:
+        return ChangeSet([], "HEAD", "", "root-commit")
+    c = _git(repo, "diff", "--name-only", f"--diff-filter={filt}", "HEAD~1", "HEAD")
+    paths = [p for p in c.stdout.splitlines() if p.strip()] if c.returncode == 0 else []
+    return ChangeSet(paths, "HEAD", "HEAD~1", "commit")
+
+
 def staged_paths(repo: Path) -> list[str]:
-    r = _git(repo, "diff", "--cached", "--name-only", "--diff-filter=ACMRD")
-    return [p for p in r.stdout.splitlines() if p.strip()] if r.returncode == 0 else []
+    return changeset(repo).paths
 
 
 def counts(text: str) -> tuple[int, int]:
@@ -107,26 +145,28 @@ def _records(text: str | None) -> dict:
     return out
 
 
-def fresh_proofs(repo: Path, task: str) -> dict:
-    """Removal justifications added or changed by THIS staged commit."""
+def fresh_proofs(repo: Path, task: str, cs: "ChangeSet | None" = None) -> dict:
+    """Removal justifications added or changed by THIS change."""
+    cs = cs or changeset(repo)
     out: dict[str, str] = {}
     for cand in ([f"{task}/{REMOVAL_LEDGERS[0]}"] if task else []) + list(REMOVAL_LEDGERS):
-        old, new = _records(blob(repo, "HEAD", cand)), _records(blob(repo, "", cand))
+        old, new = _records(blob(repo, cs.old, cand)), _records(blob(repo, cs.new, cand))
         for (field, name), reason in new.items():
             if old.get((field, name)) != reason:
                 out[name] = reason
     return out
 
 
-def check_ratchet(repo: Path, paths: list[str]) -> tuple[list[Finding], int, list[Finding]]:
+def check_ratchet(repo: Path, paths: list[str], cs: ChangeSet | None = None) -> tuple[list[Finding], int, list[Finding]]:
     """Graded coverage may not shrink without a recorded reason."""
+    cs = cs or changeset(repo)
     findings: list[Finding] = []
     unparsed: list[Finding] = []
     examined = 0
     for path in paths:
         if not GRADED.search(path):
             continue
-        new, old = blob(repo, "", path), blob(repo, "HEAD", path)
+        new, old = blob(repo, cs.new, path), blob(repo, cs.old, path)
         if old is None:
             if new is None:
                 continue
@@ -148,7 +188,7 @@ def check_ratchet(repo: Path, paths: list[str]) -> tuple[list[Finding], int, lis
             unparsed.append(Finding(path, f"does not parse: {str(e).splitlines()[0]}"))
             continue
         examined += 1
-        proven = fresh_proofs(repo, path.split("/tests/")[0].split("/steps/")[0])
+        proven = fresh_proofs(repo, path.split("/tests/")[0].split("/steps/")[0], cs=cs)
         for name in sorted(gone):
             if name not in proven:
                 findings.append(Finding(path, f"test removed with no recorded reason: {name}"))
@@ -157,18 +197,20 @@ def check_ratchet(repo: Path, paths: list[str]) -> tuple[list[Finding], int, lis
     return findings, examined, unparsed
 
 
-def check_weakening(repo: Path, paths: list[str]) -> tuple[list[Finding], int, list[Finding]]:
+def check_weakening(repo: Path, paths: list[str], cs: ChangeSet | None = None) -> tuple[list[Finding], int, list[Finding]]:
     """Assertions may not get weaker."""
+    cs = cs or changeset(repo)
     findings: list[Finding] = []
     unparsed: list[Finding] = []
     examined = 0
     for path in paths:
         if not GRADED.search(path):
             continue
-        r = _git(repo, "diff", "--cached", "-U0", "--", path)
+        r = (_git(repo, "diff", "--cached", "-U0", "--", path) if cs.source == "index"
+             else _git(repo, "diff", "-U0", cs.old, cs.new, "--", path))
         if r.returncode != 0 or not r.stdout.strip():
             continue
-        new = blob(repo, "", path)
+        new = blob(repo, cs.new, path)
         if new is not None:
             try:
                 ast.parse(new)
@@ -196,10 +238,11 @@ def check_weakening(repo: Path, paths: list[str]) -> tuple[list[Finding], int, l
 
 def run(repo: Path, paths: list[str] | None = None) -> dict:
     repo = Path(repo)
-    paths = staged_paths(repo) if paths is None else paths
+    cs = changeset(repo)
+    paths = cs.paths if paths is None else paths
     out = {}
     for name, fn in (("diff-ratchet", check_ratchet), ("diff-weakening", check_weakening)):
-        findings, examined, unparsed = fn(repo, paths)
+        findings, examined, unparsed = fn(repo, paths, cs)
         # Unparsed files are findings in their own right, never a quiet skip.
         all_f = findings + unparsed
         if all_f:
@@ -212,8 +255,9 @@ def run(repo: Path, paths: list[str] | None = None) -> dict:
             "state": state,
             "examined": examined,
             "findings": [f.as_dict() for f in all_f],
+            "source": cs.source,
             "detail": ("; ".join(f"{f.path}: {f.what}" for f in all_f[:4]) if all_f
-                       else (f"{examined} graded file(s) clean" if examined
-                             else "no graded python file in the staged diff")),
+                       else (f"{examined} graded file(s) clean ({cs.source})" if examined
+                             else f"no graded python file in the {cs.source} diff")),
         }
     return out

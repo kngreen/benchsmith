@@ -295,6 +295,11 @@ benchsmith probe                      # resolve the CLI surface; never hardcode 
 benchsmith install-hooks --repo .     # pre-push gate, into the hooks dir the repo already uses
 ```
 
+**The gate reads whatever change is in front of it.** Staged if something is staged, otherwise the
+commit itself against its parent. `commit, then gate, then push` is the natural order, and a gate
+that only read the index reported `NOT_RUN` for every diff-shaped check at exactly the moment they
+mattered. The report says which it read (`index` or `commit`).
+
 **A required check that did not run blocks the push.** `benchsmith gate --require-push-set` (which
 the installed pre-push hook passes) makes `NOT_RUN` blocking for `oracle`, `scope`,
 `config-integrity` and `tags`. Elsewhere `NOT_RUN` is reported but does not block, because at

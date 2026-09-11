@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+
+# Nothing in this suite may start a real worker.
+os.environ["BENCHSMITH_NO_DISPATCH"] = "1"
 import subprocess
 import sys
 import tempfile
@@ -955,6 +958,23 @@ try:
     s = _ad.discover(binary="codimango")
     check("discover resolves the bare surface", s.task_show, ("task", "show"))
 
+    # A retired PATH shim must not shadow the installed replacement. Explicit
+    # binary choices still remain authoritative for callers that need them.
+    retired = "THIS IS THE LEGACY CODIMANGO CLI\n" + _LEGACY_ROOT
+    calls = []
+
+    def retired_help(binary, *words):
+        calls.append((binary, words))
+        if binary == "/usr/local/bin/codimango":
+            return _NEW_ROOT if not words else (_SHOW_HELP if words[-1] == "show" else _JOBS_HELP)
+        return retired if not words else _LEGACY_API
+
+    _ad._help = retired_help
+    s = _ad.discover()
+    check("discover bypasses a retired PATH shim", s.binary, "/usr/local/bin/codimango")
+    check("retired shim fallback resolves bare surface", s.task_show, ("task", "show"))
+    check("retired shim fallback is recorded", "retired CLI" in s.notes[0], True)
+
     # the substring trap: "task" appears only in a DESCRIPTION
     _ad._help, _ = _stub_cli(
         "Usage: x\n\nCommands:\n  assets  Manage the large task assets a trial downloads.\n", ""
@@ -1179,7 +1199,7 @@ except dsp.DispatchRefused:
 
 _pub = dsp.plan("t1", _REPO); _pub.publishing = True
 try:
-    dsp.run(_pub, apply=True)
+    dsp.run(_pub, apply=True, runner=lambda _p: {"ok": True, "stdout": "{}"})
     check("run refuses a publishing plan", "ran", "refused")
 except dsp.DispatchRefused as e:
     check("run refuses a publishing plan", "stage 4" in str(e), True)
@@ -1235,13 +1255,20 @@ def _survives(old, new) -> bool:
         m = _il.reload(dsp)
         probes = [
             lambda: m.plan("t1", _REPO, harness="claude"),
-            lambda: m.run(m.plan("t1", _REPO)),
+            # A runner, so this probe measures the APPLY guard and not the
+            # no-dispatch safety net -- otherwise the net masks the mutation and
+            # the probe silently stops testing anything.
+            lambda: m.run(m.plan("t1", _REPO),
+                          runner=lambda _p: {"ok": True, "stdout": "{}"}),
             lambda: m.parse_handoff('{"state":"ready_to_publish"}'),
             lambda: m.parse_handoff('{"state":"kinda_done"}'),
             lambda: m.parse_handoff(_oversized()),
         ]
         _pl = m.plan("t1", _REPO); _pl.publishing = True
-        probes.append(lambda: m.run(_pl, apply=True))
+        # An explicit runner, because this probe deliberately removes the guard
+        # that would otherwise stop it. Without one it started real sessions.
+        probes.append(lambda: m.run(_pl, apply=True,
+                                    runner=lambda _p: {"ok": True, "stdout": "{}"}))
         for probe in probes:
             try:
                 probe()
@@ -2999,6 +3026,101 @@ check("a task changing tier is reported", [m["task"] for m in _ch["moved"]], ["b
 _r = _qrc(_ch)
 check("the change note says where it moved to", "draft · failing → needs revision" in _r, True)
 check("...and that leaving is not a loss", "left the queue" in _r, True)
+
+
+# --- the suite may not start real workers ------------------------------------
+#
+# It did. The mutation harness removes each guard in turn and then calls run();
+# with no injection point that reached `meta agentcloud.session create`, and a
+# suite run spawned real sessions named after fixture tasks. Two defences, and a
+# check that neither rots.
+
+import re as _re3  # noqa: E402
+
+_selfsrc = Path("/home/kngreen/.claude/skills/benchsmith/lib/selftest.py").read_text()
+# Anchored on a real call site, or the pattern matches this very line.
+# Anchored on a real call site, or the pattern matches this very line. One
+# deliberate exception is tagged `armed-probe`: it exists to prove the disarm
+# fires, so stubbing it would defeat its purpose.
+_lines = _selfsrc.splitlines()
+_unguarded = []
+for _m in _re3.finditer(r"\b(?:dsp|m)\.run\([^)]*apply=True[^)]*\)", _selfsrc):
+    _ln = _lines[_selfsrc[: _m.start()].count("\n")]
+    if "runner" not in _m.group(0) and "armed-probe" not in _ln:
+        _unguarded.append(_m.group(0))
+check("no apply=True call in this suite lacks a stub runner", _unguarded, [])
+check("the suite disarms dispatch outright",
+      os.environ.get("BENCHSMITH_NO_DISPATCH"), "1")
+
+_armed = dsp.plan("t1", _REPO)
+try:
+    dsp.run(_armed, apply=True)  # armed-probe: this one must reach the disarm
+    check("an unstubbed apply is refused while disarmed", "ran", "refused")
+except dsp.DispatchRefused as e:
+    check("an unstubbed apply is refused while disarmed", "NO_DISPATCH" in str(e), True)
+check("...while an explicit runner still works",
+      dsp.run(_armed, apply=True, runner=lambda _p: {"ok": True})["ok"], True)
+
+
+# --- the gate must evaluate a committed tree ---------------------------------
+#
+# `commit, then gate, then push` is the natural order, and every push-required
+# diff check read only the index -- so they all reported NOT_RUN at exactly the
+# moment they mattered. Observed: "the push-strict gate cannot evaluate a
+# committed tree because its scope checks only staged changes."
+
+_cr3 = Path(tempfile.mkdtemp()) / "committed"
+(_cr3 / "mytask" / "tests").mkdir(parents=True)
+
+
+def _c3(*a):
+    return subprocess.run(["git", "-C", str(_cr3), *a], capture_output=True, text=True)
+
+
+_c3("init", "-q", "-b", "main"); _c3("config", "user.email", "t@t"); _c3("config", "user.name", "t")
+(_cr3 / "mytask" / "tests" / "t.py").write_text("def test_a():\n    assert 1 == 1\n    assert 2 == 2\n")
+_c3("add", "-A"); _c3("commit", "-qm", "base")
+
+_cs0 = dc.changeset(_cr3)
+check("a clean committed tree has nothing to review", _cs0.empty, True)
+
+# Stage a change: reviewed against HEAD.
+(_cr3 / "mytask" / "tests" / "t.py").write_text("def test_a():\n    assert 1 == 1 or True\n")
+_c3("add", "-A")
+_cs1 = dc.changeset(_cr3)
+check("a staged change is reviewed against HEAD", (_cs1.source, _cs1.new, _cs1.old),
+      ("index", "", "HEAD"))
+check("...and is caught", dc.run(_cr3)["diff-weakening"]["state"], "FAIL")
+
+# Commit it: the index is now empty and the check must still fire.
+_c3("commit", "-qm", "weaken")
+_cs2 = dc.changeset(_cr3)
+check("a committed change is reviewed against its parent", (_cs2.source, _cs2.new, _cs2.old),
+      ("commit", "HEAD", "HEAD~1"))
+_after = dc.run(_cr3)
+check("the weakening is still caught after committing",
+      _after["diff-weakening"]["state"], "FAIL")
+check("the ratchet is too", _after["diff-ratchet"]["state"], "FAIL")
+check("...and the report says which tree it read", _after["diff-ratchet"]["source"], "commit")
+
+# scope and single-lever had the same blindness.
+_rp3 = gate_mod.Report(); gate_mod.check_scope(_cr3, "mytask", _rp3)
+check("scope evaluates a committed tree",
+      {c.name: c for c in _rp3.checks}["scope"].state, gate_mod.PASS)
+_rp4 = gate_mod.Report(); gate_mod.check_single_lever(_cr3, "mytask", "harden", _rp4)
+check("single-lever evaluates a committed tree",
+      {c.name: c for c in _rp4.checks}["single-lever"].state, gate_mod.PASS)
+
+# A root commit has no parent; nothing to ratchet against is not a crash.
+_rc = Path(tempfile.mkdtemp()) / "root"
+(_rc / "mytask").mkdir(parents=True)
+subprocess.run(["git", "-C", str(_rc), "init", "-q", "-b", "main"], capture_output=True)
+(_rc / "mytask" / "x.py").write_text("x = 1\n")
+for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"],
+           ["add", "-A"], ["commit", "-qm", "root"]):
+    subprocess.run(["git", "-C", str(_rc), *_a], capture_output=True)
+check("a root commit is handled", dc.changeset(_rc).source, "root-commit")
+check("...without crashing the checks", dc.run(_rc)["diff-ratchet"]["state"], "NOT_RUN")
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

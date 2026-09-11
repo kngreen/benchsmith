@@ -13,6 +13,7 @@ therefore inspectable before anything starts.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import socket
 import subprocess
@@ -353,13 +354,29 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
     return Plan(backend=backend, argv=argv, task=task, publishing=False, notes=notes)
 
 
-def run(p: Plan, *, apply: bool = False, timeout: int = 900) -> dict:
-    """Execute a plan. Refuses unless explicitly applied."""
+def run(p: Plan, *, apply: bool = False, timeout: int = 900, runner=None) -> dict:
+    """Execute a plan. Refuses unless explicitly applied.
+
+    `runner` exists so a test can exercise this without starting anything. It is
+    not a nicety: the mutation harness removes each guard in turn and then calls
+    this, so with no injection point a suite run spawned real AgentCloud
+    sessions -- dozens of them, titled from fixture task names.
+    """
     if not apply:
         raise DispatchRefused("dispatch not applied; pass apply=True to actually start a worker")
     if p.publishing:
         raise DispatchRefused("stage 3 workers are non-publishing; the publish lane is stage 4")
+    if runner is None and os.environ.get("BENCHSMITH_NO_DISPATCH"):
+        # A blunt second line of defence. A guard that can be mutated away is
+        # exactly the guard a mutation harness will mutate away, so the harness
+        # must not be able to reach a real subprocess at all.
+        raise DispatchRefused(
+            "BENCHSMITH_NO_DISPATCH is set: refusing to start a real worker. "
+            "Pass an explicit runner if you meant to exercise this in a test."
+        )
     try:
+        if runner is not None:
+            return runner(p)
         r = subprocess.run(p.argv, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
         return {"ok": False, "task": p.task, "error": f"{type(e).__name__}: {e}"}

@@ -64,12 +64,15 @@ def check(repo: Path, rev: str = "") -> dict:
         candidates = sorted(universe)
         read = lambda p: _git(repo, "show", f"{rev}:{p}").stdout
     else:
+        from .diffcheck import changeset
+
+        cs = changeset(repo, filt="ACMR")
+        gone = changeset(repo, filt="D")
         tracked = set(_git(repo, "ls-files").stdout.splitlines())
-        staged = set(_git(repo, "diff", "--cached", "--name-only", "--diff-filter=ACMR").stdout.splitlines())
-        deleted = set(_git(repo, "diff", "--cached", "--name-only", "--diff-filter=D").stdout.splitlines())
-        universe = (tracked | staged) - deleted
-        candidates = sorted(staged)
-        read = lambda p: _git(repo, "show", f":{p}").stdout
+        universe = (tracked | set(cs.paths)) - set(gone.paths)
+        candidates = sorted(cs.paths)
+        rev = cs.new
+        read = lambda p: _git(repo, "show", f"{rev}:{p}").stdout
 
     sources = [p for p in candidates if SOURCE_FILE.search(p) and TOOLING_DIR.match(p)]
     if not sources:
