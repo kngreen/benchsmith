@@ -52,6 +52,26 @@ change it if it misdescribes the task. Do not stop to ask for it.
 Intake comes first and **intake can say KILL. That is a successful outcome**, not a failure to
 work around: report it and stop rather than scaffolding something the screen rejected.
 
+```bash
+benchsmith scaffold T288273925 --apply     # card -> task, on this host
+```
+
+**Scaffolding is not the finish line — keep going.** The moment the task exists, resolve it and
+start the round on it in the same session. Do not stop and report a new directory.
+
+```bash
+benchsmith resolve ordering-schema-rollout-consumer
+```
+
+A task scaffolded a minute ago is **`status: unregistered`** — it exists in the checkout and not on
+the platform. That is normal and not an error. It means there are no measurements to read yet: run
+the local gate, author until the oracle passes and the unchanged base fails, then push. The bar
+comes after the first validated round, not before.
+
+`benchsmith scaffold` on a card that is already scaffolded reports `already-scaffolded` and exits
+**zero**, because the thing you wanted — a task the loop can run — exists. Pick it up; do not treat
+it as a failure.
+
 For a task, **start the round immediately** in the `repo` and `mode` returned (`repair` when the
 platform says `needs_revision`, else `harden`). Keep looping rounds in this session until a
 terminal state; do not report after round one and wait.

@@ -264,10 +264,21 @@ def cmd_release(args) -> int:
 
 def cmd_dispatch(args) -> int:
     """Plan (default) or start one non-publishing worker."""
+    idea = None
+    if args.mode == "scaffold":
+        if not args.card:
+            _out({"ok": False, "reason": "--mode scaffold needs --card <GSD ref>; an idea cannot "
+                                         "be dispatched by slug alone"})
+            return 2
+        try:
+            idea = resolve_mod.resolve(args.card)
+        except resolve_mod.Unresolved as e:
+            _out({"ok": False, "reason": str(e)})
+            return 2
     try:
         p = dispatch_mod.plan(args.task, args.repo, backend=args.backend, harness=args.harness,
                               skills=args.skills, mode=args.mode, target=args.target,
-                              bootstrap=args.bootstrap)
+                              bootstrap=args.bootstrap, idea=idea)
     except dispatch_mod.DispatchRefused as e:
         _out({"ok": False, "reason": str(e)})
         return 2
@@ -412,6 +423,53 @@ def cmd_fleet(args) -> int:
     if not args.apply:
         payload["hint"] = "re-run with --apply to start these"
     _out(payload)
+    return 0
+
+
+def cmd_scaffold(args) -> int:
+    """Idea -> task, in one call. Resolves the card and dispatches a scaffold worker."""
+    try:
+        idea = resolve_mod.resolve(args.ref)
+    except resolve_mod.Unresolved as e:
+        _out({"ok": False, "reason": str(e)})
+        return 2
+    if idea.get("kind") != "idea":
+        _out({"ok": False, "reason": f"{args.ref} resolves to an existing task "
+                                     f"({idea.get('task')}), not an idea. Run the round on it "
+                                     "instead of scaffolding."})
+        return 2
+    name = args.name or idea.get("suggestedSlug") or ""
+    repo = args.repo or idea.get("repo") or ""
+
+    # Already scaffolded is not an error: the desired end state -- a task the
+    # loop can run -- is satisfied. Refusing here strands the flow one step
+    # short of the thing it exists to reach, which is what happened when a
+    # retry hit the overwrite guard and stopped.
+    if repo and name and (Path(repo) / name / "task.toml").is_file():
+        _out({"state": "already-scaffolded", "card": idea.get("gsd"), "task": name,
+              "repo": repo, "registered": False,
+              "next": "run the round on it; it is unregistered, so there are no measurements "
+                      "to read until it is authored, gated and pushed",
+              "resolve": f"benchsmith resolve {name}"})
+        return 0
+    try:
+        p = dispatch_mod.plan(name, repo, backend=args.backend, mode="scaffold", idea=idea)
+    except dispatch_mod.DispatchRefused as e:
+        _out({"ok": False, "reason": str(e)})
+        return 2
+    out = {"card": idea.get("gsd"), "title": idea.get("title"), "track": idea.get("track"),
+           "repo": repo, "proposedName": name, "applied": bool(args.apply)}
+    if args.apply:
+        res = dispatch_mod.run(p, apply=True)
+        out["session"] = dispatch_mod.session_id(res.get("stdout") or "")
+        out["ok"] = res.get("ok")
+        # The point of scaffolding is to get a task the loop can run. Say so, so
+        # nobody treats a fresh skeleton as the end of the job.
+        out["thenRun"] = f"benchsmith resolve {name}   # then run the round; it will be unregistered"
+    else:
+        out["shell"] = p.shell
+        out["hint"] = "re-run with --apply to start it"
+    _out(out)
     return 0
 
 
@@ -598,7 +656,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--hardening", action="store_true")
     s.add_argument("--status", default="")
     s.add_argument("--oracle-failing", action="store_true")
-    s.add_argument("--mode", default="", choices=("", "repair", "harden"))
+    s.add_argument("--mode", default="", choices=("", "repair", "harden", "scaffold"))
     s.add_argument("--open-finding", default="",
                    help="ID=symptom::acceptance-test — acceptance is mandatory")
     s.add_argument("--close-finding", default="", help="ID=evidence")
@@ -685,7 +743,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--bootstrap", dest="bootstrap", action="store_true", default=None,
                    help="force the clone preamble (default: on for agentcloud)")
     s.add_argument("--no-bootstrap", dest="bootstrap", action="store_false")
-    s.add_argument("--mode", default="harden", choices=("harden", "repair"))
+    s.add_argument("--mode", default="harden", choices=("harden", "repair", "scaffold"))
+    s.add_argument("--card", default="",
+                   help="GSD reference for --mode scaffold (T123, or a task URL)")
     s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"))
     s.add_argument("--apply", action="store_true", help="actually start the worker")
     s.set_defaults(fn=cmd_dispatch)
@@ -710,6 +770,16 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--bench", default="codimango")
     s.add_argument("--timeout", type=int, default=3600)
     s.set_defaults(fn=cmd_corpus)
+
+    s = sub.add_parser("scaffold", help="turn an idea card into a task, then loop on it")
+    s.add_argument("ref", help="GSD card reference, e.g. T288273925")
+    s.add_argument("--name", default="", help="task slug (default: derived from the card title)")
+    s.add_argument("--repo", default="", help="checkout (default: canonical one for the track)")
+    s.add_argument("--backend", default="codex",
+                   choices=("agentcloud", "codex", "metacode"),
+                   help="codex by default: it runs on this host, where benchsmith is installed")
+    s.add_argument("--apply", action="store_true")
+    s.set_defaults(fn=cmd_scaffold)
 
     s = sub.add_parser("collect", help="read a worker session and return its handoff")
     s.add_argument("--session-id", required=True)

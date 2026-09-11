@@ -167,9 +167,34 @@ def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = No
     else:
         hit = next((t for t in rows if str(t.get("name")) == ref), None)
         if hit is None:
+            # A task scaffolded a moment ago exists on disk and not on the
+            # platform. Refusing it strands the loop exactly where it should be
+            # picking up: nothing can be measured until it is pushed, and it
+            # cannot be pushed until it has been authored and gated.
+            local = find_repos(ref, roots)
+            if local:
+                return {
+                    "kind": "task",
+                    "task": ref,
+                    "id": "",
+                    "status": "unregistered",
+                    "registered": False,
+                    "validation": "",
+                    "sha": "",
+                    "repo": local[0],
+                    "otherRepos": local[1:],
+                    "owned": True,
+                    "owner": "",
+                    "reviewer": False,
+                    "mode": "harden",
+                    "note": ("not on the platform yet: it exists only in this checkout. There are "
+                             "no measurements to read — author it, gate it, and push it before "
+                             "expecting a bar."),
+                }
             near = [str(t.get("name")) for t in rows if ref.lower() in str(t.get("name", "")).lower()]
             raise Unresolved(
-                f"no task named {ref!r}." + (f" Did you mean: {', '.join(near[:3])}?" if near else "")
+                f"no task named {ref!r}, and no checkout on this host holds it."
+                + (f" Did you mean: {', '.join(near[:3])}?" if near else "")
             )
 
     name = str(hit.get("name") or "")
@@ -191,4 +216,6 @@ def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = No
         "owner": str(hit.get("importedBy") or ""),
         "reviewer": bool(hit.get("currentUserIsReviewer")),
         "mode": "repair" if str(hit.get("status")) == "needs_revision" else "harden",
+        "registered": True,
+        "kind": "task",
     }

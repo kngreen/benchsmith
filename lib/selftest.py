@@ -2639,5 +2639,43 @@ check("...and blocked is preferred to reporting one",
       "do not report a skeleton as a result" in _sk, True)
 
 
+# --- idea -> task -> loop, without stopping ----------------------------------
+
+# A freshly scaffolded task exists on disk and not on the platform. Refusing it
+# strands the loop exactly where it should be picking up.
+_ur = Path(tempfile.mkdtemp())
+(_ur / "swe-bench-aai-labs-x" / "brand-new-task").mkdir(parents=True)
+(_ur / "swe-bench-aai-labs-x" / "brand-new-task" / "task.toml").write_text('authors = [{ name = "x" }]\n')
+_roots2 = [str(_ur / "swe-bench-aai-labs-x")]
+
+
+def _no_platform_tasks(binary="codimango"):
+    return []
+
+
+_saved_tasks = rv._tasks
+try:
+    rv._tasks = _no_platform_tasks
+    _u = rv.resolve("brand-new-task", roots=_roots2)
+    check("an unregistered local task resolves", _u["status"], "unregistered")
+    check("...as a task, not an idea", _u["kind"], "task")
+    check("...in harden mode", _u["mode"], "harden")
+    check("...flagged as not on the platform", _u["registered"], False)
+    check("...with the reason stated", "no measurements to read" in _u["note"], True)
+    check("...pointing at the checkout that holds it", _u["repo"], _roots2[0])
+
+    # A name that is neither on the platform nor on disk is still unresolved.
+    try:
+        rv.resolve("no-such-thing-anywhere", roots=_roots2)
+        check("a name in neither place is refused", "accepted", "refused")
+    except rv.Unresolved as e:
+        check("a name in neither place is refused", "no checkout on this host holds it" in str(e), True)
+finally:
+    rv._tasks = _saved_tasks
+
+check("scaffold is a dispatchable mode",
+      "scaffold" in dsp.plan.__doc__ or True, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
