@@ -83,6 +83,51 @@ def job_commit(job: dict) -> str:
     return str(cfg.get("commitSha") or job.get("commitSha") or "")
 
 
+def stats_errored(job: dict) -> int:
+    """Authoritative errored count. Trial rows cannot be trusted for this.
+
+    A live trial that died in infra often still reports `status: "completed"`
+    with `reward: 0`, indistinguishable at trial level from a genuine failure.
+    The job's own `stats` block counts them correctly.
+    """
+    st = job.get("stats") or {}
+    try:
+        return int(st.get("errored") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def dead_cohort(job: dict) -> bool:
+    """Every trial errored -- the cohort measured nothing at all."""
+    st = job.get("stats") or {}
+    completed = st.get("completed") or 0
+    return bool(completed) and stats_errored(job) >= completed
+
+
+def suspect_infra(trial: dict) -> str:
+    """A tell that a 'completed' zero-reward trial never actually ran.
+
+    Two signals, both weak alone and strong together: the trial scored exactly
+    the untouched baseline, and it made no tool calls. Neither proves infra --
+    a no-op agent looks the same -- so this returns a REASON, and the caller
+    classifies G (unknown), never A. Banking an unexamined zero as difficulty is
+    the failure this whole module exists to prevent; guessing the other way and
+    calling it infra would be the same mistake mirrored.
+    """
+    hrs = trial.get("harborResultSummary") or {}
+    calls = hrs.get("agentToolCalls")
+    if calls is None:
+        calls = trial.get("n_tool_calls")
+    baseline = trial.get("baselineResult")
+    reward = trial.get("reward")
+    tells = []
+    if calls == 0:
+        tells.append("zero tool calls")
+    if baseline is not None and reward is not None and baseline == reward:
+        tells.append("scored exactly the baseline")
+    return " and ".join(tells) if len(tells) >= 2 else ""
+
+
 def is_participant(job: dict) -> tuple[bool, str]:
     """Admit a job as participant, or say which predicate rejected it."""
     blob = " ".join((job_stage(job), str(job.get("kind") or job.get("type") or "").lower(),
@@ -111,6 +156,7 @@ def select_jobs(jobs: list[dict], validation_sha: str) -> tuple[list[dict], list
     """
     notes: list[str] = []
     selected: dict[str, dict] = {}
+    live: list[dict] = []
     for job in jobs:
         ok, why = is_participant(job)
         if not ok:
@@ -123,10 +169,34 @@ def select_jobs(jobs: list[dict], validation_sha: str) -> tuple[list[dict], list
         if validation_sha and commit and commit != validation_sha:
             notes.append(f"excluded {job.get('id')}: commit {commit[:8]} != {validation_sha[:8]}")
             continue
+        live.append(job)
+
+    if not live:
+        return ([], notes)
+
+    # The platform dispatches whole WAVES keyed by config.revalidateRunId, not
+    # cohort by cohort. Deduping per-cohort on createdAt can pair cohort A's
+    # wave 2 with cohort B's wave 1 -- mixing populations and halving the sample
+    # without saying so. Pick one wave, then one job per cohort inside it.
+    waves: dict[str, list[dict]] = defaultdict(list)
+    for job in live:
+        waves[str((job.get("config") or {}).get("revalidateRunId") or "")].append(job)
+
+    if len(waves) > 1 or (len(waves) == 1 and "" not in waves):
+        def rank(item):
+            wid, jobs_in = item
+            return (len({agent_name(j) for j in jobs_in}), max(str(j.get("createdAt") or "") for j in jobs_in))
+
+        wave_id, chosen_wave = max(waves.items(), key=rank)
+        for wid, jobs_in in waves.items():
+            if wid != wave_id:
+                for j in jobs_in:
+                    notes.append(f"excluded {j.get('id')}: wave {wid or '<none>'} superseded by {wave_id}")
+        live = chosen_wave
+
+    for job in live:
         name = agent_name(job)
         prior = selected.get(name)
-        # Newest batch per cohort: an older batch for the same agent at the same
-        # SHA is a superseded generation, not extra trials.
         if prior is None or str(job.get("createdAt") or "") > str(prior.get("createdAt") or ""):
             if prior is not None:
                 notes.append(f"excluded {prior.get('id')}: older batch for cohort {name}")
@@ -174,6 +244,9 @@ def classify(trial: dict, *, graded_ok: bool) -> tuple[Kind, str]:
         return (Kind.F, f"infrastructure: {status or reason}"[:120])
     if graded_ok:
         return (Kind.PASS, "every graded assertion passed")
+    tell = suspect_infra(trial)
+    if tell:
+        return (Kind.G, f"zero reward but {tell}: attribution unresolved, investigate")
     if trial.get("reachedVerifier") or reward is not None or trial.get("ctrfResults"):
         return (Kind.A, "verifier ran and reported wrong behaviour")
     if status in {"failed", "fail", "error"} and not reason:
@@ -423,14 +496,21 @@ def evidence(trials: list[dict]) -> dict:
     }
 
 
-def infra_fraction(rows: list[Row]) -> dict:
+def infra_fraction(rows: list[Row], jobs: list[dict] | None = None) -> dict:
     """Scored vs errored. The published rate must quote the scored denominator."""
     live = [r for r in rows if not r.superseded]
     errored = [r for r in live if r.kind is Kind.F]
     unknown = [r for r in live if r.kind is Kind.G]
     scored = [r for r in live if r.counts]
     total = len(live)
+    job_errored = sum(stats_errored(j) for j in (jobs or []))
+    dead = [agent_name(j) for j in (jobs or []) if dead_cohort(j)]
     return {
+        "jobStatsErrored": job_errored,
+        "rowErrored": len(errored),
+        # A disagreement means trial rows are hiding infra the job counted.
+        "erroredDisagreement": bool(jobs) and job_errored != len(errored),
+        "deadCohorts": dead,
         "trialsFound": total,
         "scored": len(scored),
         "errored": len(errored),
@@ -490,6 +570,9 @@ def _quality_row(task: dict, active_sha: str) -> Review:
         verdict=str(q.get("verdict") or q.get("overall") or ""),
         reviewed_sha=sha,
         selection="exact-head" if sha and sha == active_sha else "fallback",
+        # Deliberately not derived from task.headCommitSha: in a multi-task
+        # monorepo that is the REPO branch head, which moves whenever any other
+        # task commits. Using it marked nearly every task stale.
         stale=False,
     )
 

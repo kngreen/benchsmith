@@ -79,7 +79,7 @@ def cmd_bar(args) -> int:
     )
     all_trials = [t for lst in (raw.get("trials") or {}).values() for t in lst]
     result = evaluate(m, target=args.target)
-    result["infra"] = infra_fraction(m.rows)
+    result["infra"] = infra_fraction(m.rows, raw.get("jobs") or [])
     result["evidence"] = evidence(all_trials)
     result["reviews"] = [r.__dict__ for r in m.reviews]
     _out(result)

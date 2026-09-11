@@ -178,10 +178,46 @@ class Platform:
         self.check_identity(rec)
         return rec
 
-    def jobs(self) -> list:
+    def jobs(self, page_size: int = 200) -> list:
+        """Every job for the task, not the first page.
+
+        The envelope is paginated with a default limit well below what a mature
+        task carries -- 87 jobs on one real task, 52 on another. Taking the first
+        page silently drops the oldest rounds, and since the drop is silent the
+        measurement just looks smaller. `hasMore`/`readTruncated` are checked so
+        a surface that ignores `--limit` cannot fail quietly either.
+        """
         extra = ("--include-agentic-review", "latest") if self.surface.supports_agentic_review else ()
-        out = self._json(self._argv(self.surface.jobs_list, self.identity.task_name, extra=extra))
-        return out if isinstance(out, list) else out.get("jobs", [])
+        collected: list = []
+        offset = 0
+        while True:
+            argv = self._argv(
+                self.surface.jobs_list,
+                self.identity.task_name,
+                extra=("--limit", str(page_size), *extra),
+            )
+            out = self._json(argv)
+            if isinstance(out, list):
+                return out
+            page = out.get("jobs") or []
+            collected.extend(page)
+            total = out.get("total")
+            more = out.get("hasMore")
+            if out.get("readTruncated"):
+                raise Unresolved(
+                    f"job list reports readTruncated at offset {offset}; the job set is "
+                    "incomplete and any rate computed from it would be wrong"
+                )
+            if not more or not page:
+                if isinstance(total, int) and total > len(collected):
+                    raise Unresolved(
+                        f"job list returned {len(collected)} of {total} jobs with hasMore={more}; "
+                        "refusing a partial job set"
+                    )
+                return collected
+            offset += len(page)
+            if offset > 5000:
+                raise Unresolved("job list pagination exceeded 5000 rows; refusing to loop")
 
     def trials(self, job_id: str) -> list:
         out = self._json(self._argv(self.surface.trials_list, job_id))
