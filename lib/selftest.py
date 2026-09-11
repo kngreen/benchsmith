@@ -3302,18 +3302,39 @@ def _remote_at(head):
 _hh = {"state": "ready_to_publish", "commit_sha": _OURS, "base_sha": _BASE, "gate_receipt": "r"}
 
 try:
-    pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False)
+    pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False, check_hold=False)
     check("a moved remote is refused without rebase", "published", "refused")
 except pub.PublishRefused as e:
     check("a moved remote is refused without rebase", "rebase=True" in str(e), True)
 
-_res = pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False, rebase=True)
+_res = pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False, check_hold=False, rebase=True)
 check("with rebase it moves onto the new head", _res["state"], "rebased")
 check("...producing a real sha", len(_res["newSha"]) == 40 and " " not in _res["newSha"], True)
 check("...that is a descendant of the sibling's commit",
       _rg("merge-base", "--is-ancestor", _THEIRS, _res["newSha"]).returncode, 0)
-# A rebased commit is a different commit; the old receipt does not attest to it.
-check("...and demands a fresh gate", _res["needsRegate"], True)
+# A rebase produces a different COMMIT, but the receipt describes the TASK. When
+# the sibling touched a different task, our task's tree object is unchanged and
+# every check the gate ran is still true of it -- the oracle ran on these exact
+# bytes. Requiring a regate here is what produced four round trips on one task:
+# the coordinator has no oracle, so it returned each rebase to a worker, and by
+# the time that worker answered main had moved again.
+check("...and carries the receipt when the task tree is untouched",
+      _res["needsRegate"], False)
+check("...naming the tree it verified", len(_res.get("taskTree", "")) == 40, True)
+
+# When the rebase DID move our task, the receipt no longer describes it.
+_rg("checkout", "-q", _BASE)
+(_rb / "mine" / "instruction.md").write_text("spec, changed by them\n")
+_rg("add", "-A"); _rg("commit", "-qm", "sibling edits our spec")
+_MOVED = _rg("rev-parse", "HEAD").stdout.strip()
+try:
+    _r2 = pub.publish(_rb, "mine", _hh, git=_remote_at(_MOVED), check_review=False,
+                      check_hold=False, rebase=True)
+    check("a rebase that moves our task demands a regate", _r2.get("needsRegate"), True)
+except pub.PublishRefused as e:
+    # Also acceptable: coverage refuses outright because they touched our task.
+    check("a rebase that moves our task is not carried silently",
+          "Someone changed this task" in str(e), True)
 
 # When the sibling touched OUR task, rebasing over them would be silent.
 _rg("checkout", "-q", _BASE)
@@ -3321,7 +3342,7 @@ _rg("checkout", "-q", _BASE)
 _rg("add", "-A"); _rg("commit", "-qm", "sibling touched mine")
 _CLASH = _rg("rev-parse", "HEAD").stdout.strip()
 try:
-    pub.publish(_rb, "mine", _hh, git=_remote_at(_CLASH), check_review=False, rebase=True)
+    pub.publish(_rb, "mine", _hh, git=_remote_at(_CLASH), check_review=False, check_hold=False, rebase=True)
     check("a sibling touching our task is not rebased over", "rebased", "refused")
 except pub.PublishRefused as e:
     check("a sibling touching our task is not rebased over",
@@ -4213,6 +4234,61 @@ try:
     check("a quoted description is refused before publishing", "accepted", "refused")
 except SystemExit as e:
     check("a quoted description is refused before publishing", "double quotes" in str(e), True)
+
+
+# --- a hold on the branch, not on one task -----------------------------------
+#
+# Task leases answer "is anyone working this task". They cannot answer "is
+# anyone about to land a stack on main", which was being handled by
+# announcement: "Task 207170 owns aai_labs_ollo main. Hold main until 4:15 PM
+# ET." Every worker that did not read that kept preparing pushes into a branch
+# somebody had claimed.
+
+from benchsmith import hold as hld  # noqa: E402
+
+check("the hold is a ref the remote arbitrates", hld.REF.startswith("refs/heads/"), True)
+check("...and is bounded by default", hld.DEFAULT_MINUTES > 0, True)
+check("a parsed hold carries who and until",
+      hld._parse("holder=kngreen host=box until=99 why=landing_stack"),
+      {"holder": "kngreen", "host": "box", "until": "99", "why": "landing_stack"})
+
+# publish must refuse into a held branch, and must refuse when it cannot tell.
+_hh3 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
+        "gate_receipt": "r"}
+_saved8 = rv._tasks
+try:
+    rv._tasks = _status("draft")
+    import benchsmith.hold as _hmod
+    _origh = _hmod.current
+    _hmod.current = lambda repo, remote="origin": {
+        "readable": True, "held": True, "holder": "someone-else", "minutesLeft": 20,
+        "why": "landing a stack"}
+    try:
+        pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40), apply=True)
+        check("publish refuses into a held branch", "pushed", "refused")
+    except pub.PublishRefused as e:
+        check("publish refuses into a held branch", "holds" in str(e), True)
+        check("...and says how long", "20m" in str(e), True)
+        check("...and that the work keeps", "keeps" in str(e), True)
+
+    _hmod.current = lambda repo, remote="origin": {"readable": False, "reason": "offline"}
+    try:
+        pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40), apply=True)
+        check("an unreadable hold refuses too", "pushed", "refused")
+    except pub.PublishRefused as e:
+        check("an unreadable hold refuses too", "not permission" in str(e), True)
+
+    _hmod.current = lambda repo, remote="origin": {"readable": True, "held": False}
+    check("a free branch publishes",
+          pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40))["applied"], False)
+    _hmod.current = _origh
+finally:
+    rv._tasks = _saved8
+
+# --- rerun must not hardcode a subcommand either ------------------------------
+check("rerun resolves its verb from the installed CLI",
+      "discover" in Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/rerun.py").read_text(),
+      True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

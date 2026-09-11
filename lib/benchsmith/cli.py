@@ -24,6 +24,7 @@ from . import preflight as preflight_mod
 from . import backoff as backoff_mod
 from . import config as config_mod
 from . import coverage
+from . import hold as hold_mod
 from . import hooks as hooks_mod
 from . import dispatch as dispatch_mod
 from . import mutate as mutate_mod
@@ -661,6 +662,18 @@ def cmd_relieve(args) -> int:
     return 0
 
 
+def cmd_hold(args) -> int:
+    """A bounded claim on the whole branch, for a landing window."""
+    repo = Path(args.repo).resolve()
+    if args.action == "show":
+        _out(hold_mod.current(repo))
+    elif args.action == "take":
+        _out(hold_mod.take(repo, why=args.why, minutes=args.minutes))
+    else:
+        _out(hold_mod.release(repo))
+    return 0
+
+
 def cmd_lease(args) -> int:
     """The cross-host claim on a task: show, take, or drop it."""
     repo = Path(args.repo).resolve()
@@ -1196,6 +1209,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="codex by default: it runs on this host, where benchsmith is installed")
     s.add_argument("--apply", action="store_true")
     s.set_defaults(fn=cmd_scaffold)
+
+    s = sub.add_parser("hold", help="claim the whole branch for a landing window")
+    s.add_argument("action", choices=("show", "take", "release"))
+    s.add_argument("--repo", default=".")
+    s.add_argument("--why", default="", help="what the window is for")
+    s.add_argument("--minutes", type=int, default=hold_mod.DEFAULT_MINUTES)
+    s.set_defaults(fn=cmd_hold)
 
     s = sub.add_parser("lease", help="the cross-host claim on a task")
     s.add_argument("action", choices=("show", "take", "release"))

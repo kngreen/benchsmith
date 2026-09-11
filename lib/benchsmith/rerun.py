@@ -69,7 +69,18 @@ def orphaned(pending_seconds: float | None, *, local_defect: bool = False) -> tu
 
 def trigger(task: str, *, binary: str = "codimango", apply: bool = False) -> dict:
     """Ask the platform to validate the same commit again."""
-    argv = [binary, "api", "tasks", "rerun", task, "--json"]
+    # Never hardcode a subcommand. `codimango api tasks rerun` is the legacy
+    # spelling and the current CLI has dropped `api` entirely -- an authorised
+    # rerun failed before creating a request for exactly this reason.
+    try:
+        from .adapter import discover
+
+        surface = discover(binary)
+        verb = ("api", "tasks", "rerun") if surface.tasks_list[:1] == ("api",) else ("task", "rerun")
+        argv = [binary, *surface.site, *verb, task, "--json"]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "task": task,
+                "error": f"could not resolve the rerun surface: {type(e).__name__}: {e}"}
     if not apply:
         return {"planned": argv, "applied": False,
                 "hint": "re-run with apply=True to actually trigger it"}

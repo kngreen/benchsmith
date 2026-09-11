@@ -147,7 +147,7 @@ class Lane:
 def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin",
             branch: str = "main", lane: Lane | None = None, apply: bool = False,
             git=_git, check_review: bool = True, rebase: bool = False,
-            allow_review_status: str = "", remote_lease=None) -> dict:
+            allow_review_status: str = "", remote_lease=None, check_hold: bool = True) -> dict:
     """Verify, claim the lane, record the intent, then push exactly once."""
     repo_root = Path(repo_root)
     lane = lane or Lane(repo_root)
@@ -252,12 +252,28 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
             # otherwise put a ref name inside the SHA we publish.
             moved = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
             git(repo_root, "checkout", "--detach", moved)
-            # A rebased commit is a DIFFERENT commit, so the receipt that
-            # attested to the old one does not attest to this. Re-gate; do not
-            # carry the receipt across.
+
+            # Does the receipt still describe this tree? A rebase produces a
+            # different COMMIT, but if the task's own tree object is unchanged
+            # then every check the gate ran is still true of it -- the oracle
+            # ran against these exact bytes.
+            #
+            # This is what ends the ping-pong. The coordinator cannot regate
+            # (it has no task oracle), so it returned every rebase to a worker;
+            # by the time that worker answered, main had moved again. One task
+            # went round four times before landing.
+            before = (git(repo_root, "rev-parse", f"{commit_sha}:{task}").stdout.split() or [""])[0]
+            after = (git(repo_root, "rev-parse", f"{moved}:{task}").stdout.split() or [""])[0]
+            if before and after and before == after:
+                return {"state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
+                        "onto": head, "needsRegate": False, "taskTree": before,
+                        "detail": (f"rebased onto {head[:8]}; the task tree is byte-identical "
+                                   f"({before[:12]}), so the existing receipt still describes it. "
+                                   "Publish this SHA without re-gating.")}
             return {"state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
                     "onto": head, "needsRegate": True,
-                    "detail": "rebased onto the new head; re-gate this SHA, then publish it"}
+                    "detail": ("rebased onto the new head and the task tree changed, so the "
+                               "receipt no longer describes it. Re-gate this SHA.")}
 
         intent = Intent(task=task, base_sha=base_sha or head, commit_sha=commit_sha,
                         remote=remote, branch=branch,
@@ -273,6 +289,19 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
         # first check happened before the lane was acquired and before a
         # possible rebase; a task can be accepted in that window.
         _freeze_check("immediately before the push")
+        if check_hold:
+            from .hold import current as _hold
+
+            h = _hold(repo_root, remote=remote)
+            if not h.get("readable"):
+                raise PublishRefused(f"{h.get('reason')}; an unreadable hold is not permission")
+            if h.get("held"):
+                raise PublishRefused(
+                    f"{h['holder']} holds {remote}/{branch}"
+                    + (f" for another {h['minutesLeft']}m" if h.get("minutesLeft") else "")
+                    + (f": {h['why']}" if h.get("why") else "")
+                    + ". Wait for the window to close; the commit is gated and keeps."
+                )
         if remote_lease is not None:
             # Same rule as the freeze check, for the same reason: the window
             # between acquiring the lane and pushing is exactly when another
