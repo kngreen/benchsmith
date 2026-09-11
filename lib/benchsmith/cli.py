@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import gate as gate_mod
 from . import preflight as preflight_mod
+from . import dispatch as dispatch_mod
 from .queue import Leases, build_queue, read_journals
 from .adapter import Identity, Platform, Unresolved, discover
 from .bar import evaluate
@@ -196,6 +197,22 @@ def cmd_release(args) -> int:
     return 0 if r["ok"] else 1
 
 
+def cmd_dispatch(args) -> int:
+    """Plan (default) or start one non-publishing worker."""
+    try:
+        p = dispatch_mod.plan(args.task, args.repo, backend=args.backend, harness=args.harness,
+                              skills=args.skills, mode=args.mode, target=args.target)
+    except dispatch_mod.DispatchRefused as e:
+        _out({"ok": False, "reason": str(e)})
+        return 2
+    if not args.apply:
+        _out({"planned": p.as_dict(), "applied": False,
+              "hint": "re-run with --apply to actually start it"})
+        return 0
+    _out(dispatch_mod.run(p, apply=True))
+    return 0
+
+
 def cmd_hash(args) -> int:
     _out(surface_hashes(Path(args.repo) / args.task))
     return 0
@@ -278,6 +295,15 @@ def main(argv: list[str] | None = None) -> int:
 
     s = common(sub.add_parser("release", help="release a lease"))
     s.set_defaults(fn=cmd_release)
+
+    s = common(sub.add_parser("dispatch", help="plan or start one non-publishing worker"))
+    s.add_argument("--backend", default="agentcloud", choices=("agentcloud", "codex", "metacode"))
+    s.add_argument("--harness", default=dispatch_mod.DEFAULT_HARNESS)
+    s.add_argument("--skills", default="benchsmith")
+    s.add_argument("--mode", default="harden", choices=("harden", "repair"))
+    s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"))
+    s.add_argument("--apply", action="store_true", help="actually start the worker")
+    s.set_defaults(fn=cmd_dispatch)
 
     s = common(sub.add_parser("hash", help="graded and visible surface hashes"))
     s.set_defaults(fn=cmd_hash)

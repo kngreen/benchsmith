@@ -1060,6 +1060,7 @@ with tempfile.TemporaryDirectory() as td:
         (["bar", str(payload)], {0, 1}),
         (["trailers", "--run-id", "r1", "--workflow", "smoke"], {0}),
         (["install-hooks", "--repo", str(repo)], {0}),
+        (["dispatch", "--repo", str(repo), "--task", "mytask"], {0}),
     ]
     for argv, ok in invocations:
         try:
@@ -1082,6 +1083,133 @@ with tempfile.TemporaryDirectory() as td:
         check("hook names an exec target", bool(m), True)
         if m:
             check("hook target exists on disk", Path(m.group(1)).is_file(), True)
+
+
+# --- stage 3: dispatch -------------------------------------------------------
+#
+# The dispatch layer's whole job is to refuse. Every refusal below is checked
+# against a mutant that removes it, because a guard that cannot be shown to fire
+# is indistinguishable from no guard at all.
+
+from benchsmith import dispatch as dsp  # noqa: E402
+
+_p = dsp.plan("t1", "/repo")
+check("default backend is agentcloud", _p.backend, "agentcloud")
+check("default harness is codex", "codex" in _p.argv, True)
+check("dispatch is non-publishing by default", _p.publishing, False)
+check("skills alias is passed", "--skills" in _p.argv and "benchsmith" in _p.argv, True)
+check("plan is shell-quotable", "benchsmith: t1" in _p.shell, True)
+check("task appears in the prompt, not just the title",
+      any("t1" in a and "YOU MAY NOT PUSH" in a for a in _p.argv), True)
+
+# Probed live: agentcloud\wire\HarnessKind rejects these two. Encoding the
+# rejection here means the skill fails loudly rather than the API failing late.
+for bad in ("claude", "metacode"):
+    try:
+        dsp.plan("t1", "/repo", harness=bad)
+        check(f"agentcloud refuses harness={bad}", "accepted", "refused")
+    except dsp.DispatchRefused as e:
+        check(f"agentcloud refuses harness={bad}", "metacode and claude" in str(e) or "valid:" in str(e), True)
+
+check("native is a legal agentcloud harness",
+      dsp.plan("t1", "/repo", harness="native").backend, "agentcloud")
+check("codex backend does not go through agentcloud",
+      dsp.plan("t1", "/repo", backend="codex").argv[:2], ["codex", "exec"])
+check("metacode is reachable as the 1P hop only",
+      "1P delegation only -- not a task worker" in dsp.plan("t1", "/repo", backend="metacode").notes, True)
+try:
+    dsp.plan("t1", "/repo", backend="nope")
+    check("unknown backend refused", "accepted", "refused")
+except dsp.DispatchRefused:
+    check("unknown backend refused", True, True)
+
+# run() must not start anything unless explicitly applied.
+try:
+    dsp.run(_p)
+    check("run without apply refuses", "ran", "refused")
+except dsp.DispatchRefused:
+    check("run without apply refuses", True, True)
+
+_pub = dsp.plan("t1", "/repo"); _pub.publishing = True
+try:
+    dsp.run(_pub, apply=True)
+    check("run refuses a publishing plan", "ran", "refused")
+except dsp.DispatchRefused as e:
+    check("run refuses a publishing plan", "stage 4" in str(e), True)
+
+# --- handoff parsing ---
+_good = '{"work_item":"t1","state":"ready_to_publish","commit_sha":"deadbeef","base_sha":"a1","next_action":"publish"}'
+check("valid handoff parses", dsp.parse_handoff(_good)["commit_sha"], "deadbeef")
+check("handoff keeps only known fields",
+      set(dsp.parse_handoff(_good)) <= set(dsp.HANDOFF_FIELDS), True)
+check("prose around the JSON is tolerated",
+      dsp.parse_handoff("Done!\n" + _good + "\nbye")["state"], "ready_to_publish")
+
+def _oversized() -> str:
+    """A handoff valid in every respect except size, so only the cap can reject it."""
+    pad = "y" * (dsp.HANDOFF_LIMIT * 4)
+    return json.dumps({"work_item": "t1", "state": "blocked", "note": pad})
+
+
+for label, bad in [
+    ("no JSON at all", "the task is finished"),
+    ("malformed JSON", '{"state": "blocked",}'),
+    ("unknown state", '{"state":"kinda_done"}'),
+    # The single claim a coordinator acts on. Unsupported, it must not pass.
+    ("ready_to_publish with no commit_sha", '{"state":"ready_to_publish","work_item":"t1"}'),
+    ("a transcript instead of a handoff", _oversized()),
+    ("nothing returned", None),
+]:
+    try:
+        dsp.parse_handoff(bad)
+        check(f"handoff refused: {label}", "accepted", "refused")
+    except dsp.DispatchRefused:
+        check(f"handoff refused: {label}", True, True)
+
+# --- mutation probe ---
+# Each locator must match exactly once, or the probe is measuring nothing.
+import importlib as _il  # noqa: E402
+_src = Path(dsp.__file__).read_text()
+_MUTANTS = [
+    ("harness allowlist", 'if harness not in AGENTCLOUD_HARNESSES:', 'if False:'),
+    ("apply guard", 'if not apply:', 'if False:'),
+    ("publishing guard", 'if p.publishing:', 'if False:'),
+    ("commit_sha requirement", 'if state == "ready_to_publish" and not doc.get("commit_sha"):', 'if False:'),
+    ("state allowlist", 'if state not in HANDOFF_STATES:', 'if False:'),
+    ("size cap", 'if len(text) > HANDOFF_LIMIT * 4:', 'if False:'),
+]
+for label, old, new in _MUTANTS:
+    check(f"mutant locator is unique: {label}", _src.count(old), 1)
+
+def _survives(old, new) -> bool:
+    """True if the suite's dispatch checks still pass with the guard removed."""
+    Path(dsp.__file__).write_text(_src.replace(old, new, 1))
+    try:
+        m = _il.reload(dsp)
+        probes = [
+            lambda: m.plan("t", "/r", harness="claude"),
+            lambda: m.run(m.plan("t", "/r")),
+            lambda: m.parse_handoff('{"state":"ready_to_publish"}'),
+            lambda: m.parse_handoff('{"state":"kinda_done"}'),
+            lambda: m.parse_handoff(_oversized()),
+        ]
+        _pl = m.plan("t", "/r"); _pl.publishing = True
+        probes.append(lambda: m.run(_pl, apply=True))
+        for probe in probes:
+            try:
+                probe()
+                return True  # something that should have been refused was not
+            except m.DispatchRefused:
+                continue
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+    finally:
+        Path(dsp.__file__).write_text(_src)
+        _il.reload(dsp)
+
+for label, old, new in _MUTANTS:
+    check(f"removing the {label} is caught", _survives(old, new), True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

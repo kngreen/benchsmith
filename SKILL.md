@@ -19,7 +19,7 @@ budget, regression comparison and excursion detection all go blind at once.
 
 ## Entry points
 
-Five flows. Each is standalone — start where the task actually is, not at the top. Never run two
+Six flows. Each is standalone — start where the task actually is, not at the top. Never run two
 against the same task at once.
 
 | Flow | Route | Done when |
@@ -29,6 +29,7 @@ against the same task at once.
 | **Validate / repair an existing task** | STEP 1 → §7 → smallest correct fix | §5 + §11 |
 | **Repair review findings** | the review itself, never the balance row → §7 | both reviews green + §11 |
 | **Generate ideas** | not this skill — `swebench-idea-triage`, then `task-hardness-screen` | a GO'd idea |
+| **Run the fleet** | §12 coordinator | the queue drains or every remaining item needs a human |
 
 **Repair means the smallest correct fix, not the fastest green.** Preserve original intent; every
 tested behaviour stays stated in `instruction.md` or inferable from the contract; the unchanged
@@ -808,3 +809,65 @@ Three ways this goes wrong, all seen:
 **A terminal state is a claim about the platform's state, not about your effort.** Report the
 term that is false and what you did about it; "I ran out of ideas" is `escalated` with an
 evidence pack, which is a real and respectable ending.
+
+## 12. Coordinator — one supervisor, many workers
+
+Everything above is one task. This section is the other axis: many tasks, limited attention. Use
+it when the ask is "work the backlog", not "loop this task".
+
+**The supervisor never does task work.** It orders the queue, starts workers, reads back a small
+handoff, and publishes. The moment it starts editing a task itself it has stopped supervising, and
+the other N-1 items stall behind it.
+
+### Ordering
+
+`benchsmith queue --root <dir>` is a pure function of the journals on disk — same inputs, same
+order, every time. Tiers, most urgent first:
+
+| Tier | Meaning | Why here |
+|---|---|---|
+| 10 | needs revision | A reviewer is already waiting. Latency is the whole cost. |
+| 20 | draft, failing | Known-broken and already scaffolded — the shortest path to a submission. |
+| 30 | draft, pending | Work in flight; may need only a read. |
+| 40 | draft, passing | Passing is not the goal. **Too easy is still a defect**, and these need hardening. |
+| 50 | idea | Nothing exists yet. Most expensive, least certain. |
+
+A journal that cannot be read is **flagged, never skipped silently** — an unreadable ledger is an
+unknown item, not an absent one.
+
+### Dispatch
+
+```bash
+benchsmith dispatch --repo <path> --task <name>            # plan only; writes nothing
+benchsmith dispatch --repo <path> --task <name> --apply    # actually start it
+```
+
+Planning is the default and printing a plan is free, so **read the command before you run fifteen
+of them.**
+
+Three backends, and the choice is a capability question, not a preference:
+
+- `agentcloud` (default) — `meta agentcloud.session create --harness codex --skills benchsmith`.
+  Fleet-visible, pollable by session id, and the only backend a second person can watch.
+- `codex` — `codex exec`. Local, no session record, blocks until the worker finishes.
+- `metacode` — the 1P delegation hop **only**. Never a task worker.
+
+`--harness` accepts `codex` and `native`; it rejects `claude` and `metacode`. So the 1P hop cannot
+be an agentcloud session, and benchsmith refuses that combination when the plan is built rather
+than letting the API fail after a fan-out has already started.
+
+### Handoff
+
+A worker returns **one JSON object under 4 KiB** and nothing else — `work_item`, `state`,
+`base_sha`, `commit_sha`, `gate_receipt`, `next_action`, `note`. A worker that returns its
+transcript instead is refused: a supervisor holding N transcripts runs out of context before the
+queue drains, which is the failure this design exists to prevent.
+
+`state=ready_to_publish` **requires a `commit_sha`**. It is the single claim the supervisor acts
+on, so it is the one claim that may not be taken on trust.
+
+### Publishing
+
+**Workers do not push.** They prepare a commit, run `benchsmith gate`, and stop. Publishing runs
+in one lane, in the supervisor, one repository at a time — N workers racing to push the same
+branch is the contention that makes a fleet slower than a single agent.
