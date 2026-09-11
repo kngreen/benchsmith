@@ -566,6 +566,35 @@ with tempfile.TemporaryDirectory() as td:
     check("missing recipe tag caught", "benchsmith-v1" in tags, True)
 
 
+# --------------------------------------------------- surface drift control ----
+section("The drift control itself is covered — it was not, on first write")
+
+from benchsmith.adapter import SMOKE_CONTRACT, verify_surface  # noqa: E402
+
+_legacy = _ad_mod = None
+from benchsmith import adapter as _ad_mod  # noqa: E402
+
+ok = verify_surface(_ad_mod.Surface(binary="c", task_show=("api", "tasks", "show"),
+                                    jobs_list=("api", "jobs", "list")))
+check("legacy shape matches the fixtures", ok["verdict"], "MATCHES-FIXTURES")
+check("and names which shape", ok["matched"], "legacy")
+
+bare = verify_surface(_ad_mod.Surface(binary="c", task_show=("task", "show"),
+                                      jobs_list=("job", "list")))
+check("bare shape matches the fixtures", bare["verdict"], "MATCHES-FIXTURES")
+
+# A renamed subcommand upstream is exactly the silent failure this exists for.
+drift = verify_surface(_ad_mod.Surface(binary="c", task_show=("workitem", "show"),
+                                       jobs_list=("job", "list")))
+check("an unknown task_show is DRIFTED", drift["verdict"], "DRIFTED")
+check("and says what it saw", "matches no shape" in drift["detail"], True)
+
+half = verify_surface(_ad_mod.Surface(binary="c", task_show=("task", "show"),
+                                      jobs_list=("api", "jobs", "list")))
+check("a half-matching surface is DRIFTED", half["verdict"], "DRIFTED")
+check("fixtures cover both known shapes", sorted(SMOKE_CONTRACT), ["bare", "legacy"])
+
+
 # ------------------------------------------------- reading foreign receipts ----
 section("Foreign receipts — a green status is not evidence")
 
