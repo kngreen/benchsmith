@@ -11,11 +11,13 @@ A missing journal and a converged one must not look alike.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +68,48 @@ def _now() -> tuple[str, str]:
         datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         time.strftime("%Y-%m-%d %H:%M %Z"),
     )
+
+
+@contextmanager
+def _exclusive(path: Path):
+    """Hold an exclusive advisory lock for one read-modify-write.
+
+    Single-task use never needed this. With N workers and a coordinator the
+    window between read and write is a corruption window, and the failure is
+    silent: the loser's rounds vanish, so its stall counters and hardening budget
+    reset to zero -- the two mechanisms that exist to stop a loop spinning.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_suffix(path.suffix + ".lock")
+    fh = lock.open("a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via temp + rename so a reader never sees a half-file.
+
+    `write_text` truncates first: a concurrent reader between truncate and write
+    gets valid-looking empty JSON, which `Journal.open` would treat as a missing
+    journal and start fresh.
+    """
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def round_key(sha: str, graded_hash: str, cls: str, fix: str) -> str:
+    """Idempotency key for one round.
+
+    Restart recovery re-runs the last action. Without a key the same round is
+    appended twice, which inflates the round count, double-spends hardening
+    budget and makes `noProgressStreak` compare a round against itself.
+    """
+    return hashlib.sha256(f"{sha}\x00{graded_hash}\x00{cls}\x00{fix}".encode()).hexdigest()[:16]
 
 
 def journal_dir(repo_root: Path) -> Path:
@@ -158,6 +202,7 @@ class Journal:
                 "mode": DEFAULT_MODE,
                 "findings": {},
                 "probesSpent": 0,
+                "waves": {},
                 "lastGradedHash": None,
                 "gradedHashHistory": [],
                 "lastUpdateLocal": None,
@@ -165,7 +210,8 @@ class Journal:
         return cls(path=path, data=data)
 
     def save(self) -> Path:
-        self.path.write_text(json.dumps(self.data, indent=2) + "\n")
+        with _exclusive(self.path):
+            _atomic_write(self.path, json.dumps(self.data, indent=2) + "\n")
         return self.path
 
     @property
@@ -314,8 +360,17 @@ class Journal:
             self.data["hardeningStreak"] = 0
         self.data["hardeningBudgetExhausted"] = self.data["hardeningSpent"] >= self.budget()
 
+        key = round_key(sha, hashes["gradedHash"], cls, fix)
+        existing = next((r for r in self.rounds if r.get("roundKey") == key), None)
+        if existing is not None:
+            # Same commit, same graded surface, same class, same fix: this is a
+            # replay of an already-recorded round, not a new one.
+            existing["replayedAt"] = iso
+            return existing
+
         entry = {
             "n": len(self.rounds) + 1,
+            "roundKey": key,
             "sha": sha,
             "cloudCommitSha": cloud_sha,
             "measurementMatchesSha": matches,
@@ -369,6 +424,23 @@ class Journal:
         self.data["ineffectiveStreak"] = 0 if moved else self.data["ineffectiveStreak"] + 1
 
     # -- stopping -----------------------------------------------------------
+
+    def record_wave(self, wave) -> dict:
+        """Persist a frozen replacement wave.
+
+        Held only in memory, a wave dies with the worker -- and a restarted
+        worker, seeing no wave, believes its one-per-SHA budget is unspent and
+        can dispatch a second.
+        """
+        row = wave.as_dict() if hasattr(wave, "as_dict") else dict(wave)
+        waves = self.data.setdefault("waves", {})
+        waves.setdefault(row.get("sha", ""), []).append(row)
+        return row
+
+    def prior_wave(self, sha: str) -> dict | None:
+        for row in (self.data.get("waves") or {}).get(sha, []):
+            return row
+        return None
 
     def stop_reason(self) -> str | None:
         # Repair terminates on closure, not on an exhausted budget. Continuing to

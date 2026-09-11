@@ -566,6 +566,66 @@ with tempfile.TemporaryDirectory() as td:
     check("missing recipe tag caught", "benchsmith-v1" in tags, True)
 
 
+# ------------------------------------------------ concurrency and restart ----
+section("Fleet prerequisites — atomicity, idempotency, durable waves")
+
+from benchsmith.journal import round_key  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td); repo = scratch_repo(tmp); task_dir = repo / "mytask"
+
+    # Idempotency: replaying the same round must not append a second one.
+    j = Journal.open(repo, "mytask")
+    a = j.record(task_dir=task_dir, sha="s1", cls="corrective", fix="same fix")
+    n_after_first = len(j.rounds)
+    b = j.record(task_dir=task_dir, sha="s1", cls="corrective", fix="same fix")
+    check("replaying a round does not append", len(j.rounds), n_after_first)
+    check("the replay returns the original", b["roundKey"], a["roundKey"])
+    check("and is marked replayed", "replayedAt" in b, True)
+    c = j.record(task_dir=task_dir, sha="s1", cls="corrective", fix="a different fix")
+    check("a genuinely different round does append", len(j.rounds), n_after_first + 1)
+    check("keys differ", c["roundKey"] != a["roundKey"], True)
+    check("key is deterministic", round_key("s", "g", "c", "f"), round_key("s", "g", "c", "f"))
+    check("key is sensitive to sha", round_key("s1", "g", "c", "f") != round_key("s2", "g", "c", "f"), True)
+    j.save()
+
+    # Atomicity: a reader must never observe a truncated file.
+    import os as _os
+    text = (repo / ".benchsmith" / "mytask.json").read_text()
+    check("saved journal parses", bool(json.loads(text).get("rounds")), True)
+    check("no temp files left behind",
+          [f for f in (repo / ".benchsmith").iterdir() if ".tmp." in f.name], [])
+
+    # Concurrent writers: last-writer-wins is acceptable, corruption is not.
+    import subprocess as _sp, sys as _sys
+    writer = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from pathlib import Path\n"
+        "from benchsmith.journal import Journal\n"
+        "j = Journal.open(Path(%r), 'mytask')\n"
+        "j.record(task_dir=Path(%r), sha='c'+sys.argv[1], cls='corrective', fix='w'+sys.argv[1])\n"
+        "j.save()\n"
+    ) % (str(Path("lib").resolve()), str(repo), str(task_dir))
+    procs = [_sp.Popen([_sys.executable, "-c", writer, str(i)]) for i in range(6)]
+    for pr in procs: pr.wait()
+    raw = (repo / ".benchsmith" / "mytask.json").read_text()
+    try:
+        parsed = json.loads(raw); ok_parse = True
+    except Exception:
+        parsed, ok_parse = None, False
+    check("journal still parses after 6 concurrent writers", ok_parse, True)
+    check("and is not empty", bool(parsed and parsed.get("task")), True)
+
+    # Durable waves: a restarted worker must see the wave it already spent.
+    k = Journal.open(repo, "waves")
+    check("no prior wave initially", k.prior_wave("shaX"), None)
+    k.record_wave({"sha": "shaX", "scope": "slot", "digest": "d1", "slots": []})
+    k.save()
+    reloaded = Journal.open(repo, "waves")
+    check("wave survives a reload", (reloaded.prior_wave("shaX") or {}).get("digest"), "d1")
+    check("a different sha has none", reloaded.prior_wave("shaY"), None)
+
+
 # --------------------------------------------------- surface drift control ----
 section("The drift control itself is covered — it was not, on first write")
 
