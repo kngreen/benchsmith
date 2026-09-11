@@ -1,18 +1,21 @@
 ---
 name: assay
-description: The hard-task bar for ripen loops — pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage, plus the integrity checks ripen's gate does not carry. Invoked at ripen STEP 2 and STEP 3, never as a driver. Use when deciding whether a Codimango task is genuinely hard, whether a round's failures count as hardness evidence, which lever to pull on a too-easy task, or which terminal state to report.
+description: Iterate one Codimango benchmark task until it is genuinely hard and every exact-head gate is green — reading the platform fresh, classifying each round, gating the push, and stopping only on a real finding. Owns the difficulty bar (pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage), the integrity checks, provenance tagging, and the terminal verdict. Use for "loop this task", "iterate until it passes", "is this task hard enough", "harden this task", "why did this round fail", or "what terminal state should I report".
 ---
 
 # Assay
 
-**You are not a loop.** Ripen owns the rounds: signals, classification, the pre-push gate, the
-journal, the wait, the endings. Do not restate or re-implement any of it, and do not run a
-second loop spec alongside it.
+Assay owns the whole cycle for one benchmark task: read the platform, classify what is failing,
+fix what it is allowed to fix, gate the push, record the round, wait, repeat — and stop when the
+task is genuinely hard, or say plainly why it is not.
 
-Assay owns the three things ripen has no opinion about — what counts as *hard*, the integrity
-checks its gate does not carry, and how its endings map to a reportable terminal state.
+It has no external loop engine and no runtime dependency on another repository. The mechanics
+live in `lib/` and run through `bin/assay`; this file holds the judgement.
 
-Where the two disagree: **ripen wins on mechanics, assay wins on the bar.**
+**One driver, one ledger.** Do not run a second iteration system against the same task. The
+journal at `.assay/<task>.json` is written only by `assay record` — never by hand, because a
+hand-written journal produces none of the fields the loop reads back, and stall detection, the
+budget, regression comparison and excursion detection all go blind at once.
 
 ## Entry points
 
@@ -21,9 +24,9 @@ against the same task at once.
 
 | Flow | Route | Done when |
 |---|---|---|
-| **Create a binary task** | §3 intake → ripen STEP S → §4 | §5 bar + §11 |
+| **Create a binary task** | §3 intake → STEP S → §4 | §5 bar + §11 |
 | **Create an open-ended task** | §3 intake → `references/continuous.md` | that file's band + §11 |
-| **Validate / repair an existing task** | ripen STEP 1 → §7 → smallest correct fix | §5 + §11 |
+| **Validate / repair an existing task** | STEP 1 → §7 → smallest correct fix | §5 + §11 |
 | **Repair review findings** | the review itself, never the balance row → §7 | both reviews green + §11 |
 | **Generate ideas** | not this skill — `swebench-idea-triage`, then `task-hardness-screen` | a GO'd idea |
 
@@ -33,24 +36,62 @@ base still fails and the reference still passes; correct alternatives still pass
 hard-coded, artifact-spoofing and grader-tampering solutions still fail. Never weaken, delete,
 skip or bypass a legitimate test to get a green.
 
-## When to invoke
+## The round
 
-| Phase | Section |
-|---|---|
-| Before scaffolding a new task, or revising one with no recorded intake | §1–§4 |
-| Ripen STEP 2, the terminal check | §5 — the bar, plus `references/gates.md` |
-| Ripen STEP 3, classifying a round | §7 — cause → class |
-| Ripen STEP 5, before a graded-surface push | §6 — integrity |
-| A too-easy or too-hard round | §8 |
-| Before claiming any terminal state | §11 |
-| Any ending | §10 |
+The loop runs **inside one live session**. A round ends by blocking on the platform until the
+run reaches a terminal state; the next round begins in the same turn. A round that changes
+nothing still reads signals and records a round — **silence must mean the loop stopped, never
+that a round was uninteresting.**
 
-**One driver, one ledger.** Ripen is the driver — do not also run `codimango-auto-iterate` or
-`push-and-watch` against the same task. Ripen's journal (`.ripen/<task>.json`, written only by
-`record_round.sh`) is the only ledger. Do not create `.rounds.json`, a `ROUNDS.md`, a contract
-doc, or any second state file. If a repo already has one, leave it and do not follow it —
-another system's *gate* still has to pass, but its *instructions* do not. Repository
-`AGENTS.md` is additive.
+```
+(idea only) scaffold the tree, prove it            STEP S   ← once, if no task yet
+        │
+read every signal for the last pushed commit      STEP 1    assay read | assay bar
+        │
+        ├─ terminal? ──────────► stop: §10          STEP 2   §5 + references/gates.md
+        │
+   classify what is failing                        STEP 3   references/classes.md
+   fix everything determinable, batched            STEP 4   §6, §8
+   gate the resulting tree                         STEP 5   assay gate
+   push ONCE, record the round                     STEP 6   assay record
+   block until the platform is terminal            STEP 7
+        │
+        └──────► back to STEP 1, same turn
+```
+
+### STEP 0 — bind, once
+
+```bash
+assay probe                      # resolve the CLI surface; never hardcode a subcommand
+assay install-hooks --repo .     # pre-push gate, into the hooks dir the repo already uses
+```
+
+Record `TASK_ID`, `TASK_UUID`, `SOURCE_REPO`, `ACTIVE_SHA` and `ASSAY_TARGET` (§1). An
+unresolved capability is **declared and degraded, never substituted with a command you have not
+run**; a command that errors is `not_run`, not a pass.
+
+### STEP 6 — push once, record always
+
+Stage and commit with a pathspec on **both** operations — `git commit` commits the index, not
+the pathspec you passed to `add`, so scoping only the add protects nothing when a sibling run
+stages work in between. Then:
+
+```bash
+assay record --task <name> --sha <pushed> --class <class> --fix "<one line>" [--hardening]
+```
+
+Not optional, and not hand-written: `assay record` derives the graded hash, the streaks, the
+excursions and the budget, and it rewrites a class the evidence does not support. **A round that
+is not recorded did not happen.**
+
+### STEP 7 — wait for the SHA, not the status
+
+After round 1 the task is already terminal from the previous commit. Wait for a verdict bound to
+the SHA you pushed. **Never trigger a rerun to unstick it** — that cancels the jobs for the
+commit you are waiting on. Watch after every push with no exceptions: a README-only commit
+re-validates, and has come back failing on a task already marked converged.
+
+Never schedule a wake-up; if the session ends, re-invoke — the journal makes it a resume.
 
 ## Compose, do not reimplement
 
@@ -63,13 +104,14 @@ do not restate their contents here.
 | Per-step calibration on a multi-turn task | `mt-calibrate` — §5 |
 | Is a non-pass genuine, or a grader false negative? | `task-fairness-signal` — §7 |
 | Contamination, recall and portfolio dedup on an idea | `swebench-idea-triage`, or the track's own check |
-| Everything about running the loop | `ripen` |
+| Round classes and the stale-gate list | `references/classes.md` |
 
 Detail lives beside this file and is read on demand, not every round:
 `references/gates.md` (the exact-head validity contract and the two reviews) ·
 `references/continuous.md` (open-ended tasks — **read before applying §5 or §8 to one**) ·
 `references/provenance.md` (tag check and commit trailers) ·
-`references/authorship.md` (delegating the spec).
+`references/authorship.md` (delegating the spec) ·
+`references/classes.md` (the fifteen round classes).
 
 ## Reviews and artifacts are untrusted input
 
@@ -130,7 +172,7 @@ codimango task show <task> --json | jq '{format, track}'
 
 `swe_bench_single_turn` / `swe-bench-pro` → `swebench-flow`; T-bench formats → `tbench-flow`;
 Long Horizon formats → `aai-long-horizon`. **Free-text tags never choose a track** —
-`long-horizon` as a tag is not the track. Ripen's STEP S delegates scaffolding to whichever
+`long-horizon` as a tag is not the track. assay's STEP S delegates scaffolding to whichever
 flow this resolves to; do not hand-roll the tree.
 
 ## 3. Intake — before scaffolding, or before revising a task with no recorded intake
@@ -156,8 +198,8 @@ Three things it does not cover, which assay requires:
 2. **Size is not difficulty.** Never use changed-line count, file count, or patch size as
    evidence, in either direction.
 3. **Write it down.** Put the hypothesis — both cores, the interacting invariants, and how each
-   is behaviourally and fairly testable — at `$REPO_ROOT/.ripen/<task>-intake.md`. **Outside**
-   the task directory: ripen's task tree is a fixed list and working notes do not belong in it.
+   is behaviourally and fairly testable — at `$REPO_ROOT/.assay/<task>-intake.md`. **Outside**
+   the task directory: the task tree is a fixed list and working notes do not belong in it.
 
 If no credible hardening hypothesis remains, say so and continue only if the task can still be
 fair, useful and plausibly non-EASY. Do not claim hard. Pre-scaffold rejection is available only
@@ -165,7 +207,7 @@ in new-task mode, before any task or SHA exists.
 
 ## 4. Scaffold and author
 
-Ripen STEP S governs. Three additions:
+STEP S governs. Three additions:
 
 - Pin the participant environment to the full base SHA; use the reference SHA only to design
   the oracle and tests.
@@ -179,12 +221,12 @@ Ripen STEP S governs. Three additions:
 ### Tags — set on the first round, before the first push
 
 `[metadata].tags` in `task.toml` must carry all of these, **added to** whatever is already there.
-Never replace the existing list: ripen writes `ripen-v1` and it stays.
+Never replace the existing list: assay writes it stays.
 
 | Tag | What it is | Enforced by |
 |---|---|---|
 | `assay-v1` | The recipe name — this task was built and gated under assay | **nothing — you** |
-| `aai-labs` | Labs attributes throughput by this tag; an untagged Labs task is invisible | ripen's gate |
+| `aai-labs` | Labs attributes throughput by this tag; an untagged Labs task is invisible | the gate |
 | `aai-labs-<project>` | **The team tag.** Derive it from the task repo slug: `codimango/swe-bench-aai-labs-<project>` → `aai-labs-<project>`. For `swe-bench-aai-labs-ollo` that is `aai-labs-ollo` | **nothing — you** |
 | `semi-synthetic` | Provenance: produced through an assisted recipe, not hand-authored end to end | **nothing — you** |
 | `private_repos_1p` | Every AAI Labs task is 1P | **nothing — you** |
@@ -195,11 +237,11 @@ the ordinary descriptive ones: language, task type, framework. A complete Labs l
 
 ```toml
 tags = ["swe-bench-pro", "SWEBench-External", "private_repos_1p", "aai-labs", "aai-labs-ollo",
-        "semi-synthetic", "assay-v1", "ripen-v1"]
+        "semi-synthetic", "assay-v1", "assay-v1"]
 ```
 
-**Only `aai-labs` is enforced.** Ripen's gate blocks a push missing `ripen-v1` or `aai-labs` (via
-`labs_scope.sh`) and knows nothing about the rest.
+**Only `aai-labs` is enforced.** the gate blocks a push missing `assay-v1` or `aai-labs` (via
+`assay gate`) and knows nothing about the rest.
 
 **Gate the full set before the first push, not at the terminal check.** A task that reaches its
 first cloud round untagged is already mis-attributed, and the §5 checklist catches it far too
@@ -213,7 +255,7 @@ platform (§2), not from this list.
 move that tags do not. Every commit an assay run creates carries `Created-Via: assay`,
 `assay-Version: 1`, `assay-Run-ID` and `assay-Workflow`, preserved across amend and rebase.
 Install the `commit-msg` hook **into the hooks directory the repo already uses** — never repoint
-`core.hooksPath`, which silently disables ripen's `pre-push` gate. Script and chaining rule:
+`core.hooksPath`, which silently disables assay's `pre-push` gate. Script and chaining rule:
 `references/provenance.md`.
 
 **Declared `difficulty` must not silently disagree with the measured classification.** Leave it
@@ -226,13 +268,13 @@ push the rate down is conjunction inflation, not hardening.**
 
 ---
 
-## 5. The bar — extends ripen STEP 2, does not replace it
+## 5. The bar — extends STEP 2, does not replace it
 
-Every box in ripen's STEP 2 checklist must be ticked. These are **additional**, and a task is
+Every box in assay's STEP 2 checklist must be ticked. These are **additional**, and a task is
 not converged until they hold on the exact final SHA:
 
 - [ ] Pooled participant completion **0.20–0.50 inclusive**, as an exact fraction over the
-      scored denominator from `infra_check.sh` — never the naive one.
+      scored denominator from `assay bar` (the `infra` block) — never the naive one.
 - [ ] Every member of the **frozen strongest set** is mixed, **0.20–0.60 inclusive**. One
       saturated or starved member fails this by itself. Avocado/MetaCode substitutes for a
       missing GPT/Opus cohort only when the platform designates it.
@@ -272,8 +314,7 @@ points. So:
 - Report the **Wilson** interval beside every rate (`z = 1.96`, no continuity correction — Wald
   is degenerate at 0/5 and 5/5).
 - Gate on the pooled point estimate.
-- Pool only measurements whose graded **and** agent-visible hashes are identical. Ripen computes
-  both via `graded_hash.sh`; use those, not a judgment call.
+- Pool only measurements whose graded **and** agent-visible hashes are identical. `assay hash` computes both; use those, not a judgment call.
 - When the estimate sits within one trial of a band edge, **say "boundary-adjacent" and do not
   make a corrective commit on that basis alone.**
 - Never describe one five-trial cohort as establishing a rate to better than about 20 points.
@@ -282,8 +323,8 @@ points. So:
 
 ## 6. Integrity — add these to the gate, do not merely remember them
 
-Ripen's Tier 1 does not carry these. **Port them into `bin/` and the gate rather than checking
-them by hand** — ripen's own rule is that a check done differently every round is not a check.
+assay's Tier 1 does not carry these. **Port them into `bin/` and the gate rather than checking
+them by hand** — our own rule is that a check done differently every round is not a check.
 Until they are scripted, run them explicitly before every push and record the result; an unrun
 check is `not_run`, never a pass.
 
@@ -309,20 +350,20 @@ invoked by pinned absolute path. Full-closure procedure: `references/gates.md`.
 
 ### The honest gap
 
-`gate.sh --mutation` covers **Go and Python only**, caps the battery at 12, and reports
+the optional mutation probe covers **Go and Python only**, caps the battery at 12, and reports
 `NOT_RUN` elsewhere — so a Swift or TypeScript task has no mutation coverage at all. Report that
 as uncovered. Do not report it as clean.
 
 ---
 
-## 7. Cause → ripen class
+## 7. Cause → assay class
 
 **`task-fairness-signal` owns the attribution.** It audits trajectories and verifier logs per
 trial, separates infra from ambiguity from reasoning, and returns OK / REVIEW / NEEDS_REVISION.
 Run it before calling anything hardness evidence; do not eyeball a trajectory and decide. Then
-map its answer onto ripen's classes:
+map its answer onto the classes:
 
-| Cause | Ripen class | Counts toward the bar? |
+| Cause | assay class | Counts toward the bar? |
 |---|---|---|
 | Spec ambiguity or defect | `contract-disagreement`, or the spec fix | No — invalidates the measurement |
 | Valid alternative rejected / grader false negative | `grader-false-negative`, `suspect-golden`, `dominant-blocker` | No — never harden on it |
@@ -331,7 +372,7 @@ map its answer onto ripen's classes:
 | Genuine semantic failure | `in-band` / `too-easy` by rate | **Yes** — the only hardness evidence |
 | Unknown attribution | `not-measured` | No |
 
-Read `infra_check.sh` **first**, before any difficulty reading — errored trials sit in the
+Read `assay bar` (the `infra` block) **first**, before any difficulty reading — errored trials sit in the
 denominator and drag the rate down, which reads as a harder task. Exit 2 is a third answer, not
 a quieter 1.
 
@@ -358,7 +399,7 @@ Before proposing anything, read **two or three tasks in this repo that measured 
 accepted**. Extract the *mechanism* each used, never the content: what behaviour the
 discriminator turned on, why the contract already entailed it, what made it survive
 consolidation. Add the Harvester difficulty-levers catalogue. Write the patterns to
-`$REPO_ROOT/.ripen/<task>-hardening.md` — a working note, outside the task tree.
+`$REPO_ROOT/.assay/<task>-hardening.md` — a working note, outside the task tree.
 
 A lever invented from first principles when three calibrated neighbours are sitting in the same
 repo is a wasted round.
@@ -367,7 +408,7 @@ repo is a wasted round.
 
 Produce **at least three** candidate levers, ranked, each with: the behaviour it targets, the
 contract clause that already entails it, the predicted per-cohort catch, and the way it could
-fail. Record declared levers in `.loop/levers.md` per ripen.
+fail. Record declared levers in `.loop/levers.md` per assay.
 
 **Freeze the whole slate before the first replay**, and hash it. This is what makes falling
 through to lever 2 legitimate: you are executing a plan that predates the evidence, not choosing
@@ -392,14 +433,14 @@ target cohort without rejecting golden, rejecting a valid alternative, or pushin
 member below 0.20. If it fails, record why and **take the next lever off the slate** — no
 re-derivation, no revision of the one that failed.
 
-One lever per *push*; `RIPEN_HARDENING_BUDGET` (default 5) counts pushes, not attempts. **A lever
+One lever per *push*; `ASSAY_HARDENING_BUDGET` (default 5) counts pushes, not attempts. **A lever
 that dies at local replay spends nothing** — nothing was measured, so nothing was spent.
 
 **Two caps run concurrently; the stricter one governs.**
 
 | Cap | Counts | Fires when |
 |---|---|---|
-| Hardening budget | pushed levers | `RIPEN_HARDENING_BUDGET` reached (default 5) |
+| Hardening budget | pushed levers | `ASSAY_HARDENING_BUDGET` reached (default 5) |
 | Ineffective-round cap | **measured** corrective rounds | three consecutive rounds move the pooled rate less than one trial-equivalent toward the band |
 
 The second is the tighter one in practice and assay previously omitted it. Three measured rounds
@@ -427,8 +468,7 @@ Each of these has ended a run early. None of them is a finding:
   declared, what the band did, what you would try next. Never `abandoned`.
 - **The premise is wrong** → `abandoned`, and say it on round 2, not round 12.
 
-**Stopping with budget unspent is an unfinished job, not a finding.** Ripen enforces the floor —
-`record_round.sh` refuses `--status abandoned` while the oracle passes and budget remains — so a
+**Stopping with budget unspent is an unfinished job, not a finding.** `assay record` refuses `--status abandoned` while the oracle passes and budget remains — so a
 run that reports REJECTED from an unspent budget bypassed the recorder. Treat that report as a
 bug in the run, not a verdict on the task.
 
@@ -469,7 +509,7 @@ medium while a fair lever remains.
 
 ## 9. Authorship
 
-**Ripen's per-driver table governs** — it is newer than the 2026-08-17 policy post (the rule
+**The per-driver table governs** — it is newer than the 2026-08-17 policy post (the rule
 changed 2026-09-08) and it is keyed on the driving model, not the file:
 
 | Driver | `instruction.md` | `tests/` | everything else |
@@ -487,7 +527,7 @@ the text is replaced — so a Codex-authored `instruction.md` is a real finding 
 it rather than waving it through. **Never emit "a human must rewrite the spec"** — that parks a
 task that is otherwise finished.
 
-Spec edits are a last resort: ripen STEP 3 must have named an ambiguity or a spec/test gap, and
+Spec edits are a last resort: STEP 3 must have named an ambiguity or a spec/test gap, and
 the edit is the smallest wording change that closes it. Rewriting the spec because the task is
 too easy is a calibration lever in disguise.
 
@@ -495,9 +535,9 @@ too easy is a calibration lever in disguise.
 
 ## 10. Endings
 
-Ripen's ending is the mechanism; the terminal state is what you report.
+assay's ending is the mechanism; the terminal state is what you report.
 
-| Ripen status | Terminal state |
+| assay status | Terminal state |
 |---|---|
 | `converged`, §5 bar holds at hard | **GREEN — HARD** |
 | `converged`, §8 medium conditions hold | **GREEN — MEDIUM** — *`hard-preferred` only* |

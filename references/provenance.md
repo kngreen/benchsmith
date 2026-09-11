@@ -6,8 +6,8 @@ into Codimango, trailers survive into `git log` after a task is renamed or moved
 
 ## Task tags
 
-See §4 for the required set. The rule that matters here: **add, never replace.** Ripen writes
-`ripen-v1`; a task may already carry track and author tags. Append yours and preserve the rest.
+See §4 for the required set. The rule that matters here: **add, never replace.** A task may already carry track, author or
+prior-recipe tags. Append yours and preserve every one of them.
 
 A worked check, since only `aai-labs` is gate-enforced:
 
@@ -25,9 +25,8 @@ print("MISSING:", ", ".join(missing) if missing else "none")
 EOF
 ```
 
-Treat a missing tag as **blocking completion**, not as a warning to note in the report. The
-control plane in taskvenger flips readiness back to `working` with "Completion blocked:
-task.toml must include …"; assay has no control plane, so the check has to run here.
+`assay gate` runs this check and **blocks the push** on a missing tag — a task that reaches its
+first cloud round untagged is already mis-attributed, and Labs cannot see it at all.
 
 ## Commit trailers
 
@@ -42,11 +41,12 @@ assay-Workflow: <flow from the §0 entry-point table>
 
 Preserve them across amend and rebase. Do not bypass with `--no-verify`.
 
-### Installing the hook without breaking ripen's gate
+### Installing the hook without disabling another tool's gate
 
-**Do not set `core.hooksPath` to a new directory.** Ripen installs its gate as a `pre-push` hook
-and treats a foreign or missing hook as a FAIL — repointing `core.hooksPath` silently disables
-the gate, which is the one thing worse than not having trailers.
+**Do not set `core.hooksPath` to a new directory.** Another tool's gate may already live in the
+repo's hooks directory, and repointing `core.hooksPath` silently disables it — which is the one
+thing worse than not having trailers. `assay install-hooks` resolves the existing path and
+installs alongside.
 
 Install `commit-msg` **into whatever hooks directory the repo already uses**:
 
@@ -68,8 +68,9 @@ chmod 755 "$HOOKS/commit-msg"
 ```
 
 `--if-exists=replace` makes it idempotent across amends. If a `commit-msg` hook already exists
-and you did not write it, **chain it rather than overwriting** — same rule ripen applies to
-`pre-push`. Overwriting another tool's hook to add provenance is a bad trade.
+and you did not write it, **chain it rather than overwriting**. Overwriting another tool's hook
+to add provenance is a bad trade, and reordering someone else's tooling unasked is worse than
+saying so loudly.
 
 ## Authorship metadata
 

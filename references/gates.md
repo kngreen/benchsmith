@@ -10,11 +10,10 @@ announcing it is legacy and pointing at a replacement fbcode CLI that keeps the 
 command and changes the subcommand shape. Treat every literal invocation here as an *example of
 the invariant*, never as the contract.
 
-Resolve the commands once, through ripen's STEP 0 adapter slots (`LOCAL_VALIDATE`,
-`LOCAL_ORACLE`, `CLOUD_STATUS`, `CLOUD_JOBS`), by probing with `command -v` and `--help` — and
-route every collector through them. **An unresolved slot is declared and degraded, never
-substituted with a command you have not run**, and a command that errors is `not_run`, not a
-pass.
+Resolve the surface once with `assay probe`, which reads `--help` and caches the result, and
+route every read through `assay read`. **An unresolved capability is declared and degraded,
+never substituted with a command you have not run**, and a command that errors is `not_run`,
+not a pass.
 
 What must hold regardless of surface: the read is uncached, it is addressed by `TASK_ID`/
 `TASK_UUID` rather than basename (§1), and every number it returns is attributed to `ACTIVE_SHA`.
@@ -22,8 +21,9 @@ What must hold regardless of surface: the read is uncached, it is addressed by `
 ## Read fresh, always
 
 **Every Codimango read carries `--no-cache`.** A cached read after a push is how one commit's
-numbers get attributed to another. Ripen detects that after the fact (`measurementMatchesSha`
-blanks the round); `--no-cache` prevents most of it upfront.
+numbers get attributed to another. `assay record` detects it after the fact — it compares the
+validation commit against the pushed SHA and blanks the round — but `--no-cache` prevents most
+of it upfront.
 
 ```bash
 codimango --site nest api tasks show     "$TASK" --json --no-cache
@@ -107,7 +107,7 @@ Every item, on one exact commit, from fresh reads:
 
 Checks a task format does not have are not applicable — record that, never fabricate them.
 Embedding dedup is informational unless project policy makes it blocking; **contamination is
-not** — assay keeps ripen's rule that `NOT EVALUATED` leaves the box unchecked rather than green.
+not** — `NOT EVALUATED` leaves the box unchecked rather than green.
 
 ## The review manifest
 

@@ -1,75 +1,78 @@
 # assay
 
-The hard-task bar for [`ripen`](https://github.com/codimango/ripen) loops.
+Iterate one Codimango benchmark task until it is genuinely hard and every exact-head gate is
+green — or say plainly, with evidence, why it is not.
 
-Ripen owns the loop — rounds, signals, classification, the pre-push gate, the journal, the
-wait, the endings. Assay owns the four things ripen has no opinion about:
+Assay is self-contained. It owns the round loop, the journal, the pre-push gate, the difficulty
+bar, provenance tagging and the terminal verdict, with **no runtime dependency on any other
+repository**. Judgement lives in `SKILL.md`; arithmetic lives in `lib/`; `bin/assay` is the entry
+point. Stdlib-only Python 3.11+, no install step.
 
-- **what counts as hard** — pooled band with a Wilson interval, strongest-cohort mixedness,
-  two-family and two-category hardness, per-step pass-and-failure, single-gate coverage;
-- **the integrity checks ripen's gate does not carry** — the `tests/config.json` config-integrity
-  block, and reward unforgeability where a candidate-controlled pre-grade execution point exists;
-- **the AAI Labs tag set** — the recipe, team, provenance and 1P tags, only one of which any
-  gate enforces (see below);
-- **how ripen's endings map to a reportable terminal state** — `converged` / `escalated` /
-  `abandoned` / `blocked-on-platform` → GREEN — HARD / GREEN — MEDIUM / IMPROVED / ESCALATED /
-  REJECTED — NOT HARD / BLOCKED — PLATFORM.
+## What it decides
 
-Where the two disagree: ripen wins on mechanics, assay wins on the bar.
+Two questions, kept separate on purpose, because passing one says nothing about the other:
 
-## Not a second loop spec
+- **Is the task valid?** Head equals validation commit, structural and oracle green, TBR
+  `GOOD`/`Accept`, Agentic Full-Task Review `GOOD` at 17/17, contamination LOW, no unresolved
+  current-commit failure. → `references/gates.md`
+- **Is the task hard?** Pooled completion in 0.20–0.50 with a Wilson interval, every frozen
+  strongest cohort mixed, two model families failing for two independent semantic reasons, every
+  step with a genuine pass and a genuine failure, no single decision explaining ≥80% of
+  strongest-member failures. → `SKILL.md` §5
 
-Ripen's `SKILL.md` says a task repo must follow exactly one loop spec, and it is right. Assay is
-deliberately **not** one — it drives no rounds, keeps no ledger, and pushes nothing. It is
-invoked at named points inside ripen's loop:
+A platform that accepts model-family balance has not established that a task is hard. That gap
+is what this skill exists to close.
 
-| Phase | Section |
-|---|---|
-| Before scaffolding a new task | §1–§4 |
-| Ripen STEP 2, terminal check | §5 |
-| Ripen STEP 3, classifying a round | §7 |
-| Ripen STEP 5, before a graded-surface push | §6 |
-| A too-easy or too-hard round | §8 |
-| Any ending | §10 |
+## Usage
 
-Ripen's journal (`.ripen/<task>.json`) stays the only ledger. Assay writes one file, the intake
-hypothesis at `$REPO_ROOT/.ripen/<task>-intake.md`, deliberately outside the task tree.
+```bash
+assay probe                                   # resolve the platform CLI surface
+assay install-hooks --repo .                  # pre-push gate
+assay read --task <name> --task-id <id>       # fresh, identity-checked
+assay bar payload.json --target hard-only     # the difficulty verdict
+assay gate --repo . --task <name>             # before every push
+assay record --repo . --task <name> --sha <sha> --class in-band --fix "..."
+```
 
-## Tags
+`assay --help` lists everything. `ASSAY_TARGET`, `ASSAY_HARDENING_BUDGET`, `ASSAY_TASK_ID`,
+`ASSAY_SOURCE_REPO` and `ASSAY_ORACLE` are read from the environment when the flags are omitted.
 
-Every task assay gates carries these in `[metadata].tags`, appended to whatever ripen already
-wrote (`ripen-v1` stays):
+## Design commitments
 
-| Tag | What it is | Enforced by |
-|---|---|---|
-| `assay-v1` | The recipe name | nothing |
-| `aai-labs` | Labs throughput attribution | ripen's gate |
-| `aai-labs-<project>` | The team tag, derived from the repo slug `codimango/swe-bench-aai-labs-<project>` — e.g. `aai-labs-ollo` | nothing |
-| `semi-synthetic` | Produced through an assisted recipe | nothing |
-| `private_repos_1p` | Every AAI Labs task is 1P | nothing |
-| `long-horizon` | Only at 10k+ LOC or 1hr+ | nothing |
+**Never fabricate a rate.** A measurement that is incomplete, or invalidated by a spec defect or
+a rejected valid alternative, returns `NO RATE` and names every missing slot. A planned slot with
+zero rows is *incomplete*, never absent — shrinking the denominator to whatever arrived turns a
+broken cohort into a flattering number.
 
-Plus the track's base tags (`swe-bench-pro`, `SWEBench-External`) and the descriptive ones —
-language, task type, framework.
+**`NOT_RUN` is never a pass.** Every gate check is tri-state, so a check that could not run never
+reads like one that ran and was satisfied.
 
-**Five of the six are unenforced.** Ripen's gate blocks a push missing `ripen-v1` or `aai-labs`
-via `labs_scope.sh`; nothing checks the rest, and a missing `private_repos_1p` is a High finding
-at review (`review-task-swebench-licensed`). §4 and the §5 checklist carry the detail. The
-durable fix is a gate row — the same argument §6 makes for the config-integrity block.
+**Errored is not failed.** An infrastructure trial is replaced, not counted; left in the
+denominator it reads as a harder task.
 
-Convention verified against `swebench-meta-project-guide` and `swebench-licensed-guide`.
+**Empty is not unknown.** When a failing trial names no failures the shared set is *unknowable*,
+so it is `null`, never `[]`.
 
-## Composes with
+**Never hardcode a subcommand.** The platform CLI announces itself as legacy and points at a
+replacement. `assay probe` resolves the surface once by probing `--help`.
 
-Assay delegates rather than restating, so each rubric drifts independently:
+**Never trust a name lookup.** Basenames collide across repos and survive renames, and the read
+surface is name-only, so identity is verified on the way back: a record whose id disagrees with
+the one bound at intake is another task.
 
-| Concern | Owner |
-|---|---|
-| Pre-build idea screening — kill-tests, residual hard core, GO/DERISK/KILL | `task-hardness-screen` |
-| Per-step multi-turn calibration at k≥10 | `mt-calibrate` |
-| Genuine failure vs grader false negative | `task-fairness-signal` |
-| Contamination, recall, portfolio dedup | `swebench-idea-triage` or the track's own check |
-| The loop itself | `ripen` |
+**A round that is not recorded did not happen**, and a journal is never hand-written.
+
+## Layout
+
+```
+SKILL.md              the loop and the judgement
+bin/assay             entry point
+lib/assay/            model · bar · snapshot · journal · gate · adapter · cli
+references/           gates · classes · continuous · provenance · authorship
+```
+
+`references/continuous.md` matters more than its size suggests: most of the difficulty machinery
+assumes binary reward, and applying it to a continuously-scored task measures the wrong thing.
 
 ## Install
 
@@ -78,28 +81,18 @@ git clone git@github.com:kngreen/assay.git ~/.claude/skills/assay
 ln -s ~/.claude/skills/assay ~/.codex/skills/assay
 ```
 
-Available as `/assay` in Claude Code on the next session, and to Codex via its skills directory.
-`~/.llms/skills/claude-templates` is a symlink to `~/.claude/skills`, so the single clone also
-surfaces through the devmate mirror.
-
-Muse resolves components through the agent marketplace rather than a local path, so reaching it
-means landing the skill in `fbcode/claude-templates/components/skills/assay/` and then
-`claude-templates skill install assay --agent muse`.
+`/assay` in Claude Code on the next session, and available to Codex via its skills directory.
+`~/.llms/skills/claude-templates` is a symlink to `~/.claude/skills`, so one clone also surfaces
+through the devmate mirror. Muse resolves through the agent marketplace rather than a local path,
+so reaching it means landing the skill in `fbcode/claude-templates/components/skills/assay/`.
 
 ## Prerequisites
 
-`ripen` installed and driving the task. Assay refers to ripen's scripts by name —
-`infra_check.sh`, `graded_hash.sh`, `record_round.sh`, `gate.sh --mutation` — and to the
-`team-aai` bundle for the skills in the table above.
+An authenticated `codimango` CLI, a checkout of the task repository, and — for the skills assay
+delegates to at intake and attribution — the `team-aai` bundle.
 
-## Provenance
+## Acknowledgement
 
-Distilled from a hard-first Codimango task-quality workflow (v1 and v5.1) by keeping what ripen
-does not enforce and deleting what it does. The removed material — exact-SHA lifecycle, push
-hygiene, bounded-wait deadlines, the round ledger and its pooling bookkeeping — is all carried
-by `gate.sh`, `watch_sha.sh` and `record_round.sh`, and prose copies of it drift out of sync
-with the scripts.
-
-Named `assay` rather than `temper` because `components/skills/temper` is already a published
-convergence-loop skill, and a second thing called temper that insists it is not a loop is the
-collision worth avoiding.
+The failure modes encoded here were learned the expensive way by other people's loops, notably
+`codimango/ripen`, whose incident log is the source of several rules above. No code is shared and
+nothing here depends on it. Bugs are ours.
