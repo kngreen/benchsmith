@@ -99,6 +99,52 @@ def load_hooks(repo_root: Path | None = None) -> list:
     return list(DEFAULT_HOOKS)
 
 
+# Where task checkouts live. `/data/users/<you>` is the Meta devserver
+# convention and is only a default: someone who keeps repos anywhere else got
+# zero results and a confusing "no checkout holds it", which reads like the task
+# is missing rather than the search path being wrong.
+DEFAULT_REPO_ROOTS: list[str] = []
+
+# Checkout-name prefixes that mark a canonical clone, and the track each serves.
+# A task directory exists in every scratch and base-tree copy that ever touched
+# it, so without these the first alphabetical match wins -- which is how a
+# worker ends up in a throwaway clone.
+DEFAULT_CANONICAL = ("swe-bench-aai-labs", "t-bench-aai-labs", "aai-labs")
+DEFAULT_TRACK_REPOS = {
+    "t-bench": ["t-bench-aai-labs"],
+    "swe-bench": ["swe-bench-aai-labs"],
+}
+
+
+@dataclass
+class Paths:
+    repo_roots: list = field(default_factory=list)
+    canonical: tuple = DEFAULT_CANONICAL
+    track_repos: dict = field(default_factory=lambda: dict(DEFAULT_TRACK_REPOS))
+    source: str = "default"
+
+    def as_dict(self) -> dict:
+        return {"repoRoots": self.repo_roots, "canonical": list(self.canonical),
+                "trackRepos": self.track_repos, "source": self.source}
+
+
+def load_paths(repo_root: Path | None = None) -> Paths:
+    """Where to look for checkouts, and which ones are canonical."""
+    out = Paths()
+    for layer in [_read(USER_CONFIG)] + ([_read(Path(repo_root) / REPO_CONFIG)] if repo_root else []):
+        g = layer.get("paths") or {}
+        if isinstance(g.get("repoRoots"), list) and g["repoRoots"]:
+            out.repo_roots, out.source = [str(x) for x in g["repoRoots"]], "config"
+        if isinstance(g.get("canonical"), list) and g["canonical"]:
+            out.canonical = tuple(str(x) for x in g["canonical"])
+        if isinstance(g.get("trackRepos"), dict) and g["trackRepos"]:
+            out.track_repos = {k: list(v) for k, v in g["trackRepos"].items()}
+    env = os.environ.get("BENCHSMITH_REPO_ROOTS", "")
+    if env:
+        out.repo_roots, out.source = [x for x in env.split(":") if x], "env"
+    return out
+
+
 HOWTO = """No GSD board is configured, so no board cards are queued.
 
 For a personal T-Bench idea board, preview or create the standard layout:

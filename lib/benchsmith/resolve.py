@@ -59,6 +59,12 @@ def _tasks(binary: str = "codimango") -> list[dict]:
 
 # A task directory exists in every scratch, review and base-tree clone that ever
 # touched it. Picking the first match dispatches a worker at a throwaway copy.
+def _canonical() -> tuple:
+    from .config import load_paths
+
+    return load_paths().canonical
+
+
 CANONICAL = ("swe-bench-aai-labs", "t-bench-aai-labs", "aai-labs")
 
 
@@ -67,9 +73,11 @@ def find_repos(task: str, roots: list[str] | None = None) -> list[str]:
     hits = [str(Path(r)) for r in (roots or _default_roots())
             if (Path(r) / task / "task.toml").is_file()]
 
+    markers = _canonical()
+
     def rank(p: str) -> tuple:
         name = Path(p).name
-        for i, marker in enumerate(CANONICAL):
+        for i, marker in enumerate(markers):
             if name.startswith(marker):
                 return (0, i, name)
         return (1, 0, name)
@@ -83,8 +91,47 @@ def find_repo(task: str, roots: list[str] | None = None) -> str | None:
 
 
 def _default_roots() -> list[str]:
-    base = Path("/data/users") / (Path.home().name)
-    return [str(p) for p in sorted(base.glob("*")) if (p / ".git").exists()] if base.is_dir() else []
+    """Every git checkout we can plausibly reach, most specific first.
+
+    Configured roots win. Otherwise: the Meta devserver convention, then a
+    couple of ordinary places, then the parent of wherever benchsmith is being
+    run from -- because a person who cloned their repos side by side is the
+    common case and should not have to configure anything.
+    """
+    from .config import load_paths
+
+    cfg = load_paths()
+    bases = [Path(r) for r in cfg.repo_roots] if cfg.repo_roots else [
+        Path("/data/users") / Path.home().name,
+        Path.home() / "repos",
+        Path.home() / "src",
+        Path.home(),
+        Path.cwd().parent,
+    ]
+    def is_checkout(p: Path) -> bool:
+        # Scanning a home directory walks into things the user cannot stat --
+        # editor servers, other people's mounts. An unreadable directory is not
+        # a checkout, and it is certainly not a reason to crash the resolver.
+        try:
+            return (p / ".git").exists()
+        except OSError:
+            return False
+
+    out, seen = [], set()
+    for base in bases:
+        try:
+            if not base.is_dir():
+                continue
+            # A configured root may itself BE a checkout, not a directory of them.
+            cands = [base] if is_checkout(base) else sorted(base.glob("*"))
+        except OSError:
+            continue
+        for cand in cands:
+            s = str(cand)
+            if s not in seen and is_checkout(cand):
+                out.append(s)
+                seen.add(s)
+    return out
 
 
 def _gsd_card(number: str) -> dict:
@@ -122,7 +169,9 @@ def resolve_gsd(number: str, *, roots: list[str] | None = None) -> dict:
     track = track_of(title) or track_of(str(card.get("description") or ""))
     repo = None
     if track:
-        markers = TRACK_REPOS.get(track, ())
+        from .config import load_paths
+
+        markers = load_paths().track_repos.get(track, TRACK_REPOS.get(track, ()))
         repo = next((r for r in (roots or _default_roots())
                      if any(Path(r).name.startswith(m) for m in markers)), None)
     return {

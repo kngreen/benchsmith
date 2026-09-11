@@ -159,8 +159,11 @@ def bootstrap_block(root: str | None = None) -> str:
         "fresh runtime's clone returns HTTP 403. If you are not on that host, attach it first.\n\n"
         "```bash\n"
         f"{PROXY_PREAMBLE}\n"
-        f"export BENCHSMITH_BIN={root}/bin/benchsmith\n"
-        'test -x "$BENCHSMITH_BIN" || { echo "NOT ON THE HOST"; exit 1; }\n'
+        f'for c in "$BENCHSMITH_BIN" "$HOME/.claude/skills/benchsmith/bin/benchsmith" '
+        f'"$(command -v benchsmith 2>/dev/null)" "{root}/bin/benchsmith"; do\n'
+        '  [ -n "$c" ] && [ -x "$c" ] && export BENCHSMITH_BIN="$c" && break\n'
+        'done\n'
+        '[ -x "$BENCHSMITH_BIN" ] || { echo "NOT ON THE HOST"; exit 1; }\n'
         '"$BENCHSMITH_BIN" preflight --json\n'
         "```\n\n"
         f"If `$BENCHSMITH_BIN` is missing you are not on `{HOST}`. Attach that devserver and retry "

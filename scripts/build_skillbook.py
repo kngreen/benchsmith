@@ -34,24 +34,34 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MAX_ARG = 128 * 1024  # a single argv entry; the whole file-set travels as one
 
+# Discovery, not a literal path. Baking in the publisher's home directory means
+# the skill only works for the person who published it -- everyone else gets a
+# CLI at a path that does not exist on their machine.
 PREAMBLE = """
-> **Binding — do this first.** This skill's commands are a package on the host,
-> not files delivered with this skill. Bind the CLI before anything else:
+> **Binding — do this first.** This skill's commands are a package installed on a
+> host, not files delivered with this skill. Find the CLI before anything else:
 >
 > ```bash
-> export BENCHSMITH_BIN={root}/bin/benchsmith
 > export no_proxy="$no_proxy,.internalmeta.com"
+> for c in "$BENCHSMITH_BIN" "$HOME/.claude/skills/benchsmith/bin/benchsmith" \\
+>          "$HOME/.codex/skills/benchsmith/bin/benchsmith" \\
+>          "$(command -v benchsmith 2>/dev/null)" {hint}; do
+>   [ -n "$c" ] && [ -x "$c" ] && export BENCHSMITH_BIN="$c" && break
+> done
+> [ -x "$BENCHSMITH_BIN" ] || {{ echo "benchsmith is not installed on this host"; exit 1; }}
+> export BENCHSMITH_ROOT="$(cd "$(dirname "$BENCHSMITH_BIN")/.." && pwd)"
 > "$BENCHSMITH_BIN" preflight --json
 > ```
 >
 > Every `benchsmith <cmd>` below means `"$BENCHSMITH_BIN" <cmd>`.
 >
 > **`references/` is not shipped with this skill — read it from disk.** Where the
-> body says `references/<file>.md`, the file is at `{root}/references/<file>.md`.
-> The full checkout, including `lib/`, is at `{root}`.
+> body says `references/<file>.md`, the file is at `$BENCHSMITH_ROOT/references/<file>.md`.
+> The full checkout, including `lib/`, is at `$BENCHSMITH_ROOT`.
 >
-> If that path does not exist you are not on the host benchsmith is installed on:
-> say so and stop, rather than improvising a substitute for the gate.
+> If nothing above resolves, benchsmith is not installed on the host you are on.
+> Say so and stop — do not improvise a substitute for the gate. Install it with:
+> `git clone <your benchsmith remote> ~/.claude/skills/benchsmith`
 
 """
 
@@ -62,7 +72,9 @@ def build() -> list[dict]:
     if end < 0:
         raise SystemExit("SKILL.md has no frontmatter fence")
     head, body = text[: end + 5], text[end + 5:]
-    published = head + PREAMBLE.format(root=ROOT) + body
+    # The publisher's own install is offered LAST, as a hint for colleagues on the
+    # same host, never as the answer.
+    published = head + PREAMBLE.format(hint=f'"{ROOT}/bin/benchsmith"') + body
 
     return [{"path": "SKILL.md", "content": published}]
 

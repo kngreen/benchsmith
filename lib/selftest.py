@@ -2788,5 +2788,76 @@ check("...and to report as it goes", "benchsmith status --repo" in _s3, True)
 check("...and why", "indistinguishable from a hang" in _s3, True)
 
 
+# --- portability: would this work for someone who is not the author? ---------
+
+from benchsmith import config as _cfgp  # noqa: E402
+
+# Repo roots. `/data/users/<you>` is a Meta devserver convention, not a fact.
+_prev_roots = os.environ.pop("BENCHSMITH_REPO_ROOTS", None)
+try:
+    _pp = _cfgp.load_paths()
+    check("roots default to a search path, not one hardcoded directory",
+          _pp.repo_roots, [])
+    check("...and canonical prefixes are overridable", isinstance(_pp.canonical, tuple), True)
+
+    _elsewhere = Path(tempfile.mkdtemp()) / "someone-elses-repos" / "their-tasks"
+    (_elsewhere / ".git").mkdir(parents=True)
+    (_elsewhere / "their-task").mkdir()
+    (_elsewhere / "their-task" / "task.toml").write_text('authors = [{ name = "them" }]\n')
+    os.environ["BENCHSMITH_REPO_ROOTS"] = str(_elsewhere.parent)
+    import importlib as _il2
+    _il2.reload(_cfgp)
+    from benchsmith import resolve as _rv2
+    _il2.reload(_rv2)
+    check("a checkout somewhere else entirely is found",
+          _rv2.find_repos("their-task"), [str(_elsewhere)])
+    check("...and the source is reported as the environment",
+          _cfgp.load_paths().source, "env")
+finally:
+    if _prev_roots is None:
+        os.environ.pop("BENCHSMITH_REPO_ROOTS", None)
+    else:
+        os.environ["BENCHSMITH_REPO_ROOTS"] = _prev_roots
+    import importlib as _il3
+    _il3.reload(_cfgp)
+    from benchsmith import resolve as _rv3
+    _il3.reload(_rv3)
+
+# Scanning a home directory walks into things the caller cannot stat. An
+# unreadable directory is not a checkout and is not a reason to crash.
+_unread = Path(tempfile.mkdtemp())
+(_unread / "locked").mkdir()
+try:
+    (_unread / "locked").chmod(0o000)
+    os.environ["BENCHSMITH_REPO_ROOTS"] = str(_unread)
+    _il4 = __import__("importlib"); _il4.reload(_cfgp)
+    from benchsmith import resolve as _rv4
+    _il4.reload(_rv4)
+    _rv4._default_roots()
+    check("an unreadable directory does not crash discovery", True, True)
+except PermissionError:
+    check("an unreadable directory does not crash discovery", "crashed", "handled")
+finally:
+    (_unread / "locked").chmod(0o755)
+    os.environ.pop("BENCHSMITH_REPO_ROOTS", None)
+
+# The published skill must not name the publisher's home directory: everyone
+# else gets a CLI at a path that does not exist on their machine.
+import subprocess as _sp2  # noqa: E402
+_built = Path(tempfile.mkdtemp()) / "files.json"
+_sp2.run([sys.executable,
+          "/home/kngreen/.claude/skills/benchsmith/scripts/build_skillbook.py", str(_built)],
+         capture_output=True)
+_pub = json.loads(_built.read_text())[0]["content"]
+_bind = _pub[_pub.index("Binding"):_pub.index("Binding") + 1400]
+check("the published skill discovers the CLI", "command -v benchsmith" in _bind, True)
+check("...and tries the reader's own HOME first",
+      _bind.index("$HOME/.claude/skills") < _bind.index("/home/kngreen"), True)
+check("...and says what to do when nothing resolves",
+      "not installed on the host" in _bind, True)
+check("references are addressed relatively",
+      "$BENCHSMITH_ROOT/references/" in _pub, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

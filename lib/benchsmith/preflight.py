@@ -179,6 +179,35 @@ def run(repo_root: Path | None = None, task: str | None = None) -> dict:
         rows.append({"kind": "config", "name": "GSD board", "state": "MISSING", "path": None,
                      "usedFor": "§12 queue tiers 50-70", "degradesTo": f"could not read: {e}"})
 
+    # A newcomer's first failure is silent: `resolve` finds no checkout, reports
+    # "no checkout on this host holds it", and that reads like the task is
+    # missing rather than the search path being wrong.
+    try:
+        from .config import load_paths
+        from .resolve import _default_roots
+
+        paths = load_paths(Path(repo_root) if repo_root else None)
+        roots = _default_roots()
+        rows.append(
+            {
+                "kind": "config",
+                "name": "task checkouts discoverable",
+                "state": "present" if roots else "MISSING",
+                "path": f"{len(roots)} checkout(s) via {paths.source}",
+                "usedFor": "resolving a task name to the repository that holds it",
+                "degradesTo": None if roots else
+                "no git checkouts found. Set BENCHSMITH_REPO_ROOTS=/path/to/repos, or add "
+                '{"paths": {"repoRoots": ["..."]}} to ~/.config/benchsmith/config.json',
+            }
+        )
+        if not roots:
+            degraded.append("no-repo-roots")
+    except Exception as e:  # noqa: BLE001 - preflight must never crash the round
+        rows.append({"kind": "config", "name": "task checkouts discoverable", "state": "MISSING",
+                     "path": None, "usedFor": "resolving a task to its repository",
+                     "degradesTo": f"could not scan: {e}"})
+        degraded.append("no-repo-roots")
+
     if repo_root and task:
         legacy = Path(repo_root) / ".ripen" / f"{task}.json"
         current = Path(repo_root) / ".benchsmith" / f"{task}.json"

@@ -346,7 +346,7 @@ def cmd_fleet(args) -> int:
                         f"{args.workers} workers were asked for; the GSD board is the next source "
                         "and it is not configured"),
                 "ask": ("Which GSD board holds your task cards? Paste the URL or the project id — "
-                        "e.g. https://www.internalfb.com/tasks/project/1722838652333221/list"),
+                        "it is the number in https://www.internalfb.com/tasks/project/<ID>/list"),
                 "thenRun": "benchsmith fleet --gsd-project <id> --workers "
                            f"{args.workers} --apply",
             }

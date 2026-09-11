@@ -17,6 +17,42 @@ journal at `.benchsmith/<task>.json` is written only by `benchsmith record` — 
 hand-written journal produces none of the fields the loop reads back, and stall detection, the
 budget, regression comparison and excursion detection all go blind at once.
 
+## Setting up on a new machine
+
+benchsmith assumes almost nothing about where it lives, but it does assume a few things about the
+environment. `benchsmith preflight --json` names each one and what degrades without it.
+
+| Assumption | If it does not hold |
+|---|---|
+| `codimango` CLI installed and authenticated | every platform read fails; nothing is measurable |
+| `meta` CLI available | no GSD board, no AgentCloud dispatch; local work still runs |
+| Task checkouts findable | `resolve` reports "no checkout holds it", which reads like a missing task |
+| A GSD board configured | board tiers are empty; Codimango tiers still work |
+| `no_proxy` covers `.internalmeta.com` | reads fail with a connection error that looks like an outage |
+
+**Checkout discovery** searches `/data/users/<you>`, `~/repos`, `~/src`, `~`, and the parent of the
+current directory. If your repositories live somewhere else, say so once:
+
+```bash
+export BENCHSMITH_REPO_ROOTS=/path/to/repos:/another/path
+```
+
+or in `~/.config/benchsmith/config.json`:
+
+```json
+{"paths": {"repoRoots": ["/path/to/repos"],
+           "canonical": ["swe-bench-aai-labs", "t-bench-aai-labs"],
+           "trackRepos": {"t-bench": ["t-bench-aai-labs"]}}}
+```
+
+`canonical` is what marks a real checkout apart from a scratch copy — a task directory exists in
+every clone that ever touched it, and without this the first alphabetical match wins. `trackRepos`
+is where a scaffolded idea goes, per track.
+
+The **hook defaults** (`references/hooks.md`) mirror the AAI Labs Ollo repos: prettier and eslint
+over `web/src`. On a repository without that layout they simply never match, which costs nothing —
+but they are yours to replace under `hooks` in the same config file.
+
 ## On invocation — run it, do not describe it
 
 **You execute. The user does not.** They invoked a skill, not a manual. Never print a command for
