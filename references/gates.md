@@ -133,7 +133,7 @@ the track requires, and treat a missing row as a missing pass:
 
 | field | meaning |
 |---|---|
-| `review` | canonical name — `tbr`, `agentic-full-task`, the track's `review-task-*`, `codimango-review-critic`, `aai-code-review` where required |
+| `review` | canonical name — `tbr`, `agentic-full-task`, `quality`, `review-critic`, plus the track's `review-task-*` and `aai-code-review` where required |
 | `jobId` | the job the verdict came from |
 | `reviewedSha` | the SHA the review actually ran on |
 | `matchesActive` | `reviewedSha == ACTIVE_SHA` |
@@ -141,6 +141,11 @@ the track requires, and treat a missing row as a missing pass:
 | `state` | `completed` / `pending` / `errored` / `absent` |
 | `selection` | `exact-head` or `fallback` — a fallback report is not a pass |
 | `stale` | true when the head moved after the review ran |
+
+`review-critic` is operator-supplied, not parsed: `codimango-review-critic` runs in a separate
+session (§10a) and its Accept / Request changes / Reject decision is recorded into the manifest
+by hand. Every other row comes from a payload. That asymmetry is deliberate — the critic audits
+the canonical reviewer, so it cannot be sourced from the same place the canonical reviewer is.
 
 The gate passes only when every required row is `state: completed`, `matchesActive: true`,
 `selection: exact-head`, `stale: false`, and a passing `verdict`. Any other combination is the

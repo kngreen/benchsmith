@@ -103,6 +103,7 @@ do not restate their contents here.
 | Screening an idea before you build it | `task-hardness-screen` — §3 |
 | Per-step calibration on a multi-turn task | `mt-calibrate` — §5 |
 | Is a non-pass genuine, or a grader false negative? | `task-fairness-signal` — §7 |
+| Second-pass review before any terminal claim | `codimango-review-critic` — §10a |
 | Contamination, recall and portfolio dedup on an idea | `swebench-idea-triage`, or the track's own check |
 | Round classes and the stale-gate list | `references/classes.md` |
 
@@ -300,6 +301,9 @@ not converged until they hold on the exact final SHA:
 - [ ] `[metadata].tags` carries `benchsmith-v1`, `aai-labs`, the `aai-labs-<project>` team tag,
       `semi-synthetic` and `private_repos_1p` (§4), and declared `difficulty` matches the
       measured classification. Only `aai-labs` is gate-enforced — check the rest by eye.
+- [ ] **`codimango-review-critic` returns Accept** on this exact SHA, dispatched to a fresh
+      session per §10a. It is the only required review the platform does not generate, so it is
+      never green by default — an absent critic row is an absent verdict, not a pass.
 - [ ] **Every validity gate in `references/gates.md` passes on this exact commit** — head equals
       validation commit, TBR `GOOD`/`Accept`, Agentic Full-Task Review `GOOD` at 17/17 across
       R01–R13 and N01–N04, contamination LOW, no unresolved current-commit failure. Those gates
@@ -612,6 +616,54 @@ and why; and the terminal state by name.
 
 If not GREEN, add the before/after calibration, why the loop stopped, and the strongest
 remaining lever with its evidence.
+
+---
+
+## 10a. The review critic — dispatched, never inlined
+
+`codimango-review-critic` is a required review (§5), and it is the only one the platform does
+not produce. It reviews the task, then **audits the canonical reviewer's own findings** — which
+is how it catches what the rubric-driven reviewers miss.
+
+**It cannot run inside this session.** Its hard rules require a brand-new agent session created
+for exactly one task, with no prior task's transcript, findings, paths or artifacts in context —
+and by the time benchsmith reaches a terminal check it has *authored* the task it would be
+reviewing. Running it inline is a context-isolation failure by its own definition, and the
+verdict it produces would be worthless in a way nothing downstream could detect.
+
+So dispatch it: a fresh session or a same-task subagent, given only the task identifier and the
+exact SHA. It runs `aai-review-flow` (or the track fallback) first and audits that, so do not
+pre-supply your own findings — feeding it your conclusions is what it exists to check.
+
+**It writes nothing.** Read-only on the task repository: no commits, no pushes, no reruns, no
+author contact. Its output is a decision plus an evidence report; benchsmith is what acts on it.
+
+| Its decision | What benchsmith does |
+|---|---|
+| **Accept** | the `review-critic` row goes green; §11 may proceed |
+| **Request changes** | blocking. Enter the *repair review findings* flow (§0) — the findings are the round's evidence, not the balance row |
+| **Reject** | the premise is wrong. §10 `abandoned` → REJECTED — NOT HARD |
+
+### What it sees that the bar cannot
+
+Its "go past the review" pass asks questions §5 has no way to answer, and several are direct
+gaps in this skill:
+
+- **Could the verifier accept a shortcut, no-op, hardcoded answer or stale generated output?**
+  §6 checks files at rest; this checks whether the reward is *earnable* without the work.
+- **Are failures genuine capability gaps rather than setup, parser, timeout or harness
+  failures?** That is exactly the `Kind.F`-vs-`Kind.A` distinction benchsmith cannot make from
+  platform fields alone.
+- **Was there a baseline, or only the current state?** It names them — `no_solution`,
+  `shortcut`, `model_floor`, `prior_revision`, `hot_vs_cold`, `with_vs_without_skill` — and if a
+  required baseline is absent it says what cannot be concluded rather than concluding it.
+- **Is a serious integrity defect ranked below cosmetics?** Severity ordering, which no numeric
+  gate can see.
+- **Did it read trajectories, or infer from summaries and pass rates?** The failure mode §11
+  exists to prevent, applied to the reviewer instead of to us.
+
+Treat a `no_solution` or `shortcut` baseline it reports as **missing** the same way §5 treats an
+unmeasured cohort: not a pass, not a failure, an absent verdict.
 
 ---
 

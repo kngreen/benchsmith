@@ -444,12 +444,16 @@ def infra_fraction(rows: list[Row]) -> dict:
 
 # --- reviews ----------------------------------------------------------------
 
-REQUIRED_REVIEWS = ("tbr", "agentic-full-task", "quality")
+REQUIRED_REVIEWS = ("tbr", "agentic-full-task", "quality", "review-critic")
 
 REVIEW_PASSING = {
     "tbr": frozenset({"pass"}),
     "agentic-full-task": frozenset({"GOOD"}),
     "quality": frozenset({"GOOD", "Accept"}),
+    # codimango-review-critic returns exactly one of Accept / Request changes /
+    # Reject. It is the only required review the platform does not produce, so
+    # its row is supplied by the operator rather than parsed from a payload.
+    "review-critic": frozenset({"Accept"}),
 }
 
 
