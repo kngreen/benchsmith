@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from . import gate as gate_mod
+from . import preflight as preflight_mod
 from .adapter import Identity, Platform, Unresolved, discover
 from .bar import evaluate
 from .journal import Journal, git_trailers, surface_hashes
@@ -32,6 +33,16 @@ def _identity(args) -> Identity:
         source_repo=args.source_repo or os.environ.get("BENCHSMITH_SOURCE_REPO", ""),
         active_sha=args.sha or os.environ.get("BENCHSMITH_ACTIVE_SHA", ""),
     )
+
+
+def cmd_preflight(args) -> int:
+    """What is missing, and what degrades because of it."""
+    result = preflight_mod.run(Path(args.repo).resolve() if args.repo else None, args.task or None)
+    if args.json:
+        _out(result)
+    else:
+        print(preflight_mod.render(result))
+    return 0 if result["ok"] else 1
 
 
 def cmd_probe(args) -> int:
@@ -157,6 +168,12 @@ def main(argv: list[str] | None = None) -> int:
         if task:
             sp.add_argument("--task", required=True, help="task directory name")
         return sp
+
+    s = sub.add_parser("preflight", help="check composed skills, CLI and env before a round")
+    s.add_argument("--repo", default="")
+    s.add_argument("--task", default="")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_preflight)
 
     s = sub.add_parser("probe", help="resolve the platform CLI surface")
     s.set_defaults(fn=cmd_probe)

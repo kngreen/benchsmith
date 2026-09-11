@@ -62,9 +62,17 @@ read every signal for the last pushed commit      STEP 1    benchsmith read | be
 ### STEP 0 — bind, once
 
 ```bash
+benchsmith preflight --repo . --task <name>   # what is missing, and what degrades
 benchsmith probe                      # resolve the CLI surface; never hardcode a subcommand
 benchsmith install-hooks --repo .     # pre-push gate, into the hooks dir the repo already uses
 ```
+
+**Run preflight first, every session.** Composed skills that are absent must fail loudly: a
+field run spent nine rounds improvising the mechanics by hand because nothing said they were
+missing. Preflight names each dependency, what it is used for, and exactly what degrades
+without it — a missing `task-fairness-signal` means attribution is unverified and the bar caps
+at MEDIUM; a missing `codimango-review-critic` means no terminal GREEN is available at all. It
+also catches the `no_proxy` trap that makes every platform read fail as `Connection refused`.
 
 Record `TASK_ID`, `TASK_UUID`, `SOURCE_REPO`, `ACTIVE_SHA` and `BENCHSMITH_TARGET` (§1). An
 unresolved capability is **declared and degraded, never substituted with a command you have not
@@ -358,6 +366,18 @@ Otherwise prove and record the simple case: no candidate-controlled execution po
 every verifier, runner, parser and dependency sits outside candidate-writable storage and is
 invoked by pinned absolute path. Full-closure procedure: `references/gates.md`.
 
+### Gold-passes-and-base-fails is not enough
+
+Necessary, and badly insufficient. A grader written against the reference satisfies it
+perfectly — all seven defects on one field task did. It cannot detect the defect because it
+only ever asks the reference.
+
+**Per grader change, verify against a divergent implementation.** One positive fixture that
+implements the same behaviour differently: renamed fields, restructured return type, reordered
+work. Two minutes to write, and in the field each one paid for itself on the round it was
+added. `benchsmith gate` looks for `solution/variant*`, `solution/divergent*`,
+`tests/variants/*` or `.benchsmith/variants/*` and reports `not_run` when there is none.
+
 ### Over-constrained implementation freedom
 
 The recurring authoring defect, and the hardest to see from inside: a grader that
@@ -375,6 +395,17 @@ Before every graded-surface push, check the grader cannot reject on:
 - **numeric margin or tolerance** the spec does not state.
 - **error shape** — exact message, type or wrapping, where the spec asks only that
   it fail.
+
+**The cheapest detector is one grep**: does the graded test file call any production symbol
+other than the stable entry point? A healthy gold file converges on one — a real one ended up
+calling `runReconcileOneShot` nine times and nothing else. Every additional symbol is another
+way for a correct-but-different implementation to fail. Declare yours in
+`.benchsmith/entrypoints` and `benchsmith gate` enforces it; without that file it reports what
+it found and does not block, since it cannot guess which symbol you meant.
+
+**Never pin shared toolchain.** A verifier-unforgeability control that refuses a trial for
+running `go install` — documented in the repo's own Makefile — is itself a grader defect. Pin
+only artifacts the task installs.
 
 The tell is in the trials, not the tree: **a trial rejected before the grader ran is
 `Kind.D`, not a failure.** It invalidates the measurement rather than counting as
@@ -411,7 +442,12 @@ Read `benchsmith bar` (the `infra` block) **first**, before any difficulty readi
 denominator and drag the rate down, which reads as a harder task. Exit 2 is a third answer, not
 a quieter 1.
 
-**"0/5" tells you nothing about why.** A `0/5` with `Passed: N-1` is a broken case. A large gap
+**"0/5" tells you nothing about why.** A `0/5` with `Passed: N-1` is a broken case. And a
+**0-of-N where the preserved-guarantee (P2P) tests also fail is a build failure, not
+behaviour** — those pass at base by construction, so if they are red the package did not
+compile. Read compile stderr before reading difficulty; three trials once scored as total
+capability failure when the gold file had broken its own compilation by renaming a struct
+field. `classify()` returns `Kind.F` for this shape. A large gap
 between `scored` and `trialsFound` means the parser failed, not the trials. `evidenceComplete:
 null` and `[]` are different answers and must never be classified alike.
 

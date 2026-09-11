@@ -192,6 +192,94 @@ def check_test_ratchet(task_dir: Path, journal: Journal, report: Report) -> None
         report.add("test-ratchet", PASS, f"{prior[-1]} -> {count}")
 
 
+# Test-framework and language noise that is never a production symbol.
+_NOISE = frozenset("""
+if for while switch case return func def class import from package var let const
+t testing assert require expect error err nil None True False true false print
+range len make new append string int float bool map struct interface go defer
+Errorf Fatalf Fatal Error Run Helper Cleanup TempDir Setenv Skip Log Logf
+""".split())
+
+_CALL = __import__("re").compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def check_gold_symbols(task_dir: Path, report: Report) -> None:
+    """Does the graded test reach past its stable entry point?
+
+    The single highest-yield grader defect, by field count: a held-out test that
+    encodes HOW the reference happens to be written rather than WHAT it must do.
+    Seven defects on one task, every one of this shape, and each took a ~40-minute
+    cloud round to find. The detector is one grep.
+
+    A healthy gold file calls the task's stable entry point and nothing else --
+    one real example converged on a single symbol called nine times. Every extra
+    production symbol is a way for a correct-but-different implementation to fail.
+
+    Declare the entry points in `.benchsmith/entrypoints` (one per line). Without
+    that file this reports what it found and does not block, because it cannot
+    know which symbol is the intended one.
+    """
+    tests = Path(task_dir) / "tests"
+    if not tests.is_dir():
+        report.add("gold-symbols", NOT_RUN, "no tests/ directory")
+        return
+    decl = Path(task_dir) / ".benchsmith" / "entrypoints"
+    allowed = (
+        {ln.strip() for ln in decl.read_text().splitlines() if ln.strip() and not ln.startswith("#")}
+        if decl.is_file()
+        else set()
+    )
+    seen: dict[str, int] = {}
+    for f in sorted(tests.rglob("*")):
+        if not f.is_file() or f.suffix not in {".go", ".py", ".ts", ".js", ".java", ".kt", ".swift", ".rs"}:
+            continue
+        for name in _CALL.findall(f.read_text(errors="ignore")):
+            if name in _NOISE or name.startswith(("Test", "test_", "Benchmark", "_")):
+                continue
+            seen[name] = seen.get(name, 0) + 1
+    if not seen:
+        report.add("gold-symbols", NOT_RUN, "no production symbols resolved from tests/")
+        return
+    extra = sorted(s for s in seen if s not in allowed)
+    top = ", ".join(f"{s}x{seen[s]}" for s in sorted(seen, key=lambda k: -seen[k])[:6])
+    if not allowed:
+        report.add(
+            "gold-symbols",
+            NOT_RUN,
+            f"{len(seen)} symbols called ({top}); declare .benchsmith/entrypoints to gate this",
+            blocking=False,
+        )
+    elif extra:
+        report.add(
+            "gold-symbols",
+            FAIL,
+            f"graded tests reach past the declared entry point: {', '.join(extra[:8])}",
+        )
+    else:
+        report.add("gold-symbols", PASS, f"only declared entry points ({top})")
+
+
+def check_divergent_fixture(task_dir: Path, report: Report) -> None:
+    """Gold-passes-and-base-fails is necessary and badly insufficient.
+
+    All seven field defects satisfied it perfectly, because the grader was written
+    against the reference. The cheap disproof is one positive fixture implementing
+    the same behaviour differently -- renamed fields, restructured return type,
+    reordered work. Two minutes to write; each one paid for itself immediately.
+    """
+    for pat in ("solution/variant*", "solution/divergent*", "tests/variants/*", ".benchsmith/variants/*"):
+        if list(Path(task_dir).glob(pat)):
+            report.add("divergent-fixture", PASS, f"found {pat}")
+            return
+    report.add(
+        "divergent-fixture",
+        NOT_RUN,
+        "no divergent positive fixture; gold-pass/base-fail cannot detect a grader "
+        "written against the reference",
+        blocking=False,
+    )
+
+
 def check_journal(journal: Journal, report: Report) -> None:
     """The previous round must be recorded. A round that is not recorded did not happen."""
     if not journal.rounds:
@@ -292,6 +380,8 @@ def run(
     check_tags(task_dir, report)
     check_difficulty(task_dir, measured, report)
     check_config_integrity(task_dir, report)
+    check_gold_symbols(task_dir, report)
+    check_divergent_fixture(task_dir, report)
     check_test_ratchet(task_dir, journal, report)
     check_journal(journal, report)
     check_excursion(journal, report)

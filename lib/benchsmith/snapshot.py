@@ -262,6 +262,18 @@ def classify(trial: dict, *, graded_ok: bool) -> tuple[Kind, str]:
         return (Kind.F, f"infrastructure: {status or reason}"[:120])
     if graded_ok:
         return (Kind.PASS, "every graded assertion passed")
+    # Nothing passed at all, on a suite that includes preserved-guarantee tests
+    # which pass at base by construction. If those are failing the package did not
+    # build -- three trials once read as total capability failure when the gold
+    # file had simply broken its own compilation.
+    ctrf_sum = ((trial.get("ctrfResults") or {}).get("summary")) or {}
+    if ctrf_sum.get("tests") and ctrf_sum.get("passed") == 0:
+        return (
+            Kind.F,
+            f"0 of {ctrf_sum['tests']} tests passed: preserved-guarantee tests pass at base, "
+            "so a total zero is a build failure, not behaviour — check compile stderr",
+        )
+
     tell = suspect_infra(trial)
     if tell:
         return (Kind.G, f"zero reward but {tell}: attribution unresolved, investigate")
