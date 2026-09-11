@@ -9,11 +9,24 @@ and do not paste text you drafted yourself. Write a brief and let a 1P model aut
 task directory:
 
 ```
+metacode models                      # what actually resolves here
 metacode run --yolo -m meta/muse-spark-1.3-internal "<brief>"
 ```
 
 The message is **positional** — `--prompt` prints help and writes nothing.
-`meta/avocado-code-flex` works the same way.
+
+Approved authors, per the AAI Labs policy of 2026-09-09: Muse Spark 1.3, Avocado, and the three
+OSS models treated as 1P for task authoring — **Kimi K3**, **GLM 5.3-Flash**, **Qwen 3.8 27B**.
+Codex and Anthropic models are not approved for instructions; the earlier allowance for Codex was
+explicitly withdrawn. Check `metacode models` before assuming an ID: policy approval and local
+harness availability are different things, and the OSS three may not be wired in yet.
+
+**The OSS models are for training data only.** Never use them on AAI Labs product-code repos or
+any other Meta codebase. Task artifacts yes; tooling, libraries and skills no.
+
+When you use one, say so in the task's report: provenance and contamination checks still flag
+3P-looking authorship, and reviewers override those warnings only when the author tells them an
+approved model was used.
 
 ### What goes in the brief
 
