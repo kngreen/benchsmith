@@ -16,6 +16,7 @@ import json
 import shlex
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Probed against the live API, not assumed: `--harness` accepts `codex` and
 # `native`; `claude` and `metacode` are rejected by agentcloud\wire\HarnessKind.
@@ -71,6 +72,37 @@ class Plan:
                 "argv": self.argv, "shell": self.shell, "notes": self.notes}
 
 
+def resume_block(repo: str, task: str) -> str:
+    """Tell a fresh worker what the last one already established.
+
+    AgentCloud has no resume action -- create, describe, list and poll are the
+    whole surface, and events are immutable -- so a session cannot be continued
+    programmatically. Durability therefore cannot live in the session. It lives
+    in the journal, which is better: it survives the session being lost
+    entirely, and any worker on any host can pick the task up.
+    """
+    import json as _json
+
+    path = Path(repo).expanduser() / ".benchsmith" / f"{task}.json"
+    try:
+        data = _json.loads(path.read_text())
+    except (OSError, ValueError):
+        return ""
+    rounds = data.get("rounds") or []
+    if not rounds:
+        return ""
+    last = rounds[-1]
+    return (
+        f"This task has {len(rounds)} prior rounds. Mode is "
+        f"{data.get('mode') or 'unset'}; the last round was classified "
+        f"{last.get('class') or last.get('cls') or 'unrecorded'}"
+        + (f" ({data['status']})" if data.get("status") else "")
+        + ".\nRead `.benchsmith/" + task + ".json` before doing anything. Continue that "
+        "history; do not restart the task, and do not re-litigate a round it "
+        "already closed.\n\n"
+    )
+
+
 def bootstrap_block(root: str = "~/.claude/skills/benchsmith") -> str:
     """Put benchsmith on the worker's disk.
 
@@ -95,10 +127,11 @@ def bootstrap_block(root: str = "~/.claude/skills/benchsmith") -> str:
 
 
 def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "hard-preferred",
-                  bootstrap: bool = False) -> str:
+                  bootstrap: bool = False, resume: bool = True) -> str:
     """The instruction a stage-3 worker gets. Deliberately narrow."""
     return (
         (bootstrap_block() if bootstrap else "")
+        + (resume_block(repo, task) if resume else "")
         +
         f"Use the benchsmith skill on exactly one task: {task}, in {repo}.\n"
         f"Run `benchsmith preflight` first and honour what it says degrades.\n"

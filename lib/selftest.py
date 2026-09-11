@@ -1061,6 +1061,10 @@ with tempfile.TemporaryDirectory() as td:
         (["trailers", "--run-id", "r1", "--workflow", "smoke"], {0}),
         (["install-hooks", "--repo", str(repo)], {0}),
         (["dispatch", "--repo", str(repo), "--task", "mytask"], {0}),
+        (["stats", "--root", str(repo)], {0}),
+        (["backoff", "--repo", str(repo), "--task", "mytask"], {0}),
+        (["mutate", "--repo", str(repo), "--task", "mytask"], {0, 1}),
+        (["passatk", str(payload)], {0, 1}),
     ]
     for argv, ok in invocations:
         try:
@@ -1498,6 +1502,45 @@ check("a swift target is NOT_RUN, not clean",
       mu.probe(_mr, ["nope.swift"], ["true"])["status"], "NOT_RUN")
 check("...and says uncovered",
       "Uncovered, not clean" in mu.probe(_mr, ["nope.swift"], ["true"])["reason"], True)
+
+
+# --- iOS / passAtK track -----------------------------------------------------
+
+from benchsmith import passatk as pk  # noqa: E402
+
+check("pass@1 of 2/4", pk.pass_at_k(4, 2, 1), 0.5)
+check("pass@k is 1.0 when failures cannot fill the sample", pk.pass_at_k(4, 3, 2), 1.0)
+check("pass@k of an all-failing cohort is 0", pk.pass_at_k(4, 0, 2), 0.0)
+# Undefined is None, never 0.0 -- 0.0 would read as "never passes".
+check("k larger than n is undefined", pk.pass_at_k(2, 1, 5), None)
+check("no runs is undefined", pk.pass_at_k(0, 0, 1), None)
+
+_R = pk.Run
+check("a missing oracle blocks", pk.check_oracle([])[0], False)
+check("a failing oracle is a defect, not difficulty",
+      "task defect" in pk.check_oracle([_R("oracle", False)])[1], True)
+check("a passing oracle clears", pk.check_oracle([_R("oracle", True)])[0], True)
+
+_runs = [_R("oracle", True), _R("claude-code", False), _R("claude-code", True),
+         _R("metacode", False), _R("metacode", False)]
+_m = pk.measure(_runs, "b1")
+check("the oracle is not pooled as a participant", len(_m["rows"]), 4)
+check("cohorts map onto the shared family names",
+      {r.slot.family for r in _m["rows"]}, {"opus", "avocado"})
+# A local run says pass or fail and nothing about why; calling a failure "A"
+# would invent semantic evidence we never observed.
+check("a local failure is G, not hardness evidence",
+      {r.kind for r in _m["rows"] if r.kind is not Kind.PASS}, {Kind.G})
+check("two cohorts present clears the roster check", _m["ok"], True)
+
+check("one cohort blocks",
+      any("two" in b for b in pk.measure([_R("oracle", True), _R("metacode", False)], "b")["blocking"]),
+      True)
+_sat = pk.measure([_R("oracle", True), _R("claude-code", False), _R("metacode", True)], "b")
+check("a saturated model under test blocks",
+      any("saturated" in b for b in _sat["blocking"]), True)
+check("an unknown agent is excluded, not pooled",
+      any("unknown agent" in n for n in pk.measure([_R("gpt-9", True)], "b")["notes"]), True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

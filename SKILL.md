@@ -876,6 +876,18 @@ queue drains, which is the failure this design exists to prevent.
 `state=ready_to_publish` **requires a `commit_sha`**. It is the single claim the supervisor acts
 on, so it is the one claim that may not be taken on trust.
 
+### Resuming
+
+**AgentCloud sessions cannot be resumed programmatically.** `create`, `describe`, `list` and `poll`
+are the whole surface and journal events are immutable, so there is no way to send work into a
+session that already exists. Durability therefore does not live in the session — it lives in the
+journal, which is strictly better: it survives the session being lost entirely, and any worker on
+any host can pick the task up.
+
+A dispatch against a task with prior rounds prepends a resume block naming the round count, the
+mode and the last classification, and tells the worker to read `.benchsmith/<task>.json` before
+doing anything. A fresh worker continues the history; it does not restart the task.
+
 ### Publishing
 
 **Workers do not push.** They prepare a commit, run `benchsmith gate`, and stop. Publishing runs

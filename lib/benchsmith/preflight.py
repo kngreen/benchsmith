@@ -125,6 +125,25 @@ def run(repo_root: Path | None = None, task: str | None = None) -> dict:
         )
         if not vs["ok"]:
             degraded.append("cli-surface-drift")
+        # The legacy CLI still works and still answers, so nothing fails today.
+        # It is also the surface every offline fixture is pinned to, which means
+        # the day it goes away the whole read path breaks at once with no
+        # warning. Say so while there is still time to migrate.
+        if vs.get("matched") == "legacy":
+            rows.append(
+                {
+                    "kind": "cli",
+                    "name": "codimango CLI is the deprecated build",
+                    "state": "degraded",
+                    "path": "legacy",
+                    "usedFor": "every platform read, and every offline fixture",
+                    "degradesTo": ("the legacy CLI is announced as deprecated; the fixtures are "
+                                   "pinned to it and will break when it is withdrawn. Migrate: "
+                                   "`devfeature install codimango --persist`, then re-run "
+                                   "`benchsmith probe` and check the fixtures still match"),
+                }
+            )
+            degraded.append("codimango-cli-deprecated")
     except Exception as e:  # noqa: BLE001 - preflight must never crash the round
         rows.append(
             {

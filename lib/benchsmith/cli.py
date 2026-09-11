@@ -10,13 +10,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
 from . import gate as gate_mod
 from . import preflight as preflight_mod
+from . import backoff as backoff_mod
 from . import coverage
 from . import dispatch as dispatch_mod
+from . import mutate as mutate_mod
+from . import passatk as passatk_mod
+from . import stats as stats_mod
 from .queue import Leases, build_queue, read_journals
 from .adapter import Identity, Platform, Unresolved, discover
 from .bar import evaluate
@@ -223,6 +228,40 @@ def cmd_dispatch(args) -> int:
     return 0
 
 
+def cmd_mutate(args) -> int:
+    """Would the suite catch a near-miss? Survivors are grader holes."""
+    task_dir = Path(args.repo) / args.task
+    res = mutate_mod.probe(task_dir, args.target or [], shlex.split(args.test_cmd or ""))
+    _out(res)
+    # NOT_RUN is not a pass. It exits non-zero so a caller cannot read an
+    # unrun probe as a clean one.
+    return 0 if res["status"] == "PASS" else 1
+
+
+def cmd_stats(args) -> int:
+    _out(stats_mod.collect(Path(args.root)))
+    return 0
+
+
+def cmd_backoff(args) -> int:
+    """How long to wait before reading the platform again."""
+    j = Journal.open(Path(args.repo), args.task)
+    _out(backoff_mod.advise(j.data.get("rounds") or []).as_dict())
+    return 0
+
+
+def cmd_passatk(args) -> int:
+    """Difficulty for the local iOS / macOS-VM track."""
+    raw = _load(args)
+    runs = [passatk_mod.Run(**r) for r in (raw.get("runs") or [])]
+    res = passatk_mod.measure(runs, raw.get("build") or "local", k=args.k)
+    res["rows"] = [
+        {"slot": str(r.slot), "kind": r.kind.value, "note": r.note} for r in res["rows"]
+    ]
+    _out(res)
+    return 0 if res["ok"] else 1
+
+
 def cmd_hash(args) -> int:
     _out(surface_hashes(Path(args.repo) / args.task))
     return 0
@@ -323,6 +362,23 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"))
     s.add_argument("--apply", action="store_true", help="actually start the worker")
     s.set_defaults(fn=cmd_dispatch)
+
+    s = common(sub.add_parser("mutate", help="probe whether the suite catches near-misses"))
+    s.add_argument("--target", action="append", help="file to mutate; repeatable")
+    s.add_argument("--test-cmd", default="", help="command that runs the suite")
+    s.set_defaults(fn=cmd_mutate)
+
+    s = sub.add_parser("stats", help="what this loop has actually done")
+    s.add_argument("--root", default=".")
+    s.set_defaults(fn=cmd_stats)
+
+    s = common(sub.add_parser("backoff", help="how long to wait after a platform round"))
+    s.set_defaults(fn=cmd_backoff)
+
+    s = sub.add_parser("passatk", help="difficulty for the local iOS / macOS-VM track")
+    s.add_argument("input", nargs="?", default="-")
+    s.add_argument("--k", type=int, default=1)
+    s.set_defaults(fn=cmd_passatk)
 
     s = common(sub.add_parser("hash", help="graded and visible surface hashes"))
     s.set_defaults(fn=cmd_hash)
