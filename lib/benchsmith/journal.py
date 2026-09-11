@@ -45,7 +45,11 @@ CLASSES = (
 # budget units on measurements that never happened.
 UNMEASURED = {"infra", "not-measured", "platform-stale"}
 
-STATUSES = ("running", "converged", "escalated", "abandoned", "blocked-on-platform", "blocked")
+STATUSES = ("running", "converged", "escalated", "abandoned", "blocked-on-platform", "blocked",
+            # Submitted, and now the reviewer's. Not converged -- nothing has
+            # been accepted yet -- and not blocked, because nothing is wrong.
+            # It is a hand-off, and the loop's part is over until they answer.
+            "awaiting-review")
 
 DEFAULT_BUDGET = 5
 

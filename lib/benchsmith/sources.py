@@ -122,6 +122,9 @@ def normalise_codimango(rows: list[dict], *, require_owner: bool = True) -> tupl
                          "not queued for work")
             continue
         if status in NOT_OUR_WORK:
+            # Named, not silent: "my task vanished from the queue" is a worse
+            # experience than one line saying a reviewer has it.
+            notes.append(f"{r.get('name') or r.get('id')}: {NOT_OUR_WORK[status]}; not queued")
             continue
         if status not in ("draft", "needs_revision"):
             notes.append(f"{r.get('name') or r.get('id')}: unrecognised status {status!r}; "

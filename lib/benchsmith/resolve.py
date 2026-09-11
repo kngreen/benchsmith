@@ -19,6 +19,16 @@ import subprocess
 from pathlib import Path
 
 # https://codimango.internalmeta.com/submissions/210976?jobId=...&trialId=...
+# Statuses where the task is submitted and a reviewer owns it. Iterating now
+# changes the thing they are looking at, and their feedback arrives against a
+# revision that no longer exists.
+AWAITING_REVIEW = {
+    "needs_reviewers_assigned": "submitted; waiting for a reviewer to be assigned",
+    "being_reviewed": "a reviewer has it now",
+    "accepted": "accepted",
+    "used_in_training": "accepted and already in training",
+}
+
 URL_ID = re.compile(r"/submissions/(\d+)")
 BARE_ID = re.compile(r"^\d+$")
 # A GSD card. It is an IDEA, not a task: it has no slug, no directory and no
@@ -264,7 +274,10 @@ def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = No
         "owned": owned is not False,
         "owner": str(hit.get("importedBy") or ""),
         "reviewer": bool(hit.get("currentUserIsReviewer")),
-        "mode": "repair" if str(hit.get("status")) == "needs_revision" else "harden",
+        "mode": ("wait" if str(hit.get("status")) in AWAITING_REVIEW
+                 else "repair" if str(hit.get("status")) == "needs_revision" else "harden"),
+        "awaitingReview": str(hit.get("status")) in AWAITING_REVIEW,
+        "awaitingReason": AWAITING_REVIEW.get(str(hit.get("status")), ""),
         "registered": True,
         "kind": "task",
     }

@@ -536,6 +536,8 @@ with tempfile.TemporaryDirectory() as td:
     rep = gate_mod.run(repo_root=repo, task_dir=task_dir, task_name="mytask")
     check("gate passes on a sound tree", rep.ok, True)
     check("NOT_RUN reported, not hidden", "oracle" in rep.as_dict()["notRun"], True)
+    config_state = next(c.state for c in rep.checks if c.name == "config-integrity")
+    check("missing SWE config is inapplicable on other tracks", config_state, "PASS")
 
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "j"], check=True, capture_output=True)
@@ -1381,6 +1383,7 @@ _lgit("init", "-q", "-b", "main")
 _lgit("config", "user.email", "t@t"); _lgit("config", "user.name", "t")
 (_lr / "mytask" / "instruction.md").write_text("spec\n")
 (_lr / "mytask" / "tests" / "t.py").write_text("def test():\n    pass\n")
+(_lr / "mytask" / "task.toml").write_text("[task]\n")
 _lgit("add", "-A"); _lgit("commit", "-qm", "base")
 
 # Two levers in one hardening round: the next band move is unattributable.
@@ -1410,6 +1413,25 @@ _lgit("add", "mytask/Dockerfile")
 _r4 = gate_mod.Report(); check_single_lever(_lr, "mytask", "harden", _r4)
 check("a corrective-only change moves no lever",
       {c.name: c for c in _r4.checks}["single-lever"].state, "PASS")
+
+_fresh = Path(tempfile.mkdtemp()) / "fresh"
+(_fresh / "newtask" / "tests").mkdir(parents=True)
+_lgit_fresh = lambda *a: subprocess.run(
+    ["git", "-C", str(_fresh), *a], capture_output=True, text=True)
+_lgit_fresh("init", "-q", "-b", "main")
+_lgit_fresh("config", "user.email", "t@t")
+_lgit_fresh("config", "user.name", "t")
+(_fresh / "README.md").write_text("base\n")
+_lgit_fresh("add", "README.md")
+_lgit_fresh("commit", "-qm", "base")
+(_fresh / "newtask" / "task.toml").write_text("[task]\n")
+(_fresh / "newtask" / "instruction.md").write_text("spec\n")
+(_fresh / "newtask" / "tests" / "test_new.py").write_text("def test_new():\n    assert True\n")
+_lgit_fresh("add", "newtask")
+_fresh_report = gate_mod.Report()
+check_single_lever(_fresh, "newtask", "harden", _fresh_report)
+check("initial scaffold may establish all task surfaces",
+      {c.name: c for c in _fresh_report.checks}["single-lever"].state, "PASS")
 
 
 # --- infra backoff -----------------------------------------------------------
@@ -1588,8 +1610,12 @@ _keep, _notes = src.normalise_codimango(_rows)
 check("only actionable statuses are queued", sorted(r["name"] for r in _keep), ["a", "b"])
 # Only the unrecognised status earns a note; the known-terminal ones are
 # dropped quietly because nothing about them needs a decision.
-check("only unrecognised statuses produce notes",
-      sorted(n.split(":")[0] for n in _notes), ["g"])
+# Every non-actionable row now says why. "My task vanished from the queue" is a
+# worse experience than one line saying a reviewer has it.
+check("every dropped row is accounted for",
+      sorted(n.split(":")[0] for n in _notes), ["c", "d", "e", "f", "g"])
+check("...naming the reviewer hold", any("a reviewer holds it" in n for n in _notes), True)
+check("...and the unrecognised status", any("brand_new_status" in n for n in _notes), True)
 # A status we have never seen must surface, not vanish: silently dropping it is
 # how a whole class of work disappears from the backlog.
 check("an unrecognised status is reported", any("brand_new_status" in n for n in _notes), True)
@@ -2075,6 +2101,13 @@ _TF.write_text("def test_one():\n    assert 1 == 1\n    assert 2 == 2\n\n"
 _dgit("add", "-A")
 check("adding a test passes", dc.run(_dr)["diff-ratchet"]["state"], "PASS")
 _dgit("reset", "-q", "--hard")
+
+_NEW_TF = _dr / "mytask" / "tests" / "test_new.py"
+_NEW_TF.write_text("def test_new():\n    assert True\n")
+_dgit("add", "-A")
+check("a new graded file establishes a ratchet baseline",
+      dc.run(_dr)["diff-ratchet"]["state"], "PASS")
+_dgit("reset", "-q", "--hard"); _dgit("clean", "-qfd")
 
 check("the diff checks are push-required",
       {"diff-ratchet", "diff-weakening"} <= set(gate_mod.PUSH_REQUIRED), True)
@@ -2857,6 +2890,75 @@ check("...and says what to do when nothing resolves",
       "not installed on the host" in _bind, True)
 check("references are addressed relatively",
       "$BENCHSMITH_ROOT/references/" in _pub, True)
+
+
+# --- a submitted task belongs to the reviewer --------------------------------
+#
+# Agents kept iterating after submission. Their changes land under the reviewer,
+# whose findings then cite a revision that no longer exists.
+
+from benchsmith.journal import STATUSES as _JSTATUSES  # noqa: E402
+
+check("awaiting-review is a terminal state", "awaiting-review" in _JSTATUSES, True)
+
+for _s in ("needs_reviewers_assigned", "being_reviewed", "accepted", "used_in_training"):
+    check(f"{_s} is a review hold", _s in rv.AWAITING_REVIEW, True)
+# The one status that means the reviewer has ALREADY spoken and it is our move.
+check("needs_revision is not a hold", "needs_revision" in rv.AWAITING_REVIEW, False)
+check("draft is not a hold", "draft" in rv.AWAITING_REVIEW, False)
+
+
+def _rows(status):
+    return [{"name": "t", "id": "1", "status": status, "currentUserIsTaskOwner": True}]
+
+
+_saved2 = rv._tasks
+try:
+    for _s, _mode, _await in (("being_reviewed", "wait", True),
+                              ("needs_revision", "repair", False),
+                              ("draft", "harden", False)):
+        rv._tasks = lambda binary="codimango", _s=_s: _rows(_s)
+        _r = rv.resolve("t")
+        check(f"{_s} resolves to mode={_mode}", _r["mode"], _mode)
+        check(f"{_s} awaitingReview={_await}", _r["awaitingReview"], _await)
+finally:
+    rv._tasks = _saved2
+
+# The push is the moment of harm, so that is where the refusal lives.
+_h2 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
+       "gate_receipt": "r"}
+_saved3 = rv._tasks
+try:
+    rv._tasks = lambda binary="codimango": _rows("being_reviewed")
+    try:
+        pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40))
+        check("publish refuses a task under review", "published", "refused")
+    except pub.PublishRefused as e:
+        check("publish refuses a task under review", "reviewer" in str(e), True)
+        check("...and says the loop resumes on its own",
+              "needs_revision" in str(e) and "resumes" in str(e), True)
+
+    rv._tasks = lambda binary="codimango": _rows("needs_revision")
+    _ok = pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40))
+    check("a needs_revision task still publishes", _ok["applied"], False)
+finally:
+    rv._tasks = _saved3
+
+# Blocking every push whenever the platform is unreachable is worse than the
+# risk it prevents, so an unreadable status is noted rather than fatal.
+_saved4 = rv._tasks
+try:
+    def _boom_tasks(binary="codimango"):
+        raise rv.Unresolved("platform unreachable")
+    rv._tasks = _boom_tasks
+    _n = pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40))
+    check("an unreadable review status does not deadlock the push", _n["applied"], False)
+    check("...but is reported", bool(_n.get("reviewNote")), True)
+finally:
+    rv._tasks = _saved4
+
+check("the guard is switchable for callers that already know",
+      pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40), check_review=False)["applied"], False)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

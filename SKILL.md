@@ -105,6 +105,7 @@ Stop only for these, and say which:
 | `owned: false` | it is someone else's task; name the owner |
 | `repo: null` | no checkout on this host holds it |
 | `kind: idea` with `repo: null` | no checkout for that track; scaffolding into the wrong repo is invisible until validation |
+| `awaitingReview: true` | it is submitted and the reviewer owns it — stop at `awaiting-review` |
 | unresolved | the reference matches nothing on the platform or on disk; quote what you tried |
 | intake says KILL | the screen rejected the idea; that is a successful outcome, report it |
 
@@ -256,6 +257,7 @@ that a round was uninteresting.**
         │
 read every signal that COVERS your commit         STEP 1    benchsmith read | benchsmith bar
         │
+        ├─ submitted? ─────────► stop: awaiting-review
         ├─ terminal? ──────────► stop: §10          STEP 2   §5 + references/gates.md
         │
    classify what is failing                        STEP 3   references/classes.md
@@ -992,6 +994,25 @@ Treat a `no_solution` or `shortcut` baseline it reports as **missing** the same 
 unmeasured cohort: not a pass, not a failure, an absent verdict.
 
 ---
+
+## 10b. Submitted means stop
+
+**A submitted task belongs to its reviewer.** When the platform reports
+`needs_reviewers_assigned`, `being_reviewed`, `accepted` or `used_in_training`, the loop's part is
+over. Record `awaiting-review` and stop.
+
+This is not a failure and not convergence — it is a hand-off. Nothing is wrong, and nothing has
+been accepted yet.
+
+Iterating anyway does concrete harm: the reviewer is reading a revision, and a push moves it under
+them. Their findings then cite a commit that no longer exists, and reconciling that costs more than
+the round saved. `benchsmith publish` refuses on a positive read for exactly this reason. When the
+platform cannot be reached it notes the uncertainty rather than blocking — deadlocking every push
+while offline is worse than the risk it prevents.
+
+**The loop resumes on its own.** If the reviewer asks for changes the status becomes
+`needs_revision`, which is tier 10 — the top of the queue — and `resolve` returns `mode: repair`.
+You do not need to watch for it; the next `benchsmith fleet` picks it up.
 
 ## 11. Before you claim done
 

@@ -128,7 +128,15 @@ def check_ratchet(repo: Path, paths: list[str]) -> tuple[list[Finding], int, lis
             continue
         new, old = blob(repo, "", path), blob(repo, "HEAD", path)
         if old is None:
-            continue  # brand new: no baseline to ratchet against
+            if new is None:
+                continue
+            try:
+                counts(new)
+            except SyntaxError as e:
+                unparsed.append(Finding(path, f"does not parse: {str(e).splitlines()[0]}"))
+                continue
+            examined += 1
+            continue
         if new is None:
             findings.append(Finding(path, "graded test file deleted outright"))
             continue

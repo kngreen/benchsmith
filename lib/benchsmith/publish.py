@@ -146,7 +146,7 @@ class Lane:
 
 def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin",
             branch: str = "main", lane: Lane | None = None, apply: bool = False,
-            git=_git) -> dict:
+            git=_git, check_review: bool = True) -> dict:
     """Verify, claim the lane, record the intent, then push exactly once."""
     repo_root = Path(repo_root)
     lane = lane or Lane(repo_root)
@@ -162,6 +162,27 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
         # without it means the lane's one job -- only gated work reaches the
         # remote -- was never actually done.
         raise PublishRefused("no gate_receipt; an ungated commit may not be published")
+
+    # Pushing to a task under review changes what the reviewer is looking at,
+    # and their findings then cite a revision that no longer exists. Refused on
+    # a positive read; noted, not blocked, when the platform cannot be reached,
+    # because a deadlock on every push while offline is worse than the risk.
+    review_note = ""
+    if check_review:
+        try:
+            from .resolve import Unresolved, resolve as _resolve
+
+            info = _resolve(task)
+            if info.get("awaitingReview"):
+                raise PublishRefused(
+                    f"{task} is {info.get('awaitingReason')}. Pushing now changes what the "
+                    "reviewer is looking at. Wait for their verdict; if they asked for changes "
+                    "the status becomes needs_revision and the loop resumes on its own."
+                )
+        except PublishRefused:
+            raise
+        except Exception as e:  # noqa: BLE001
+            review_note = f"could not confirm review status: {type(e).__name__}"
 
     pend = lane.reconcile(repo_root, git=git)
     if pend["state"] in (LANDED, DIVERGED, UNKNOWN):
@@ -190,6 +211,7 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
                         key=lane.key(task, commit_sha), at=time.time())
         if not apply:
             return {"planned": intent.as_dict(), "applied": False,
+                    "reviewNote": review_note or None,
                     "hint": "re-run with apply=True to actually push"}
 
         # Written before the push, so a crash between here and the next line is

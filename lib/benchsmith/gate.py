@@ -165,7 +165,7 @@ def check_config_integrity(task_dir: Path, report: Report) -> None:
     """
     cfg_path = Path(task_dir) / "tests" / "config.json"
     if not cfg_path.is_file():
-        report.add("config-integrity", NOT_RUN, "no tests/config.json (not applicable to this track)")
+        report.add("config-integrity", PASS, "no tests/config.json; check is not applicable")
         return
     try:
         cfg = json.loads(cfg_path.read_text())
@@ -432,6 +432,14 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
     staged = [p for p in r.stdout.split() if p]
     if not staged:
         report.add("single-lever", NOT_RUN, "nothing staged")
+        return
+    base_task = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"HEAD:{task_name}/task.toml"],
+        capture_output=True,
+        text=True,
+    )
+    if base_task.returncode != 0:
+        report.add("single-lever", PASS, "initial scaffold; no measured round to attribute")
         return
     hit = levers_touched(staged, task_name)
     if len(hit) > 1:
