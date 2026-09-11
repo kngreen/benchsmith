@@ -2227,7 +2227,27 @@ check("no task.toml is NOT_RUN", {c.name: c for c in _rep.checks}["task-author"]
 (_ar / "mytask" / "task.toml").write_text('authors = [{ name = "Kristin Green" }]\n')
 _rep = gate_mod.Report()
 gate_mod.check_task_author(_ar, _ar / "mytask", "mytask", _rep)
-check("our own task passes", {c.name: c for c in _rep.checks}["task-author"].state, "PASS")
+check("our own task passes by display name",
+      {c.name: c for c in _rep.checks}["task-author"].state, "PASS")
+
+# Identity has three spellings and they are not interchangeable. task.toml
+# carries a unixname; `git config user.name` carries a display name. Comparing
+# one to the other reported every one of the caller's own tasks as somebody
+# else's and skipped them all as out of scope -- observed on a real repo.
+subprocess.run(["git", "-C", str(_ar), "config", "user.email",
+                "104796296+kngreen@users.noreply.github.com"], capture_output=True)
+(_ar / "mytask" / "task.toml").write_text('authors = [{ name = "kngreen" }]\n')
+_rep = gate_mod.Report()
+gate_mod.check_task_author(_ar, _ar / "mytask", "mytask", _rep)
+check("...and by unixname from a noreply email",
+      {c.name: c for c in _rep.checks}["task-author"].state, "PASS")
+
+subprocess.run(["git", "-C", str(_ar), "config", "user.email", "kngreen@meta.com"],
+               capture_output=True)
+_rep = gate_mod.Report()
+gate_mod.check_task_author(_ar, _ar / "mytask", "mytask", _rep)
+check("...and by unixname from a plain email",
+      {c.name: c for c in _rep.checks}["task-author"].state, "PASS")
 
 # A colleague's task is SKIPPED, never FAILED. Failing it deadlocks the moment
 # you merge their commits: the gate cannot assess a task whose intent you do not

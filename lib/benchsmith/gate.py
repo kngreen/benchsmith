@@ -535,18 +535,33 @@ def check_task_author(repo_root: Path, task_dir: Path, task_name: str, report: R
     if not author:
         report.add("task-author", NOT_RUN, "task.toml declares no author")
         return
-    r = subprocess.run(["git", "-C", str(repo_root), "config", "user.name"],
-                       capture_output=True, text=True)
-    me = r.stdout.strip()
+    # Identity lives in three spellings and they are not interchangeable:
+    # task.toml carries a unixname (`kngreen`), `git config user.name` carries a
+    # display name (`Kristin Green`), and the email carries the unixname again.
+    # Comparing one to another is a category error, not a check -- it reported
+    # every one of the caller's own tasks as somebody else's and skipped them
+    # all as out of scope.
+    def _cfg(key: str) -> str:
+        return subprocess.run(["git", "-C", str(repo_root), "config", key],
+                              capture_output=True, text=True).stdout.strip()
+
+    display = _cfg("user.name")
+    email = _cfg("user.email")
+    unix = email.split("@")[0] if "@" in email else ""
+    # `104796296+kngreen@users.noreply.github.com` and the like.
+    if "+" in unix:
+        unix = unix.split("+", 1)[1]
+    me = {x.lower() for x in (display, unix, os.environ.get("USER", "")) if x}
     if not me:
-        report.add("task-author", NOT_RUN, "git user.name is unset; cannot tell whose task this is")
+        report.add("task-author", NOT_RUN, "no git identity configured; cannot tell whose task this is")
         return
-    if author != me:
+    if author.lower() not in me:
         report.add("task-author", NOT_RUN,
-                   f"{task_name} is authored by {author}, not {me} — out of scope, not gated here",
+                   f"{task_name} is authored by {author}, not {display or unix} "
+                   f"(checked {', '.join(sorted(me))}) — out of scope, not gated here",
                    blocking=False)
         return
-    report.add("task-author", PASS, f"authored by {me}")
+    report.add("task-author", PASS, f"authored by {author}")
 
 
 def check_contamination(repo_root: Path, report: Report) -> None:
