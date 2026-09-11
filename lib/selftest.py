@@ -2165,5 +2165,126 @@ check("an unavailable validator is NOT_RUN, not a pass",
 check("contamination is push-required", "contamination" in gate_mod.PUSH_REQUIRED, True)
 
 
+# --- the hand-written fixture corpus (G2/G5) ---------------------------------
+#
+# Complements mutate.py rather than duplicating it: a generated mutant finds a
+# hole nobody anticipated, a corpus fixture keeps a hole already found from
+# reopening.
+
+from benchsmith import fixtures as fx  # noqa: E402
+
+_fr = Path(tempfile.mkdtemp()) / "fxtask"
+(_fr / "qa" / "negative").mkdir(parents=True)
+(_fr / "qa" / "positive").mkdir(parents=True)
+(_fr / "qa" / "variants").mkdir(parents=True)
+(_fr / "solve.sh").write_text("#!/bin/sh\ngold_fix\n")
+
+check("no fixtures is NOT_RUN, not clean",
+      fx.run_corpus(_fr, runner=lambda td: (0, ["1.0"]))["state"], fx.NOT_RUN)
+check("...and says not run is not passed",
+      "not run is not passed" in fx.run_corpus(_fr, runner=lambda td: (0, ["1.0"]))["detail"], True)
+
+(_fr / "qa" / "negative" / "n1-hardcode.sh").write_text("#!/bin/sh\ncheat\n")
+(_fr / "qa" / "negative" / "n2-tamper-suffix.sh").write_text("tamper\n")
+(_fr / "qa" / "positive" / "p1-alternative.sh").write_text("#!/bin/sh\nset -e\nother_fix\n")
+(_fr / "qa" / "variants" / "v1-style.sh").write_text("#!/bin/sh\nstyle_fix\n")
+
+# Glob, never a hardcoded name list: a fixed list does not merely fail the wrong
+# task, it SKIPS the fixtures the task owns, so the gate goes green having run
+# nothing.
+_neg, _pos = fx.discover(_fr)
+check("negatives are globbed", [f.name for f in _neg],
+      ["n1-hardcode.sh", "n2-tamper-suffix.sh"])
+check("positives span qa/positive and qa/variants", [f.name for f in _pos],
+      ["p1-alternative.sh", "v1-style.sh"])
+check("a suffix fixture is gold-plus-tamper", fx.negative_kind(_neg[1]), fx.SUFFIX)
+check("any other negative is standalone", fx.negative_kind(_neg[0]), fx.STANDALONE)
+
+# MIN across steps: a trial passes only when EVERY step scores 1.0. Got wrong
+# twice before -- once as a mean against a threshold, once as a max.
+check("a negative that scores 1.0 everywhere fails the gate",
+      fx.verdict(["1.0", "1.0"], expect_pass=False)[0], fx.FAIL)
+check("a negative blocked on one step passes",
+      fx.verdict(["1.0", "0.0"], expect_pass=False)[0], fx.PASS)
+check("mean would have passed this cheat; min does not",
+      fx.verdict(["1.0", "1.0", "1.0"], expect_pass=False)[0], fx.FAIL)
+check("max would have passed this positive; min does not",
+      fx.verdict(["1.0", "0.4"], expect_pass=True)[0], fx.FAIL)
+check("a positive scoring 1.0 throughout passes",
+      fx.verdict(["1.0", "1.0"], expect_pass=True)[0], fx.PASS)
+check("no gradable reward is a failure, not a pass",
+      fx.verdict([], expect_pass=False)[0], fx.FAIL)
+check("nulls are not scores", fx.verdict(["null", "null"], expect_pass=False)[0], fx.FAIL)
+
+# A timeout is a THIRD state. Narrating one into "expected 0.0 anyway" is how a
+# reward-hack fixture stops being checked.
+_to = fx.run_corpus(_fr, runner=lambda td: (124, []))
+check("a timed-out fixture is TIMEOUT, not PASS", _to["state"], fx.TIMEOUT)
+check("...and never assumes the expected score",
+      "never assume the expected score" in _to["detail"], True)
+
+# The solve scripts must come back exactly as they were.
+_before = (_fr / "solve.sh").read_text()
+fx.run_corpus(_fr, runner=lambda td: (0, ["0.0"]))
+check("solve.sh is restored after the corpus runs", (_fr / "solve.sh").read_text(), _before)
+check("no backup file is left behind", (_fr / "solve.sh.gate-backup").exists(), False)
+
+# A standalone cheat must replace EVERY step; otherwise a later gold step
+# silently repairs it and the fixture scores 1.0.
+_multi = Path(tempfile.mkdtemp()) / "multi"
+for i in (1, 2):
+    (_multi / "steps" / str(i)).mkdir(parents=True)
+    (_multi / "steps" / str(i) / "solve.sh").write_text(f"#!/bin/sh\ngold{i}\n")
+(_multi / "qa" / "negative").mkdir(parents=True)
+(_multi / "qa" / "negative" / "n1.sh").write_text("cheat\n")
+_seen = []
+
+
+def _capture(td):
+    _seen.append([(s.name, s.read_text()) for s in fx.solve_steps(td)])
+    return 0, ["0.0"]
+
+
+fx.run_corpus(_multi, runner=_capture)
+check("a standalone cheat replaces every step",
+      all("cheat" in text for _, text in _seen[0]), True)
+
+_seen.clear()
+(_multi / "qa" / "negative" / "n1.sh").unlink()
+(_multi / "qa" / "negative" / "n2-suffix.sh").write_text("tamper\n")
+fx.run_corpus(_multi, runner=_capture)
+_texts = [text for _, text in _seen[0]]
+check("a suffix fixture leaves earlier steps as gold", "tamper" in _texts[0], False)
+check("...and appends to the last", "tamper" in _texts[-1] and "gold2" in _texts[-1], True)
+
+# A positive overlay composes onto gold with its preamble stripped.
+_c = fx.compose_overlay("#!/bin/sh\ngold\n", "#!/bin/sh\nset -e\nextra\n")
+check("the overlay preamble is stripped", "set -e" in _c, False)
+check("...and gold survives", "gold" in _c and "extra" in _c, True)
+
+# --- TIMEOUT is a first-class gate state ---
+_tr = gate_mod.Report()
+_tr.add("fixture-corpus", gate_mod.TIMEOUT, "timed out")
+check("a TIMEOUT check blocks", _tr.ok, False)
+check("...and is listed separately from NOT_RUN", _tr.as_dict()["timedOut"], ["fixture-corpus"])
+check("...and is not counted as not-run", _tr.as_dict()["notRun"], [])
+
+# --- controls roster ---
+_rr2 = Path(tempfile.mkdtemp())
+(_rr2 / "scripts" / "controls").mkdir(parents=True)
+_rep = gate_mod.Report(); gate_mod.check_controls_roster(_rr2, _rep)
+check("a missing roster is reported", {c.name: c for c in _rep.checks}["controls-roster"].state,
+      gate_mod.NOT_RUN)
+(_rr2 / "scripts" / "controls" / "EXPECTED").write_text("harness-smoke.py\n# a comment\n")
+_rep = gate_mod.Report(); gate_mod.check_controls_roster(_rr2, _rep)
+_cr3 = {c.name: c for c in _rep.checks}["controls-roster"]
+check("a declared control that vanished fails", _cr3.state, gate_mod.FAIL)
+check("...and names it", "harness-smoke.py" in _cr3.detail, True)
+(_rr2 / "scripts" / "harness-smoke.py").write_text("x\n")
+_rep = gate_mod.Report(); gate_mod.check_controls_roster(_rr2, _rep)
+check("a present control passes", {c.name: c for c in _rep.checks}["controls-roster"].state,
+      gate_mod.PASS)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

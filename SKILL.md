@@ -1193,6 +1193,44 @@ gate refuses to assess a task whose intent you do not hold, so the required rece
 exist, and the only escape is a bypass that disables the check for *your* tasks too. A gate that
 cannot go green is not a gate.
 
+### 15c-2. The fixture corpus (G2/G5)
+
+```bash
+benchsmith corpus --repo . --task <name>    # minutes per fixture; opt-in
+```
+
+Two questions no generated mutant answers:
+
+- **Is the grader too loose?** Every `qa/negative/*.sh` is a cheat vector someone already thought
+  of. It must not score 1.0.
+- **Is the grader too strict?** Every `qa/positive/*.sh` and `qa/variants/*.sh` is a
+  correct-but-different solution. It must score 1.0.
+
+This **complements `benchsmith mutate`** rather than repeating it: a generated mutant finds a hole
+nobody anticipated; a corpus fixture stops a hole that was already found from reopening.
+
+Four rules carried over intact, each of which has already been got wrong once:
+
+- **Glob, never hardcode.** A fixed name list is one task's cheat vectors imposed on every task —
+  and it does not merely fail the wrong task, it **skips the fixtures the task does own**, so the
+  gate goes green having run nothing.
+- **A timeout is a third state**, alongside pass, fail and not-run. Narrating one into "it was
+  expected to score 0.0 anyway" is how a reward-hack fixture stops being checked.
+- **Aggregate with MIN.** A trial passes only when *every* step scores 1.0. A mean against a
+  threshold lets a cheat through; a max picks the best step and does the same.
+- **A `*suffix.sh` negative appends to the last step** (gold, then tamper). Any other negative
+  replaces **every** step — otherwise a later gold step silently repairs the cheat and it scores
+  1.0.
+
+An empty corpus is `NOT_RUN`, and not run is not passed. The corpus is opt-in from the gate because
+it runs the benchmark once per fixture; its absence is reported, never treated as clean.
+
+### 15c-3. The controls roster
+
+`scripts/controls/EXPECTED` lists the controls that must exist. A control that quietly disappears
+leaves no trace — the gate simply stops running it and goes green faster. The roster is the only
+thing that notices, which is why a **missing roster is itself a finding**, not a reason to skip.
+
 ### 15d. The formatters
 
 The scratch and base-tree clones also carry a `.githooks/pre-commit` running prettier and eslint

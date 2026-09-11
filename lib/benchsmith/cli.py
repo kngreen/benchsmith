@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
+from . import fixtures as fixtures_mod
 from . import gate as gate_mod
 from . import ideas as ideas_mod
 from . import preflight as preflight_mod
@@ -335,6 +337,23 @@ def cmd_hooks(args) -> int:
     return 0
 
 
+def cmd_corpus(args) -> int:
+    """Run the hand-written fixture corpus. Minutes per fixture."""
+    from . import fixtures as fx
+
+    task_dir = Path(args.repo).resolve() / args.task
+
+    def runner(td):
+        r = subprocess.run([args.bench, "bench", "run", "-p", str(td), "--n-attempts", "1"],
+                           capture_output=True, text=True, timeout=args.timeout)
+        rewards = re.findall(r'"reward"\s*:\s*([0-9.]+|null)', r.stdout)
+        return r.returncode, rewards
+
+    res = fx.run_corpus(task_dir, runner=runner)
+    _out(res)
+    return 0 if res["state"] == fx.PASS else 1
+
+
 def cmd_stats(args) -> int:
     _out(stats_mod.collect(Path(args.root)))
     return 0
@@ -551,6 +570,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--repo", default=".")
     s.add_argument("--time", action="store_true", help="measure a real run")
     s.set_defaults(fn=cmd_hooks)
+
+    s = common(sub.add_parser("corpus", help="run the hand-written fixture corpus"))
+    s.add_argument("--bench", default="codimango")
+    s.add_argument("--timeout", type=int, default=3600)
+    s.set_defaults(fn=cmd_corpus)
 
     s = sub.add_parser("config", help="show the resolved configuration")
     s.add_argument("--repo", default=".")

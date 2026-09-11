@@ -26,6 +26,13 @@ REQUIRED_TAGS = ("benchsmith-v1", "aai-labs", "semi-synthetic", "private_repos_1
 TEAM_TAG_PREFIX = "aai-labs-"
 
 PASS, FAIL, NOT_RUN = "PASS", "FAIL", "NOT_RUN"
+# A fourth state, kept distinct on purpose. A timeout is not a pass, not a
+# failure, and not "did not run" -- it is a verdict that was never reached.
+# Folding it into NOT_RUN loses the one thing a reader needs: that the check
+# was attempted and the answer is missing. Narrating a timed-out reward-hack
+# fixture into "it was expected to score 0.0 anyway" is how that fixture stops
+# being checked.
+TIMEOUT = "TIMEOUT"
 
 
 # Checks whose absence makes a push unsafe rather than merely unmeasured. These
@@ -51,7 +58,7 @@ class Check:
         # failed" have the same consequence. Without this, every gate the loop
         # depends on is skippable by arranging for it not to run, which is the
         # one hole that makes all the others optional.
-        if self.blocking and self.state == FAIL:
+        if self.blocking and self.state in (FAIL, TIMEOUT):
             return True
         return bool(self.required and self.state == NOT_RUN)
 
@@ -87,6 +94,7 @@ class Report:
             "notRun": [c.name for c in self.checks if c.state == NOT_RUN],
             "blockedByNotRun": [c.name for c in self.checks
                                 if c.required and c.state == NOT_RUN],
+            "timedOut": [c.name for c in self.checks if c.state == TIMEOUT],
         }
 
     def render(self) -> str:
@@ -440,6 +448,57 @@ TOML_AUTHOR = re.compile(
     r'authors\s*=\s*\[\s*\{\s*name\s*=\s*"([^"]*)"', re.S)
 
 
+def check_controls_roster(repo_root: Path, report: Report) -> None:
+    """Every control the repo declares must still be present.
+
+    A control that quietly disappears leaves no trace: the gate stops running it
+    and goes green faster. The roster is the only thing that notices, which is
+    why a missing roster is itself a finding rather than a reason to skip.
+    """
+    roster = Path(repo_root) / "scripts" / "controls" / "EXPECTED"
+    if not roster.is_file():
+        report.add("controls-roster", NOT_RUN,
+                   "no scripts/controls/EXPECTED; nothing declares which controls must exist",
+                   blocking=False)
+        return
+    try:
+        wanted = [l.strip() for l in roster.read_text().splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+    except OSError as e:
+        report.add("controls-roster", NOT_RUN, f"roster unreadable: {e}")
+        return
+    if not wanted:
+        report.add("controls-roster", NOT_RUN, "roster is empty; it declares nothing")
+        return
+    missing = [n for n in wanted
+               if not (Path(repo_root) / "scripts" / n).is_file()
+               and not (Path(repo_root) / "scripts" / "controls" / n).is_file()]
+    report.add("controls-roster", FAIL if missing else PASS,
+               ("declared but absent: " + ", ".join(missing)) if missing
+               else f"all {len(wanted)} declared control(s) present")
+
+
+def check_fixture_corpus(task_dir: Path, report: Report, runner=None) -> None:
+    """Known cheats must fail; correct alternatives must pass."""
+    from . import fixtures as fx
+
+    if runner is None:
+        # Running the corpus means running the benchmark once per fixture, which
+        # is minutes. It is opt-in rather than silently skipped, and reported as
+        # NOT_RUN so nobody reads its absence as a clean bill.
+        neg, pos = fx.discover(Path(task_dir))
+        report.add("fixture-corpus", NOT_RUN,
+                   f"{len(neg)} negative and {len(pos)} positive fixture(s) found, not run "
+                   "(minutes per fixture; run `benchsmith corpus`)" if (neg or pos)
+                   else "no fixture corpus under qa/negative, qa/positive or qa/variants",
+                   blocking=False)
+        return
+    res = fx.run_corpus(Path(task_dir), runner=runner)
+    report.add("fixture-corpus",
+               {fx.PASS: PASS, fx.FAIL: FAIL, fx.TIMEOUT: TIMEOUT, fx.NOT_RUN: NOT_RUN}[res["state"]],
+               res["detail"])
+
+
 def check_task_author(repo_root: Path, task_dir: Path, task_name: str, report: Report) -> None:
     """Is this our task to be changing?
 
@@ -623,6 +682,8 @@ def run(
     check_scope(repo_root, task_name, report)
     check_single_lever(repo_root, task_name, journal.mode, report)
     check_task_author(repo_root, task_dir, task_name, report)
+    check_controls_roster(repo_root, report)
+    check_fixture_corpus(task_dir, report)
     check_contamination(repo_root, report)
     check_untracked_deps(repo_root, report)
     check_diff(repo_root, report)
