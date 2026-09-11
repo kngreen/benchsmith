@@ -566,6 +566,92 @@ with tempfile.TemporaryDirectory() as td:
     check("missing recipe tag caught", "benchsmith-v1" in tags, True)
 
 
+# ------------------------------------------------------- stage 2: planner ----
+section("Read-only planner and leases")
+
+from benchsmith.queue import (  # noqa: E402
+    TIER_DRAFT_FAILED, TIER_DRAFT_PASSING, TIER_DRAFT_PENDING, TIER_IDEA, TIER_REVISION,
+    Leases, build_queue, read_journals,
+)
+
+TASKS = [
+    {"name": "rev-a", "status": "needs_revision", "validationStatus": "passing"},
+    {"name": "d-fail", "status": "draft", "validationStatus": "failed"},
+    {"name": "d-pend", "status": "draft", "validationStatus": "pending"},
+    {"name": "d-pass", "status": "draft", "validationStatus": "passing"},
+    {"name": "accepted-x", "status": "accepted", "validationStatus": "passing"},
+    {"name": "training-x", "status": "used_in_training", "validationStatus": "passing"},
+]
+q = build_queue(TASKS)
+check("terminal statuses are not queued", [i.task for i in q if "accepted" in i.task or "training" in i.task], [])
+check("priority order", [i.task for i in q], ["rev-a", "d-fail", "d-pend", "d-pass"])
+check("revision is tier 10", q[0].tier, TIER_REVISION)
+check("failed draft is tier 20", q[1].tier, TIER_DRAFT_FAILED)
+check("pending draft is tier 30", q[2].tier, TIER_DRAFT_PENDING)
+check("passing draft is tier 40", q[3].tier, TIER_DRAFT_PASSING)
+check("all dispatchable with no journals", all(i.dispatchable for i in q), True)
+
+# Determinism: a restarted coordinator must compute the identical plan.
+check("order is stable under input shuffle",
+      [i.task for i in build_queue(list(reversed(TASKS)))], [i.task for i in q])
+
+# Journal status gates dispatch.
+j = {"rev-a": "converged", "d-fail": "escalated", "d-pend": "running", "d-pass": "unreadable"}
+q2 = build_queue(TASKS, journals=j)
+by = {i.task: i for i in q2}
+check("converged is skipped", by["rev-a"].dispatchable, False)
+check("escalated needs a human", "needs a human" in by["d-fail"].skip, True)
+check("running is still dispatchable", by["d-pend"].dispatchable, True)
+check("an unparseable journal is not 'no journal'", by["d-pass"].dispatchable, False)
+check("and says why", "will not parse" in by["d-pass"].skip, True)
+
+# Ideas are last, and deduplicated against real tasks.
+q3 = build_queue(TASKS, ideas=[{"name": "brand-new"}, {"name": "rev-a"}])
+check("idea is tier 50", [i.tier for i in q3 if i.task == "brand-new"], [TIER_IDEA])
+check("idea duplicating a task is dropped", len([i for i in q3 if i.task == "rev-a"]), 1)
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td); repo = scratch_repo(tmp)
+
+    # read_journals must not mistake a receipt for a journal.
+    (repo / ".benchsmith").mkdir(exist_ok=True)
+    (repo / ".benchsmith" / "t1.json").write_text(json.dumps({"task": "t1", "status": "converged"}))
+    (repo / ".benchsmith" / "t2.receipt.json").write_text(json.dumps({"task": "t2", "ok": True}))
+    (repo / ".benchsmith" / "broken.json").write_text("{not json")
+    js = read_journals(repo)
+    check("journal status read", js.get("t1"), "converged")
+    check("receipts are not journals", "t2" in js, False)
+    check("unparseable journal is flagged", js.get("broken"), "unreadable")
+
+    # Leases: exactly one claimant wins.
+    L = Leases(repo)
+    check("first claim wins", L.claim("taskA")["ok"], True)
+    second = L.claim("taskA")
+    check("second claim loses", second["ok"], False)
+    check("and names the holder", bool(second.get("heldBy")), True)
+    check("claim appears active", "taskA" in L.active(), True)
+    check("a claimed task is not dispatchable",
+          build_queue([{"name": "taskA", "status": "draft", "validationStatus": "failed"}],
+                      leases=L.active())[0].dispatchable, False)
+    check("release works", L.release("taskA")["ok"], True)
+    check("releasing twice is not ok", L.release("taskA")["ok"], False)
+    check("released task is dispatchable again",
+          build_queue([{"name": "taskA", "status": "draft", "validationStatus": "failed"}],
+                      leases=L.active())[0].dispatchable, True)
+
+    # An expired lease is not a claim -- a crashed worker must not park a task.
+    expired = Leases(repo, ttl=-1)
+    expired.claim("taskB")
+    check("expired lease is reaped", "taskB" in Leases(repo).active(), False)
+    check("and can be reclaimed", Leases(repo).claim("taskB")["ok"], True)
+
+    # The planner is read-only: it must write nothing.
+    before = sorted(p.name for p in (repo / ".benchsmith").iterdir())
+    build_queue(TASKS, journals=read_journals(repo), leases=Leases(repo).active())
+    check("build_queue mutates nothing",
+          sorted(p.name for p in (repo / ".benchsmith").iterdir()), before)
+
+
 # ------------------------------------------------ concurrency and restart ----
 section("Fleet prerequisites — atomicity, idempotency, durable waves")
 

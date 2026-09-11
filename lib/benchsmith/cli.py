@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import gate as gate_mod
 from . import preflight as preflight_mod
+from .queue import Leases, build_queue, read_journals
 from .adapter import Identity, Platform, Unresolved, discover
 from .bar import evaluate
 from .journal import Journal, git_trailers, surface_hashes
@@ -154,6 +155,47 @@ def cmd_gate(args) -> int:
     return 0 if report.ok else 1
 
 
+def cmd_queue(args) -> int:
+    """Read-only prioritised backlog. Mutates nothing."""
+    repo = Path(args.repo).resolve()
+    raw = json.loads(Path(args.input).read_text()) if args.input else {}
+    tasks = raw.get("tasks") if isinstance(raw, dict) else raw
+    items = build_queue(
+        tasks or [],
+        journals=read_journals(repo),
+        leases=Leases(repo).active(),
+        ideas=raw.get("ideas") if isinstance(raw, dict) else None,
+    )
+    ready = [i for i in items if i.dispatchable]
+    payload = {
+        "total": len(items),
+        "dispatchable": len(ready),
+        "next": [i.as_dict() for i in ready[: args.workers]],
+        "queue": [i.as_dict() for i in items],
+    }
+    if args.json:
+        _out(payload)
+    else:
+        for i in items:
+            mark = "  " if i.dispatchable else "· "
+            note = i.skip or (f"claimed by {i.claimed_by}" if i.claimed_by else i.reason)
+            print(f"{mark}{i.tier:>3} {i.tierName if hasattr(i,'tierName') else '':<0}{i.task:<52} {note}")
+        print(f"\n  {len(ready)} dispatchable of {len(items)}; next {min(args.workers, len(ready))}")
+    return 0
+
+
+def cmd_claim(args) -> int:
+    r = Leases(Path(args.repo).resolve()).claim(args.task)
+    _out(r)
+    return 0 if r["ok"] else 1
+
+
+def cmd_release(args) -> int:
+    r = Leases(Path(args.repo).resolve()).release(args.task)
+    _out(r)
+    return 0 if r["ok"] else 1
+
+
 def cmd_hash(args) -> int:
     _out(surface_hashes(Path(args.repo) / args.task))
     return 0
@@ -223,6 +265,19 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--verify-receipt", action="store_true",
                    help="check an existing receipt against the exact clean HEAD")
     s.set_defaults(fn=cmd_gate)
+
+    s = sub.add_parser("queue", help="read-only prioritised backlog")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--input", default="", help="tasks payload JSON (from `read`/`tasks list`)")
+    s.add_argument("--workers", type=int, default=3)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_queue)
+
+    s = common(sub.add_parser("claim", help="take an exclusive lease on a task"))
+    s.set_defaults(fn=cmd_claim)
+
+    s = common(sub.add_parser("release", help="release a lease"))
+    s.set_defaults(fn=cmd_release)
 
     s = common(sub.add_parser("hash", help="graded and visible surface hashes"))
     s.set_defaults(fn=cmd_hash)
