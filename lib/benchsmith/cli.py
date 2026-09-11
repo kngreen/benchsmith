@@ -28,7 +28,10 @@ from . import hooks as hooks_mod
 from . import dispatch as dispatch_mod
 from . import mutate as mutate_mod
 from . import passatk as passatk_mod
+from . import causal as causal_mod
+from . import rerun as rerun_mod
 from . import resolve as resolve_mod
+from . import worktree as wt_mod
 from . import publish as publish_mod
 from . import sources
 from . import stats as stats_mod
@@ -398,13 +401,24 @@ def cmd_fleet(args) -> int:
         # An idea is dispatched under its PROPOSED SLUG, not the card number: the
         # worker is creating that directory, and a card number is not a name.
         name = (info.get("suggestedSlug") or item.task) if mode == "scaffold" else item.task
+        # Its own working tree, or eight workers share one index and stage over
+        # each other long before anything reaches a remote.
+        work_in = target
+        if args.apply and not args.shared_tree:
+            try:
+                w = wt_mod.ensure(Path(target), name)
+                work_in = w.path
+            except wt_mod.WorktreeRefused as e:
+                plans.append({"task": item.task, "skipped": f"worktree: {e}"})
+                continue
         try:
-            p = dispatch_mod.plan(name, target, mode=mode, target=args.target, idea=info)
+            p = dispatch_mod.plan(name, work_in, mode=mode, target=args.target, idea=info)
         except dispatch_mod.DispatchRefused as e:
             plans.append({"task": item.task, "skipped": str(e)})
             continue
         entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
-                 "repo": target, "mode": mode}
+                 "repo": target, "worktree": work_in if work_in != target else None,
+                 "mode": mode}
         if mode == "scaffold":
             entry["card"] = info.get("gsd")
             entry["proposedName"] = name
@@ -454,6 +468,11 @@ def cmd_fleet(args) -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "current.json").write_text(json.dumps(
             {"started": started, "at": time.time(),
+             # A loop with no wall clock runs until someone notices. The
+             # deadline is recorded, not enforced here, because killing a
+             # worker mid-round loses the round.
+             "deadline": time.time() + args.max_runtime * 3600,
+             "maxRuntimeHours": args.max_runtime,
              "plans": [{k: v for k, v in pl.items() if k in ("task", "repo", "mode", "session")}
                        for pl in plans if "session" in pl]}, indent=1))
     if not args.apply:
@@ -527,6 +546,46 @@ def cmd_status(args) -> int:
                      "note": (hand.get("note") or res.get("reason") or "")[:110]})
     done = [r for r in rows if r["state"] not in ("running", "starting")]
     _out({"workers": rows, "running": len(rows) - len(done), "finished": len(done)})
+    return 0
+
+
+def cmd_worktree(args) -> int:
+    """Per-task working trees: list, create, release."""
+    repo = Path(args.repo).resolve()
+    if args.action == "list":
+        _out({"root": str(wt_mod.root(repo)), "worktrees": wt_mod.existing(repo)})
+        return 0
+    if not args.task:
+        _out({"ok": False, "reason": f"--task is required for {args.action}"})
+        return 2
+    try:
+        if args.action == "add":
+            _out(wt_mod.ensure(repo, args.task).as_dict())
+        else:
+            _out(wt_mod.release(repo, args.task, force=args.force))
+    except wt_mod.WorktreeRefused as e:
+        _out({"ok": False, "reason": str(e)})
+        return 2
+    return 0
+
+
+def cmd_rerun(args) -> int:
+    """Re-measure the same commit, when the platform failed rather than the task."""
+    j = Journal.open(Path(args.repo), args.task)
+    rounds = j.data.get("rounds") or []
+    last = str((rounds[-1].get("class") or rounds[-1].get("cls") or "")) if rounds else ""
+    ok, why = rerun_mod.authorised(last, budget_left=1 if not args.force else 99)
+    if not ok:
+        _out({"ok": False, "reason": why, "lastClass": last})
+        return 2
+    _out({"authorised": why, **rerun_mod.trigger(args.task, apply=args.apply)})
+    return 0
+
+
+def cmd_causal(args) -> int:
+    """Did the last hardening change move the rate, or did the sample?"""
+    j = Journal.open(Path(args.repo), args.task)
+    _out(causal_mod.assess(j.data.get("rounds") or []).as_dict())
     return 0
 
 
@@ -845,6 +904,21 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--apply", action="store_true")
     s.set_defaults(fn=cmd_scaffold)
 
+    s = sub.add_parser("worktree", help="per-task working trees")
+    s.add_argument("action", choices=("list", "add", "release"))
+    s.add_argument("--repo", default=".")
+    s.add_argument("--task", default="")
+    s.add_argument("--force", action="store_true", help="release even with uncommitted work")
+    s.set_defaults(fn=cmd_worktree)
+
+    s = common(sub.add_parser("rerun", help="re-measure the same commit after an infra failure"))
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--force", action="store_true", help="ignore the per-commit rerun budget")
+    s.set_defaults(fn=cmd_rerun)
+
+    s = common(sub.add_parser("causal", help="did the last hardening change move the rate?"))
+    s.set_defaults(fn=cmd_causal)
+
     s = sub.add_parser("status", help="what every dispatched worker is doing")
     s.add_argument("--repo", default=".")
     s.set_defaults(fn=cmd_status)
@@ -869,6 +943,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--apply", action="store_true", help="actually start the workers")
     s.add_argument("--no-snooze", action="store_true",
                    help="leave worker sessions in the AgentCloud inbox")
+    s.add_argument("--shared-tree", action="store_true",
+                   help="run workers in the checkout itself instead of per-task worktrees")
+    s.add_argument("--max-runtime", type=float, default=8.0,
+                   help="hours before the run should wind down (recorded, not enforced)")
     s.set_defaults(fn=cmd_fleet)
 
     s = sub.add_parser("config", help="show the resolved configuration")

@@ -3123,5 +3123,105 @@ check("a root commit is handled", dc.changeset(_rc).source, "root-commit")
 check("...without crashing the checks", dc.run(_rc)["diff-ratchet"]["state"], "NOT_RUN")
 
 
+# --- one working tree per task -----------------------------------------------
+#
+# Eight workers in one checkout share one index. They stage over each other and
+# commit each other's half-finished edits, and serialising the push does not
+# help -- the damage happens long before anything reaches a remote.
+
+from benchsmith import causal as cz  # noqa: E402
+from benchsmith import rerun as rr  # noqa: E402
+from benchsmith import worktree as wtm  # noqa: E402
+
+_wr = Path(tempfile.mkdtemp()) / "wrepo"
+(_wr / "taskA").mkdir(parents=True)
+
+
+def _wg(*a):
+    return subprocess.run(["git", "-C", str(_wr), *a], capture_output=True, text=True)
+
+
+_wg("init", "-q", "-b", "main"); _wg("config", "user.email", "t@t"); _wg("config", "user.name", "t")
+(_wr / "taskA" / "task.toml").write_text("[t]\n"); _wg("add", "-A"); _wg("commit", "-qm", "base")
+
+_a = wtm.ensure(_wr, "taskA")
+_b = wtm.ensure(_wr, "taskB")
+check("each task gets its own tree", _a.path != _b.path, True)
+# Inside the checkout it would be picked up by its own git status, its own
+# globs, and its own gate.
+check("...outside the checkout, not inside it",
+      (_wr.name in Path(_a.path).name, str(_a.path).startswith(str(_wr) + "/")),
+      (True, False))
+check("an existing tree is reused, not recreated", wtm.ensure(_wr, "taskA").created, False)
+
+# The whole point: independent indexes.
+(Path(_a.path) / "x").write_text("1\n")
+subprocess.run(["git", "-C", _a.path, "add", "x"], capture_output=True)
+_sa = subprocess.run(["git", "-C", _a.path, "diff", "--cached", "--name-only"],
+                     capture_output=True, text=True).stdout.split()
+_sb = subprocess.run(["git", "-C", _b.path, "diff", "--cached", "--name-only"],
+                     capture_output=True, text=True).stdout.split()
+check("staging in one tree is invisible in the other", (_sa, _sb), (["x"], []))
+
+# A commit in a worktree shares the object store, which is what lets the publish
+# lane stay in the coordinator.
+subprocess.run(["git", "-C", _a.path, "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "-qm", "in worktree"], capture_output=True)
+_sha = subprocess.run(["git", "-C", _a.path, "rev-parse", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()
+check("its commit is visible from the main checkout",
+      _wg("cat-file", "-e", _sha).returncode, 0)
+
+# Uncommitted work in there is somebody's round.
+(Path(_b.path) / "y").write_text("1\n")
+check("an untracked file makes the tree dirty", wtm.release(_wr, "taskB")["removed"], False)
+check("...and the refusal says what to do",
+      "commit or pass force" in wtm.release(_wr, "taskB")["reason"], True)
+check("force releases it", wtm.release(_wr, "taskB", force=True)["removed"], True)
+
+for _bad in ("../escape", "a/b", "", "-flag"):
+    try:
+        wtm.path_for(_wr, _bad)
+        check(f"unsafe worktree name refused: {_bad!r}", "accepted", "refused")
+    except wtm.WorktreeRefused:
+        check(f"unsafe worktree name refused: {_bad!r}", True, True)
+
+# --- rerun is for infrastructure, never for a better sample ------------------
+
+for _c in ("infra", "not-measured", "platform-stale"):
+    check(f"{_c} authorises a rerun", rr.authorised(_c)[0], True)
+for _c in ("in-band", "too-easy", "dominant-blocker", "grader-false-negative"):
+    check(f"{_c} does not", rr.authorised(_c)[0], False)
+check("...and says why not", "rerolling" in rr.authorised("too-easy")[1], True)
+check("an unclassified round authorises nothing", rr.authorised("")[0], False)
+check("the per-commit budget is respected", rr.authorised("infra", budget_left=0)[0], False)
+check("a planned rerun does not fire", rr.trigger("t")["applied"], False)
+
+# --- causal evidence ----------------------------------------------------------
+
+
+def _rnd(rate, hardening=True):
+    return {"hardening": hardening, "measurement": {"pooledRate": rate}}
+
+
+check("a change that pulled it into band is confirmed",
+      cz.assess([_rnd(0.8, False), _rnd(0.4)]).state, cz.CONFIRMED)
+check("a change that pushed it away is called out",
+      cz.assess([_rnd(0.6, False), _rnd(0.8)]).state, cz.WRONG_WAY)
+check("...and reverting is named as the next step",
+      "reverting it" in cz.assess([_rnd(0.6, False), _rnd(0.8)]).detail, True)
+# One flipped trial in three cohorts of five moves the rate ~6.7 points, so
+# anything smaller is the sample, not the change.
+check("movement under one trial is indistinguishable",
+      cz.assess([_rnd(0.40, False), _rnd(0.44)]).state, cz.INDISTINGUISHABLE)
+check("no prior measurement is unknown, not success",
+      cz.assess([_rnd(0.4)]).state, cz.UNKNOWN)
+check("an unmeasured hardening round is unknown",
+      cz.assess([_rnd(0.4, False), {"hardening": True}]).state, cz.UNKNOWN)
+check("only 'confirmed' counts as useful",
+      [cz.assess([_rnd(0.8, False), _rnd(0.4)]).useful,
+       cz.assess([_rnd(0.40, False), _rnd(0.44)]).useful], [True, False])
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

@@ -202,6 +202,45 @@ returns `needsGsdBoard` with the exact question. Put it to the user in those ter
 Then re-run with `--gsd-project <id>` and keep going. Do not ask for it pre-emptively, and do not
 silently proceed with fewer workers than asked for.
 
+#### Isolation, budget, and knowing when a change worked
+
+**Every worker gets its own working tree.** `fleet --apply` creates
+`<parent>/.benchsmith-worktrees/<repo>--<task>` per task. Eight workers in one checkout share one
+index: they stage over each other and commit each other's half-finished edits, and serialising the
+push does not help because the damage happens long before anything reaches a remote. The object
+store is shared, so a commit made in a worktree is immediately publishable from the coordinator.
+
+Release one when its work is published or abandoned — `benchsmith worktree release --task NAME`.
+It refuses while the tree is dirty, because uncommitted work in there is somebody's round.
+
+**The run is bounded.** `--max-runtime` (default 8 hours) records a deadline in the run file. It is
+recorded rather than enforced: killing a worker mid-round loses the round. When the deadline
+passes, stop dispatching, let what is running finish, and report.
+
+**An infrastructure failure is re-measured, not re-edited.**
+
+```bash
+benchsmith rerun --repo REPO --task TASK-NAME --apply
+```
+
+Editing in response to an infra failure changes the tree, so whatever the platform was hiding is
+now hidden behind a different tree too, and the round that would have told you something is gone.
+`rerun` is authorised **only** by an infrastructure classification — `infra`, `not-measured`,
+`platform-stale`. It refuses on a real measurement, because re-running one of those is rerolling
+for a better sample and the numbers it produces are not evidence.
+
+**Before calling it done, check the change is what moved it.**
+
+```bash
+benchsmith causal --repo REPO --task TASK-NAME
+```
+
+"In band" and "in band because of what we did" are different claims. `causal` compares the last
+hardening round with the one before it and returns `confirmed`, `wrong-way` (revert it),
+`indistinguishable` (under one trial of movement — the sample, not the change), or `unknown`. Only
+`confirmed` supports a terminal claim that the hardening worked; the others are reportable as they
+are, not roundable up.
+
 #### Supervising
 
 ```bash
