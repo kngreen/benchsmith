@@ -2961,5 +2961,45 @@ check("the guard is switchable for callers that already know",
       pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40), check_review=False)["applied"], False)
 
 
+# --- the queue, as something a person can read -------------------------------
+
+from benchsmith.queue import changes as _qchanges  # noqa: E402
+from benchsmith.queue import fingerprint as _qfp  # noqa: E402
+from benchsmith.queue import render as _qrender  # noqa: E402
+from benchsmith.queue import render_changes as _qrc  # noqa: E402
+
+_qi = build_queue([
+    {"name": "needs-fix", "status": "needs_revision"},
+    {"name": "broken", "status": "draft", "validationStatus": "failed"},
+    {"name": "green", "status": "draft", "validationStatus": "passed"},
+])
+_txt = _qrender(_qi)
+check("the rendering counts by tier", "1 needs revision" in _txt, True)
+check("...and names each task", "needs-fix" in _txt and "broken" in _txt, True)
+check("...in priority order", _txt.index("needs-fix") < _txt.index("broken") < _txt.index("green"), True)
+check("an empty queue says so, rather than printing a header",
+      "nothing on the platform needs work" in _qrender([]), True)
+check("reviewer-held tasks are surfaced too",
+      "Held by reviewers: 2" in _qrender(_qi, held=["a", "b"]), True)
+
+# Only post when something moved: an identical queue reposted every poll is
+# noise, and noise is how a real change gets missed.
+_before = _qfp(_qi)
+check("an unchanged queue reports no change", _qchanges(_before, _before)["changed"], False)
+check("...and renders nothing", _qrc(_qchanges(_before, _before)), "")
+
+_after = dict(_before)
+_after["brand-new"] = TIER_REVISION
+_after.pop("green")
+_after["broken"] = TIER_REVISION          # a reviewer sent it back
+_ch = _qchanges(_before, _after)
+check("a new task is reported", [a["task"] for a in _ch["added"]], ["brand-new"])
+check("a task leaving is reported", [g["task"] for g in _ch["gone"]], ["green"])
+check("a task changing tier is reported", [m["task"] for m in _ch["moved"]], ["broken"])
+_r = _qrc(_ch)
+check("the change note says where it moved to", "draft · failing → needs revision" in _r, True)
+check("...and that leaving is not a loss", "left the queue" in _r, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

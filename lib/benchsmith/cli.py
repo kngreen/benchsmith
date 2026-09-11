@@ -32,8 +32,8 @@ from . import resolve as resolve_mod
 from . import publish as publish_mod
 from . import sources
 from . import stats as stats_mod
-from .queue import (DEFAULT_WORKERS, MAX_WORKERS, Leases, build_queue,
-                    read_journals)
+from .queue import (DEFAULT_WORKERS, MAX_WORKERS, Leases, build_queue, changes,
+                    fingerprint, read_journals, render, render_changes)
 from .adapter import Identity, Platform, Unresolved, discover
 from .bar import evaluate
 from .journal import Journal, git_trailers, surface_hashes
@@ -201,8 +201,28 @@ def cmd_queue(args) -> int:
         ideas=raw.get("ideas") if isinstance(raw, dict) else None,
     )
     ready = [i for i in items if i.dispatchable]
+
+    # Only post when something moved. An identical queue reposted every poll is
+    # noise, and noise is how a real change gets missed.
+    snap = repo / ".benchsmith" / "queue.json"
+    try:
+        before = json.loads(snap.read_text())
+    except (OSError, ValueError):
+        before = {}
+    after = fingerprint(items)
+    ch = changes(before, after)
+    if args.remember:
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        snap.write_text(json.dumps(after, indent=1))
+
+    held = [n.split(":")[0] for n in (raw.get("notes") or [])
+            if "reviewer" in n or "already accepted" in n]
     payload = {
         "total": len(items),
+        "brief": render(items, held=held),
+        "changed": ch["changed"],
+        "changes": ch if ch["changed"] else None,
+        "changeBrief": render_changes(ch) or None,
         "dispatchable": len(ready),
         "gsd": raw.get("gsd") if isinstance(raw, dict) else None,
         "notes": raw.get("notes") if isinstance(raw, dict) else [],
@@ -728,6 +748,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="queue tasks you do not own (default: refuse)")
     s.add_argument("--workers", type=int, default=3)
     s.add_argument("--json", action="store_true")
+    s.add_argument("--no-remember", dest="remember", action="store_false", default=True,
+                   help="do not update the change-detection snapshot")
     s.set_defaults(fn=cmd_queue)
 
     s = sub.add_parser("ideas", help="manage a personal GSD board of human T-Bench seeds")

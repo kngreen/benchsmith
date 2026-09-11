@@ -246,3 +246,77 @@ class Leases:
             return {"ok": False, "task": task, "reason": "not claimed"}
         p.unlink()
         return {"ok": True, "task": task}
+
+
+# --- reporting ---------------------------------------------------------------
+#
+# A queue nobody can see is one the operator has to ask about, and asking is the
+# thing the whole loop is trying to remove. These render it for a person and say
+# what moved since last time, so an update is posted when something changed
+# rather than on every poll.
+
+SHORT = {
+    TIER_REVISION: "needs revision",
+    TIER_DRAFT_FAILED: "draft · failing",
+    TIER_DRAFT_PENDING: "draft · pending",
+    TIER_DRAFT_PASSING: "draft · passing",
+    TIER_GSD_REVIEW: "board · review",
+    TIER_GSD_SCAFFOLD: "board · scaffold",
+    TIER_IDEA: "board · idea",
+}
+
+
+def render(items: list, *, limit: int = 12, held: list | None = None) -> str:
+    """The queue as a person would want to read it."""
+    if not items:
+        return "Queue is empty — nothing on the platform needs work."
+    counts: dict[int, int] = {}
+    for i in items:
+        counts[i.tier] = counts.get(i.tier, 0) + 1
+    head = ", ".join(f"{n} {SHORT.get(tier, str(tier))}"
+                     for tier, n in sorted(counts.items()))
+    lines = [f"**Queue — {len(items)} task(s):** {head}", ""]
+    for i in items[:limit]:
+        mark = "  " if i.dispatchable else "· "
+        why = "" if i.dispatchable else f"  ({i.skip})"
+        lines.append(f"{mark}`{SHORT.get(i.tier, str(i.tier)):<16}` {i.task}{why}")
+    if len(items) > limit:
+        lines.append(f"  … and {len(items) - limit} more")
+    if held:
+        lines.append("")
+        lines.append(f"Held by reviewers: {len(held)} — " + ", ".join(held[:4])
+                     + (" …" if len(held) > 4 else ""))
+    return "\n".join(lines)
+
+
+def fingerprint(items: list) -> dict:
+    """Task -> tier. The thing worth noticing a change in."""
+    return {i.task: i.tier for i in items}
+
+
+def changes(before: dict, after: dict) -> dict:
+    """What moved. Empty means nothing worth posting about."""
+    added = sorted(k for k in after if k not in before)
+    gone = sorted(k for k in before if k not in after)
+    moved = sorted(k for k in after if k in before and before[k] != after[k])
+    return {
+        "added": [{"task": k, "tier": SHORT.get(after[k], str(after[k]))} for k in added],
+        "gone": [{"task": k, "was": SHORT.get(before[k], str(before[k]))} for k in gone],
+        "moved": [{"task": k, "from": SHORT.get(before[k], str(before[k])),
+                   "to": SHORT.get(after[k], str(after[k]))} for k in moved],
+        "changed": bool(added or gone or moved),
+    }
+
+
+def render_changes(ch: dict) -> str:
+    if not ch.get("changed"):
+        return ""
+    bits = []
+    for a in ch["added"]:
+        bits.append(f"+ {a['task']} → {a['tier']}")
+    for m in ch["moved"]:
+        bits.append(f"~ {m['task']}: {m['from']} → {m['to']}")
+    for g in ch["gone"]:
+        # Left the queue: submitted, accepted, or converged. Not a loss.
+        bits.append(f"- {g['task']} (was {g['was']}) left the queue")
+    return "**Queue changed**\n" + "\n".join(f"  {b}" for b in bits)

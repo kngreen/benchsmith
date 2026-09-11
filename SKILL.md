@@ -151,16 +151,32 @@ Workers are titled `[benchsmith][harden]: <task>`, `[benchsmith][revise]: <task>
 `[benchsmith][scaffold]: <task>` automatically, so the fleet view reads as a list of what is being
 done to what.
 
-**Report as you go.** You are the only place the operator can see the fleet, so narrate it: say
-what you started, and post a short update whenever a worker changes state. Not a transcript — one
-line each.
+**Report as you go.** You are the only place the operator can see any of this, so narrate it.
+Silence for twenty minutes while eight workers run is indistinguishable from a hang.
+
+Post two things, and nothing else unprompted:
 
 ```bash
-benchsmith status --repo REPO
+benchsmith queue --repo REPO --fetch --json     # .brief and .changeBrief
+benchsmith status --repo REPO                   # every dispatched worker
 ```
 
-That returns every dispatched worker with its task, mode and current state. Post it as a short
-table. Silence for twenty minutes while eight workers run is indistinguishable from a hang.
+**The queue, when you first read it and whenever it changes.** `queue` returns a `brief` — tasks
+grouped by tier, in priority order, with reviewer-held ones counted at the end — and a `changed`
+flag with a `changeBrief` naming exactly what moved:
+
+```
+Queue changed
+  + ollo-new-thing → needs revision
+  ~ ollo-broken: draft · failing → needs revision
+  - ollo-done (was draft · passing) left the queue
+```
+
+**Post `brief` once at the start, then only `changeBrief` when `changed` is true.** Reposting an
+identical queue on every poll is noise, and noise is how a real change gets missed. A task leaving
+the queue is not a loss — it was submitted, accepted, or converged.
+
+**Worker states, as they change.** One line each, not a transcript.
 
 **Announce, then go.** Before the first worker's first round, say plainly which tasks you picked
 and why each is on the list — "I'm going to start iterating on these three: X (needs revision),
