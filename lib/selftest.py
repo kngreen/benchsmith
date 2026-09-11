@@ -2461,5 +2461,45 @@ check("the board question is concrete enough to answer",
 check("pre-emptive asking is ruled out", "Do not ask for it pre-emptively" in _skill, True)
 
 
+# --- concurrency --------------------------------------------------------------
+
+from benchsmith.queue import DEFAULT_WORKERS, MAX_WORKERS  # noqa: E402
+
+check("the default is more than a token few", DEFAULT_WORKERS >= 8, True)
+check("...and under the reported ceiling", DEFAULT_WORKERS <= MAX_WORKERS, True)
+check("the ceiling matches the reported working figure", MAX_WORKERS, 15)
+
+# Concurrency on ONE repository is only safe because a buried commit is still
+# attributable. Without coverage, N workers on one repo destroy each other's
+# evidence -- which is what the strict exact-SHA rule was protecting against,
+# at the cost of deadlock. This is the fixture that ties the two together.
+_cov_repo = Path(tempfile.mkdtemp()) / "conc"
+(_cov_repo / "task-a" / "tests").mkdir(parents=True)
+(_cov_repo / "task-b" / "tests").mkdir(parents=True)
+
+
+def _cg2(*a):
+    return subprocess.run(["git", "-C", str(_cov_repo), *a], capture_output=True, text=True)
+
+
+_cg2("init", "-q", "-b", "main")
+_cg2("config", "user.email", "t@t"); _cg2("config", "user.name", "t")
+for name in ("task-a", "task-b"):
+    (_cov_repo / name / "tests" / "t.py").write_text("def test():\n    assert True\n")
+    (_cov_repo / name / "instruction.md").write_text("do it\n")
+_cg2("add", "-A"); _cg2("commit", "-qm", "base")
+_A = _cg2("rev-parse", "HEAD").stdout.strip()
+
+# A sibling worker publishes a DIFFERENT task and buries our commit.
+(_cov_repo / "task-b" / "tests" / "t.py").write_text("def test():\n    assert 1 == 1\n")
+_cg2("add", "-A"); _cg2("commit", "-qm", "sibling publishes task-b")
+_TIP = _cg2("rev-parse", "HEAD").stdout.strip()
+
+check("a sibling's push does not invalidate our evidence",
+      cov.attribute(_cov_repo, "task-a", _A, _TIP).covers, True)
+check("...while the sibling's own task did change",
+      cov.attribute(_cov_repo, "task-b", _A, _TIP).verdict, cov.DIVERGENT)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

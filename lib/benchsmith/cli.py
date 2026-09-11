@@ -31,7 +31,8 @@ from . import resolve as resolve_mod
 from . import publish as publish_mod
 from . import sources
 from . import stats as stats_mod
-from .queue import Leases, build_queue, read_journals
+from .queue import (DEFAULT_WORKERS, MAX_WORKERS, Leases, build_queue,
+                    read_journals)
 from .adapter import Identity, Platform, Unresolved, discover
 from .bar import evaluate
 from .journal import Journal, git_trailers, surface_hashes
@@ -338,7 +339,12 @@ def cmd_fleet(args) -> int:
                            f"{args.workers} --apply",
             }
 
-    ready = ready[: args.workers]
+    workers, clamp_note = args.workers, None
+    if workers > MAX_WORKERS:
+        clamp_note = (f"asked for {workers}; clamped to {MAX_WORKERS}. Past that the limit is the "
+                      "devserver and the platform's validation capacity, not benchsmith")
+        workers = MAX_WORKERS
+    ready = ready[:workers]
 
     plans, started = [], []
     for item in ready:
@@ -375,12 +381,22 @@ def cmd_fleet(args) -> int:
             entry["shell"] = p.shell
         plans.append(entry)
 
+    by_repo: dict[str, int] = {}
+    for pl in plans:
+        if "repo" in pl:
+            by_repo[pl["repo"]] = by_repo.get(pl["repo"], 0) + 1
     payload = {"discovered": len(items), "dispatchable": sum(1 for i in items if i.dispatchable),
-               "workers": args.workers, "applied": bool(args.apply),
+               "workers": workers, "applied": bool(args.apply),
+               # Named because it is the only thing that serialises: one publish
+               # lane per repository. It is held for a push and released before
+               # validation, so N tasks in one repo cost N pushes, not N cycles.
+               "workersPerRepo": by_repo,
                "selected": [p["task"] for p in plans if "skipped" not in p],
                "started": started, "plans": plans, "notes": raw.get("notes") or []}
     if needs_board:
         payload["needsGsdBoard"] = needs_board
+    if clamp_note:
+        payload["clamped"] = clamp_note
     if not args.apply:
         payload["hint"] = "re-run with --apply to start these"
     _out(payload)
@@ -693,7 +709,8 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("fleet", help="discover, order, and dispatch down the priority list")
     s.add_argument("--repo", default="", help="where journals and leases live (default: cwd)")
-    s.add_argument("--workers", type=int, default=3)
+    s.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                   help=f"concurrent workers (default {DEFAULT_WORKERS}, clamped at {MAX_WORKERS})")
     s.add_argument("--gsd-project", default="")
     s.add_argument("--no-gsd", action="store_true")
     s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"))

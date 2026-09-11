@@ -51,6 +51,24 @@ NEEDS_HUMAN = frozenset({"escalated", "blocked-on-platform", "blocked"})
 
 DEFAULT_LEASE_TTL = 3600
 
+# Concurrency. A round is mostly spent waiting on the platform, so workers cost
+# far less than their count suggests -- 12-15 loops on one devserver is a
+# reported working figure, not a theoretical one.
+#
+# What made a low default necessary was the strict exact-SHA rule: with several
+# workers pushing to one repository, each push buried the last and only the tip
+# was ever measured. `coverage.py` removed that -- a later commit's run counts
+# for an earlier one when the task's graded and visible surfaces are unchanged
+# between them, and a worker only ever touches its own task directory. The
+# publish lane is still one per repository, but it is held for the duration of a
+# `git push` and released before validation, so it costs seconds per task rather
+# than a validation cycle.
+DEFAULT_WORKERS = 8
+# Not a hard law, but past this the limit stops being benchsmith and starts
+# being the devserver and the platform's validation capacity. Clamped with a
+# warning rather than refused: the caller may know something this does not.
+MAX_WORKERS = 15
+
 
 @dataclass
 class Item:

@@ -53,11 +53,29 @@ Stop only for these, and say which:
 You are the coordinator. Start work; do not present a plan and wait.
 
 ```bash
-benchsmith fleet --workers 3 --apply
+benchsmith fleet --apply          # 8 workers by default
+benchsmith fleet --workers 12 --apply
 ```
 
 That orders the backlog, resolves each task to the checkout that holds it, and starts one
 non-publishing worker per task, returning a `session` for each.
+
+**Run many.** A round is mostly spent waiting on the platform, so a worker costs far less than its
+count suggests; 12–15 loops on one devserver is a reported working figure. The default is 8 and the
+clamp is 15 — past that the limit is the devserver and the platform's validation capacity, not
+anything here.
+
+Concurrency on **one** repository is safe, and it is worth knowing why, because it was not always:
+
+- Workers prepare in parallel and publish through one lane per repository. The lane is held for the
+  duration of a `git push` and released **before** validation, so N tasks in one repo cost N
+  pushes, not N validation cycles.
+- A sibling's push burying your commit no longer destroys your evidence. A later commit's
+  measurement covers yours when your task's graded and visible surfaces are unchanged between the
+  two — and a worker only ever touches its own task directory. See `references/attribution.md`.
+
+Under the old exact-SHA rule neither was true, which is why a low worker count used to be the only
+safe setting. `workersPerRepo` in the output tells you how much is landing in each.
 
 **Announce, then go.** Before the first worker's first round, say plainly which tasks you picked
 and why each is on the list — "I'm going to start iterating on these three: X (needs revision),
