@@ -30,6 +30,7 @@ from . import mutate as mutate_mod
 from . import passatk as passatk_mod
 from . import causal as causal_mod
 from . import remote_lease as rlease_mod
+from . import reviewqueue as rq_mod
 from . import reviews as reviews_mod
 from . import rerun as rerun_mod
 from . import resolve as resolve_mod
@@ -759,6 +760,52 @@ def cmd_rerun(args) -> int:
     return 0
 
 
+def cmd_reviewfleet(args) -> int:
+    """The other backlog: tasks waiting on you to review them."""
+    repo = Path(args.repo).resolve() if args.repo else Path.cwd()
+    rows, notes = sources.fetch_codimango_reviewing()
+    items, why_not = rq_mod.build(rows)
+    ready = [i for i in items if i.dispatchable][: args.workers]
+
+    plans, started = [], []
+    for n, item in enumerate(ready, 1):
+        try:
+            info = resolve_mod.resolve(item.task, rows=rows)
+        except resolve_mod.Unresolved as e:
+            plans.append({"task": item.task, "skipped": f"unresolved: {e}"})
+            continue
+        target = info.get("repo")
+        if not target:
+            plans.append({"task": item.task,
+                          "skipped": "no checkout on this host holds it; a review needs the tree"})
+            continue
+        try:
+            p = dispatch_mod.plan(item.task, target, mode="review",
+                                  idea={"track": item.track, "due": item.due})
+        except dispatch_mod.DispatchRefused as e:
+            plans.append({"task": item.task, "skipped": str(e)})
+            continue
+        entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
+                 "repo": target, "track": item.track, "due": item.due}
+        if args.apply:
+            print(f"[{n}/{len(ready)}] review {item.task}…", file=sys.stderr, flush=True)
+            res = dispatch_mod.run(p, apply=True)
+            sid = dispatch_mod.session_id(res.get("stdout") or "")
+            entry["session"] = sid
+            if sid and not args.no_snooze:
+                dispatch_mod.snooze(sid)
+            started.append({"task": item.task, "session": sid})
+        else:
+            entry["shell"] = p.shell
+        plans.append(entry)
+
+    _out({"queue": len(items), "dispatchable": sum(1 for i in items if i.dispatchable),
+          "brief": rq_mod.render(items, why_not), "notMine": why_not[:8],
+          "applied": bool(args.apply), "started": started, "plans": plans, "notes": notes,
+          "hint": None if args.apply else "re-run with --apply to start these"})
+    return 0
+
+
 def cmd_review(args) -> int:
     """What the reviewer asked for, and whether it has been written down."""
     j = Journal.open(Path(args.repo), args.task)
@@ -1126,6 +1173,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--apply", action="store_true")
     s.add_argument("--force", action="store_true", help="ignore the per-commit rerun budget")
     s.set_defaults(fn=cmd_rerun)
+
+    s = sub.add_parser("review-fleet", help="work the queue of tasks assigned to you to review")
+    s.add_argument("--repo", default="")
+    s.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--no-snooze", action="store_true")
+    s.set_defaults(fn=cmd_reviewfleet)
 
     s = common(sub.add_parser("review", help="what the reviewer asked for, and its closure state"))
     s.set_defaults(fn=cmd_review)

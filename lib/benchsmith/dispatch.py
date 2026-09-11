@@ -69,7 +69,8 @@ HANDOFF_STATES = frozenset({
 # What a mode is called in a session title. `needs_revision` is the platform's
 # word for the state, so `revise` is the operator-facing label for the work;
 # `repair` stays the internal mode name because the journal records it.
-MODE_LABELS = {"harden": "harden", "repair": "revise", "revise": "revise", "scaffold": "scaffold"}
+MODE_LABELS = {"harden": "harden", "repair": "revise", "revise": "revise",
+               "scaffold": "scaffold", "review": "review"}
 MODE_ALIASES = {"revise": "repair"}
 
 
@@ -222,6 +223,55 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
     )
 
 
+# The canonical reviewer per track. iOS has none in `codimango bench ai-review`,
+# which is a gap to report rather than a reason to substitute another track's
+# rubric.
+TRACK_REVIEWERS = {
+    "swe-bench-pro": "review-task-swebench-v2",
+    "tbench": "review-task-tbench-v2",
+    "t-bench": "review-task-tbench-v2",
+    "ml-bench": "review-task-mlbench-v1",
+    "mlbench": "review-task-mlbench-v1",
+}
+
+
+def review_prompt(task: str, repo: str, *, track: str = "", due: str = "") -> str:
+    """The brief for reviewing somebody else's task.
+
+    Reviewing is never automated to a verdict. The worker gathers evidence and
+    drafts feedback; submitting it stays a human decision, exactly as publishing
+    a task does.
+    """
+    canonical = TRACK_REVIEWERS.get(track.lower(), "")
+    reviewer_line = (
+        f"1. Canonical reviewer: `codimango bench ai-review {canonical} -p {repo}/{task}`\n"
+        if canonical else
+        f"1. **No canonical reviewer exists for track {track!r}** in `codimango bench ai-review`. "
+        "Say so in your report. Do NOT substitute another track's rubric — its checks assume a "
+        "different task shape and would produce confident findings about the wrong thing.\n"
+    )
+    return (
+        f"Review the task {task} in {repo}. Track: {track or 'unknown'}."
+        + (f" SLA: {due[:10]}." if due else "") + "\n\n"
+        "**The repository is READ-ONLY.** Do not commit, push, edit, rerun validation, or contact "
+        "the author. You are producing a review, not a repair.\n\n"
+        "**You may not submit the review.** Draft every field; submitting stays a human decision.\n\n"
+        "Run both, in this order:\n"
+        + reviewer_line +
+        "2. Then the second pass: read `~/.claude/skills/codimango-review-critic/SKILL.md` and "
+        "follow it. It reviews the reviewer — it verifies each finding against the exact task "
+        "revision, reads prior reviews, and preserves unverified caveats rather than dropping "
+        "them.\n\n"
+        "Bind every finding to the exact revision you read. A finding cited against a commit the "
+        "task has moved past is worse than no finding: the author cannot reproduce it, and "
+        "reconciling that costs more than the review saved.\n\n"
+        f"Write your report to `{repo}/{HANDOFF_DIR}/review-{task}.md`, and a handoff to "
+        f"`{repo}/{HANDOFF_DIR}/{task}.json` with `state` one of "
+        "`ready_to_publish` (feedback drafted and ready for a human to submit), `blocked`, "
+        "`needs_human`, or `failed`. Then say in one plain sentence what you found.\n"
+    )
+
+
 def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "hard-preferred",
                   bootstrap: bool = False, resume: bool = True) -> str:
     """The instruction a stage-3 worker gets. Deliberately narrow."""
@@ -293,7 +343,11 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
     bad = _placeholder(task)
     if bad:
         raise DispatchRefused(bad)
-    if mode == "scaffold":
+    if mode == "review":
+        prompt = ((bootstrap_block() if bootstrap else "")
+                  + review_prompt(task, repo, track=(idea or {}).get("track", ""),
+                                  due=(idea or {}).get("due", "")))
+    elif mode == "scaffold":
         if not isinstance(idea, dict) or not idea:
             raise DispatchRefused(
                 "scaffold mode needs the resolved card; dispatching an idea by name alone "
@@ -311,6 +365,8 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
             )
         prompt = ((bootstrap_block() if bootstrap else "")
                   + scaffold_prompt(idea, repo, task))
+    elif mode == "review":
+        pass  # prompt already built above
     else:
         # A worker sent at a directory that is not there burns a session to
         # discover what one `is_file()` call already knows.

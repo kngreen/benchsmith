@@ -3970,5 +3970,80 @@ check("the findings check blocks a push",
       "review-findings" in gate_mod.PUSH_REQUIRED, True)
 
 
+# --- the reviewer's queue is not the author's --------------------------------
+#
+# A task in `being_reviewed` is blocking somebody else and has a deadline. One
+# in `needs_revision` is the author's move and belongs in their queue.
+
+from benchsmith import reviewqueue as rq  # noqa: E402
+from datetime import datetime as _dtm, timezone as _tz  # noqa: E402
+
+_NOW = _dtm(2026, 9, 15, tzinfo=_tz.utc)
+
+
+def _rrow(name, status, **kw):
+    return {"name": name, "status": status, "currentUserIsReviewer": True,
+            "track": kw.get("track", "swe-bench-pro"),
+            "tbdReviewStatus": kw.get("tbd", "pass"),
+            "validationStatus": kw.get("validation", "passing"),
+            "reviewSlaDeadline": kw.get("due", "")}
+
+
+_ri, _rn = rq.build([
+    _rrow("late", "being_reviewed", due="2026-09-01T00:00:00.000Z"),
+    _rrow("soon", "being_reviewed", due="2026-09-20T00:00:00.000Z"),
+    _rrow("nodue", "being_reviewed"),
+    _rrow("pre", "draft"),
+    _rrow("theirs", "needs_revision"),
+    _rrow("done", "accepted"),
+], now=_NOW)
+check("an overdue review sorts first", [i.task for i in _ri][0], "late")
+check("...then due, then undated, then pre-submission",
+      [i.task for i in _ri], ["late", "soon", "nodue", "pre"])
+# needs_revision is the AUTHOR's move; showing it here would double-count work.
+check("a task I sent back is not in my review queue",
+      any("theirs" in n for n in _rn), True)
+check("...and accepted work is not either", any("done" in n for n in _rn), True)
+
+check("a task where I am not the reviewer is absent",
+      rq.build([{"name": "x", "status": "being_reviewed", "currentUserIsReviewer": False}])[0], [])
+
+# An absent deadline is not "plenty of time".
+check("no deadline is undated, not overdue", rq._overdue(""), None)
+check("an unparseable deadline is undated too", rq._overdue("soon-ish"), None)
+
+# Reviewing a task whose validation is still moving reads evidence about to change.
+_pend, _ = rq.build([_rrow("moving", "being_reviewed", validation="pending",
+                           due="2026-09-20T00:00:00.000Z")], now=_NOW)
+check("a task mid-validation is held", _pend[0].dispatchable, False)
+check("...with the reason", "evidence will move" in _pend[0].skip, True)
+
+# --- the review brief ---------------------------------------------------------
+
+_revrepo = Path(tempfile.mkdtemp())
+(_revrepo / "ollo-some-task").mkdir()
+(_revrepo / "ollo-some-task" / "task.toml").write_text("x")
+_rp = dsp.plan("ollo-some-task", str(_revrepo), mode="review",
+               idea={"track": "swe-bench-pro", "due": "2026-09-20"})
+_rt = [a for a in _rp.argv if "READ-ONLY" in a][0]
+check("the review brief names the canonical reviewer",
+      "review-task-swebench-v2" in _rt, True)
+check("...and the second pass", "codimango-review-critic" in _rt, True)
+check("the repository is read-only", "READ-ONLY" in _rt, True)
+check("submitting stays a human decision", "may not submit" in _rt, True)
+check("findings must bind to the exact revision", "exact revision" in _rt, True)
+check("the session title says review",
+      any(a == "[benchsmith][review]: ollo-some-task" for a in _rp.argv), True)
+
+# A track with no canonical reviewer must be reported, not substituted: another
+# track's rubric assumes a different task shape and produces confident findings
+# about the wrong thing.
+_ios = [a for a in dsp.plan("ollo-some-task", str(_revrepo), mode="review",
+                            idea={"track": "ios-swe-bench"}).argv if "READ-ONLY" in a][0]
+check("a track with no reviewer is called out", "No canonical reviewer exists" in _ios, True)
+check("...and substitution is forbidden", "Do NOT substitute" in _ios, True)
+check("...while the critic still runs", "codimango-review-critic" in _ios, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

@@ -110,6 +110,25 @@ def fetch_gsd(cfg, limit: int = 200) -> tuple[list[dict], list[str]]:
     return rows if isinstance(rows, list) else [], []
 
 
+def fetch_codimango_reviewing(binary: str = "codimango") -> tuple[list[dict], list[str]]:
+    """Tasks where the caller is the assigned reviewer, not the author."""
+    argv, why = task_list_argv(binary)
+    if argv is None:
+        return [], [f"could not resolve the task-list surface: {why}"]
+    argv = argv[:-1] + ["--reviewing", "--json"] if argv[-1] == "--json" else argv + ["--reviewing"]
+    code, out, err = _run(argv)
+    if code != 0:
+        return [], [f"`{' '.join(argv)}` failed: {err.strip()[:200]}"]
+    try:
+        doc = json.loads(out[out.index("{"):]) if "{" in out else {}
+    except ValueError as e:
+        return [], [f"review list did not return JSON: {e}"]
+    rows = doc.get("tasks")
+    if rows is None:
+        return [], ["review list had no `tasks` key; treating as unknown, not empty"]
+    return rows, []
+
+
 def normalise_codimango(rows: list[dict], *, require_owner: bool = True) -> tuple[list[dict], list[str]]:
     """Keep the rows that represent work THIS caller owns.
 
