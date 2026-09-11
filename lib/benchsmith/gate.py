@@ -60,7 +60,12 @@ class Check:
         # failed" have the same consequence. Without this, every gate the loop
         # depends on is skippable by arranging for it not to run, which is the
         # one hole that makes all the others optional.
-        if self.blocking and self.state in (FAIL, TIMEOUT):
+        if not self.blocking:
+            # Explicitly advisory. Requiring an advisory check was a
+            # contradiction that silently won, and it produced a gate nobody
+            # could satisfy.
+            return False
+        if self.state in (FAIL, TIMEOUT):
             return True
         return bool(self.required and self.state == NOT_RUN)
 
@@ -522,10 +527,19 @@ def check_findings(task_name: str, journal, report: Report, *, binary: str = "co
     try:
         req = requests(task_name, binary=binary)
     except Exception as e:  # noqa: BLE001
-        report.add("review-findings", NOT_RUN, f"could not read the reviews: {e}")
+        # Unreadable is genuinely unknown, and non-blocking here on purpose:
+        # `publish` already refuses outright when it cannot read a task's
+        # status, so the needs_revision case stays fail-closed at the one place
+        # it matters, without blocking every unrelated draft push.
+        report.add("review-findings", NOT_RUN, f"could not read the reviews: {e}",
+                   blocking=False)
         return
     if not req.get("requests"):
-        report.add("review-findings", NOT_RUN, "no outstanding revision request", blocking=False)
+        # PASS, not NOT_RUN. "Every requested change is addressed" is true when
+        # there are no requests, and calling it unmeasured made the push gate
+        # unsatisfiable for every draft: the check is push-required, a required
+        # NOT_RUN blocks, and no receipt could ever be issued.
+        report.add("review-findings", PASS, "no outstanding revision request")
         return
     blocked, why = unaddressed(journal.data.get("findings") or {}, req)
     report.add("review-findings", FAIL if blocked else PASS, why)

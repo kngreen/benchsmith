@@ -4049,5 +4049,77 @@ check("...and substitution is forbidden", "Do NOT substitute" in _ios, True)
 check("...while the critic still runs", "codimango-review-critic" in _ios, True)
 
 
+# --- a gate that cannot go green is not a gate --------------------------------
+#
+# `review-findings` went into PUSH_REQUIRED while returning NOT_RUN for a draft
+# with no revision request. A required NOT_RUN blocks, so no draft could ever be
+# issued a receipt: "current benchsmith gate --require-push-set is unsatisfiable
+# here". Observed on a real worker, which correctly wrote a blocked handoff
+# rather than bypassing.
+
+_nfj = Journal.open(Path(tempfile.mkdtemp()), "t")
+_saved7 = rvw.requests
+
+
+def _no_requests(task, binary="codimango"):
+    return {"task": task, "requests": [], "comments": [], "systemComments": 0}
+
+
+try:
+    import benchsmith.reviews as _rvmod
+    _orig = _rvmod.requests
+    _rvmod.requests = _no_requests
+    _rp5 = gate_mod.Report()
+    gate_mod.check_findings("t", _nfj, _rp5)
+    _c5 = {c.name: c for c in _rp5.checks}["review-findings"]
+    # Vacuously true is true: with no requests, every requested change IS
+    # addressed. Calling that unmeasured made the push gate unsatisfiable.
+    check("no revision request is a PASS, not NOT_RUN", _c5.state, gate_mod.PASS)
+    _rp5.require(gate_mod.PUSH_REQUIRED)
+    check("...so the push-required set is satisfiable for a draft",
+          _c5.blocks, False)
+finally:
+    _rvmod.requests = _orig
+
+
+def _unreadable(task, binary="codimango"):
+    raise RuntimeError("platform unreachable")
+
+
+try:
+    _rvmod.requests = _unreadable
+    _rp6 = gate_mod.Report()
+    gate_mod.check_findings("t", _nfj, _rp6)
+    _c6 = {c.name: c for c in _rp6.checks}["review-findings"]
+    check("unreadable reviews are NOT_RUN", _c6.state, gate_mod.NOT_RUN)
+    _rp6.require(gate_mod.PUSH_REQUIRED)
+    # publish already refuses outright when it cannot read a status, so the
+    # needs_revision case stays fail-closed where it matters.
+    check("...and do not block every unrelated draft push", _c6.blocks, False)
+finally:
+    _rvmod.requests = _orig
+
+# `blocking=False` must mean non-blocking. Requiring an advisory check was a
+# contradiction that silently won.
+_adv = gate_mod.Report()
+_adv.add("advisory", gate_mod.NOT_RUN, "n/a", blocking=False)
+_adv.require(["advisory"])
+check("an advisory check cannot be made to block", _adv.ok, True)
+_req2 = gate_mod.Report()
+_req2.add("oracle", gate_mod.NOT_RUN, "not run")
+_req2.require(["oracle"])
+check("a real required NOT_RUN still blocks", _req2.ok, False)
+
+# The worker writes its handoff inside its worktree; reading the canonical
+# checkout finds a stale one from a previous round, which is worse than none.
+check("status reads the handoff from the worktree",
+      'pl.get("worktree") or pl.get("repo"' in _clisrc.replace("\n", " ")
+      or "worktree" in Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text(),
+      True)
+check("...and the worktree is persisted in the run file",
+      '"worktree", "mode", "session"' in
+      Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text(), True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

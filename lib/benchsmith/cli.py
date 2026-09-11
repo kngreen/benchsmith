@@ -424,7 +424,7 @@ def cmd_fleet(args) -> int:
                  "deadline": time.time() + args.max_runtime * 3600,
                  "maxRuntimeHours": args.max_runtime,
                  "plans": [{k: v for k, v in pl.items()
-                            if k in ("task", "repo", "mode", "session")}
+                            if k in ("task", "repo", "worktree", "mode", "session")}
                            for pl in plans if "session" in pl]}, indent=1))
         except OSError:
             pass
@@ -703,7 +703,11 @@ def cmd_status(args) -> int:
     rows = []
     for pl in run.get("plans") or []:
         sid = pl.get("session") or ""
-        res = dispatch_mod.collect(sid, repo=pl.get("repo", ""), task=pl.get("task", ""))
+        # The worker wrote its handoff inside its own worktree. Reading the
+        # canonical checkout finds an older one from a previous round, which is
+        # worse than finding none.
+        res = dispatch_mod.collect(sid, repo=pl.get("worktree") or pl.get("repo", ""),
+                                   task=pl.get("task", ""))
         hand = res.get("handoff") or {}
         row = {"task": pl.get("task"), "mode": pl.get("mode"), "session": sid,
                "state": hand.get("state") or res.get("state"),
