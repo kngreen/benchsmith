@@ -390,13 +390,52 @@ def cmd_fleet(args) -> int:
         workers = MAX_WORKERS
     ready = ready[:workers]
 
+    # One ls-remote per repository, not one per task. Tasks can resolve to
+    # different checkouts, so the state is keyed by the repo it came from.
+    _lease_states: dict = {}
+
+    def lease_state_for(target_repo: str) -> dict:
+        if target_repo not in _lease_states:
+            try:
+                _lease_states[target_repo] = rlease_mod.states(target_repo)
+            except Exception as e:  # noqa: BLE001 - reported per task, not fatal here
+                _lease_states[target_repo] = {"__error__": str(e)}
+        return _lease_states[target_repo]
+
     plans, started = [], []
-    for item in ready:
+    run_dir = repo / ".benchsmith" / "fleet"
+    claimed: list = []
+
+    def _persist() -> None:
+        """Write what has happened so far, after every worker.
+
+        Writing only at the end meant an interrupted run recorded nothing: its
+        leases and worktrees leaked, and the supervisor could not name a single
+        worker it had started.
+        """
+        if not args.apply:
+            return
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "current.json").write_text(json.dumps(
+                {"started": started, "at": time.time(),
+                 "deadline": time.time() + args.max_runtime * 3600,
+                 "maxRuntimeHours": args.max_runtime,
+                 "plans": [{k: v for k, v in pl.items()
+                            if k in ("task", "repo", "mode", "session")}
+                           for pl in plans if "session" in pl]}, indent=1))
+        except OSError:
+            pass
+
+    for n, item in enumerate(ready, 1):
+        if args.apply:
+            print(f"[{n}/{len(ready)}] {item.task}: claiming and preparing…",
+                  file=sys.stderr, flush=True)
         # Each worker is dispatched against the checkout that actually holds its
         # task, not against one repo assumed to hold them all.
         info = {}
         try:
-            info = resolve_mod.resolve(item.task)
+            info = resolve_mod.resolve(item.task, rows=raw.get("tasks") or None)
             target, mode = info.get("repo"), info.get("mode", "harden")
         except resolve_mod.Unresolved as e:
             plans.append({"task": item.task, "skipped": f"unresolved: {e}"})
@@ -418,7 +457,11 @@ def cmd_fleet(args) -> int:
         lease = None
         if args.apply and not args.no_remote_lease:
             try:
-                lease = rlease_mod.RemoteLease(item.task, target)
+                st = lease_state_for(target)
+                if "__error__" in st:
+                    raise rlease_mod.LeaseLost(st["__error__"])
+                lease = rlease_mod.RemoteLease(item.task, target,
+                                               known=st.get(item.task, ""))
                 got = lease.acquire()
             except rlease_mod.LeaseLost as e:
                 # Not knowing who holds it is not the same as nobody holding it.
@@ -426,6 +469,8 @@ def cmd_fleet(args) -> int:
                               "skipped": f"remote lease unreadable: {e}. Pass --no-remote-lease "
                                          "if this repository has no shared remote"})
                 continue
+            if got.get("held"):
+                claimed.append((lease, item.task, target))
             if not got.get("held"):
                 plans.append({"task": item.task,
                               "skipped": f"claimed elsewhere: {got.get('reason', '')}",
@@ -471,6 +516,11 @@ def cmd_fleet(args) -> int:
                 entry["warning"] = "started but returned no session id; it cannot be followed"
             entry["error"] = res.get("error") or (res.get("stderr") or "")[:200] or None
             started.append({"task": item.task, "session": sid})
+            print(f"[{n}/{len(ready)}] {item.task}: started {sid or '(no session id)'}",
+                  file=sys.stderr, flush=True)
+            if sid:
+                claimed = [c for c in claimed if c[1] != item.task]  # in use, keep it
+            _persist()
         else:
             entry["shell"] = p.shell
         plans.append(entry)
@@ -491,21 +541,22 @@ def cmd_fleet(args) -> int:
         payload["needsGsdBoard"] = needs_board
     if clamp_note:
         payload["clamped"] = clamp_note
-    if args.apply and started:
-        # Written down because a coordinator that only remembers its workers
-        # in-context forgets them on compaction, and an unremembered worker is
-        # one nobody collects.
-        run_dir = repo / ".benchsmith" / "fleet"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "current.json").write_text(json.dumps(
-            {"started": started, "at": time.time(),
-             # A loop with no wall clock runs until someone notices. The
-             # deadline is recorded, not enforced here, because killing a
-             # worker mid-round loses the round.
-             "deadline": time.time() + args.max_runtime * 3600,
-             "maxRuntimeHours": args.max_runtime,
-             "plans": [{k: v for k, v in pl.items() if k in ("task", "repo", "mode", "session")}
-                       for pl in plans if "session" in pl]}, indent=1))
+    if "payload_released" in dir():
+        payload["releasedUnused"] = payload_released
+    _persist()
+    # Anything claimed but never dispatched is released. A lease and a worktree
+    # held for a task nobody is working on strands that task from every other
+    # host until the TTL expires.
+    released = []
+    for lease, task_name, target in claimed:
+        try:
+            wt_mod.release(Path(target), task_name)
+            lease.release()
+            released.append(task_name)
+        except Exception:  # noqa: BLE001 - cleanup must not mask the result
+            pass
+    if released:
+        payload_released = released
     if not args.apply:
         payload["hint"] = "re-run with --apply to start these"
     _out(payload)

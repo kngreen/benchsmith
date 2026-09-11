@@ -104,6 +104,9 @@ def find_repo(task: str, roots: list[str] | None = None) -> str | None:
     return hits[0] if hits else None
 
 
+_ROOTS_CACHE: list[str] | None = None
+
+
 def _default_roots() -> list[str]:
     """Every git checkout we can plausibly reach, most specific first.
 
@@ -112,6 +115,10 @@ def _default_roots() -> list[str]:
     run from -- because a person who cloned their repos side by side is the
     common case and should not have to configure anything.
     """
+    global _ROOTS_CACHE
+    if _ROOTS_CACHE is not None:
+        return _ROOTS_CACHE
+
     from .config import load_paths
 
     cfg = load_paths()
@@ -145,6 +152,7 @@ def _default_roots() -> list[str]:
             if s not in seen and is_checkout(cand):
                 out.append(s)
                 seen.add(s)
+    _ROOTS_CACHE = out
     return out
 
 
@@ -206,7 +214,8 @@ def resolve_gsd(number: str, *, roots: list[str] | None = None) -> dict:
     }
 
 
-def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = None) -> dict:
+def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = None,
+            rows: list[dict] | None = None) -> dict:
     """`ref` may be a task name, a numeric id, or a submissions URL."""
     ref = (ref or "").strip()
     if not ref:
@@ -219,7 +228,7 @@ def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = No
     m = URL_ID.search(ref)
     wanted_id = m.group(1) if m else (ref if BARE_ID.match(ref) else "")
 
-    rows = _tasks(binary)
+    rows = _tasks(binary) if rows is None else rows
     if wanted_id:
         hit = next((t for t in rows if str(t.get("id")) == wanted_id), None)
         if hit is None:

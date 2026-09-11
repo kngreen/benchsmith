@@ -3731,5 +3731,119 @@ check("...and only lease pushes do",
       False)
 
 
+# --- a fleet run must not re-fetch what it already has ------------------------
+#
+# `fleet --apply` looked like it had started only one worker. It had not stalled:
+# each task cost a fresh 4.3s task-list fetch plus a scan of every checkout on
+# the box, so eight workers took minutes to appear.
+
+_fetches = []
+_saved6 = rv._tasks
+
+
+def _counting_tasks(binary="codimango"):
+    _fetches.append(1)
+    return [{"name": "known-task", "id": "1", "status": "draft",
+             "currentUserIsTaskOwner": True}]
+
+
+try:
+    rv._tasks = _counting_tasks
+    rv.resolve("known-task")
+    check("without rows, resolve fetches", len(_fetches), 1)
+    _rows = _counting_tasks()
+    _fetches.clear()
+    for _ in range(5):
+        rv.resolve("known-task", rows=_rows)
+    check("with rows supplied, it fetches nothing", len(_fetches), 0)
+    check("...and still resolves correctly",
+          rv.resolve("known-task", rows=_rows)["task"], "known-task")
+finally:
+    rv._tasks = _saved6
+
+# The checkout scan is the same answer all run and stats every directory.
+rv._ROOTS_CACHE = None
+_r1 = rv._default_roots()
+check("the root scan is cached within a process", rv._ROOTS_CACHE is not None, True)
+check("...and returns the same answer", rv._default_roots(), _r1)
+
+# Progress must be visible: a supervisor staring at one agent for ten minutes
+# cannot tell slow from stuck.
+_clisrc = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text()
+check("fleet reports progress per task", "claiming and preparing" in _clisrc, True)
+check("...on stderr, so it streams past the JSON result",
+      "file=sys.stderr, flush=True" in _clisrc, True)
+
+
+# --- the lease must not cost a round trip per task ----------------------------
+#
+# Adding a remote claim put a network call in front of every dispatch, and the
+# run timed out before a single worker started: "worker dispatch hit a remote
+# lease push timeout before any agent was created."
+
+_lsr = []
+
+
+def _batch_git(out):
+    def run(argv):
+        _lsr.append(argv)
+        class R:
+            returncode = 0
+            stdout = out
+            stderr = ""
+        return R
+    return run
+
+
+import subprocess as _sp4  # noqa: E402
+
+_saved_run = _sp4.run
+try:
+    _sp4.run = lambda *a, **k: type("R", (), {
+        "returncode": 0,
+        "stdout": ("aaa\trefs/heads/benchsmith-locks/one\n"
+                   "bbb\trefs/heads/benchsmith-locks/two\n"),
+        "stderr": ""})()
+    _st5 = rl.states("/tmp")
+    check("one call returns every held lease", _st5, {"one": "aaa", "two": "bbb"})
+finally:
+    _sp4.run = _saved_run
+
+# A caller that already knows the ref state must not look it up again.
+_probe = []
+
+
+def _no_lsremote(args):
+    _probe.append(args[0])
+    class R:
+        returncode = 0
+        stdout = "treeish" if args[0] in ("rev-parse", "commit-tree") else ""
+        stderr = ""
+    return R
+
+
+_l2 = rl.RemoteLease("free-task", "/tmp", runner=_no_lsremote, known="")
+_l2.acquire()
+check("a known-free lease skips its own ls-remote", "ls-remote" in _probe, False)
+
+# A hanging push looks exactly like an empty backlog from the outside.
+def _hang_git(args):
+    raise _sp4.TimeoutExpired(args, 1)
+
+
+try:
+    rl.RemoteLease("t", "/tmp", runner=None, timeout=1)._git("ls-remote")
+    _timed_out = False
+except Exception:
+    _timed_out = True
+check("the lease has a bounded timeout", rl.RemoteLease("t", "/tmp").timeout <= 120, True)
+
+# An interrupted run must still have recorded what it started.
+check("the run file is written after every worker, not at the end",
+      _clisrc.count("def _persist()") == 1 and "_persist()" in _clisrc, True)
+check("claims that never dispatched are released",
+      "releasedUnused" in _clisrc, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

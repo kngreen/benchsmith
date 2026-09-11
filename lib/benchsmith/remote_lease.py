@@ -36,6 +36,24 @@ SAFE = re.compile(r"[A-Za-z0-9._-]+")
 TTL_SECONDS = 4 * 3600
 
 
+# One round trip answers for every task. Asking per task turned an already slow
+# dispatch loop into one that timed out before a single worker started.
+def states(repo, *, remote: str = "origin", timeout: int = 60) -> dict:
+    """Every held lease in this repository, task -> sha, in one ls-remote."""
+    p = subprocess.run(
+        ["git", "-C", str(repo), "ls-remote", "--heads", remote, "refs/heads/benchsmith-locks/*"],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if p.returncode:
+        raise LeaseLost(f"could not read the lease refs: {p.stderr.strip()[:160]}")
+    out = {}
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].startswith("refs/heads/benchsmith-locks/"):
+            out[parts[1].rsplit("/", 1)[1]] = parts[0]
+    return out
+
+
 class LeaseLost(Exception):
     """The claim is not held. The message says what happened to it."""
 
@@ -102,12 +120,16 @@ def parse_owner(message: str) -> Owner:
 
 class RemoteLease:
     def __init__(self, task: str, repo, *, remote: str = "origin", ttl: int = TTL_SECONDS,
-                 runner=None):
+                 runner=None, timeout: int = 60, known: str | None = None):
         if not SAFE.fullmatch(task or ""):
             raise LeaseLost(f"task name is not safe for a remote ref: {task!r}")
         self.task, self.repo, self.remote, self.ttl = task, str(repo), remote, ttl
         self.ref = REF.format(task=task)
         self.sha = ""
+        self.timeout = timeout
+        # A sha the caller already fetched in a batch, so acquire() need not
+        # make its own round trip just to discover the ref is free.
+        self._known = known
         self._run = runner
 
     # A lease ref is not a task publication, and the repos' pre-push hook does
@@ -125,8 +147,17 @@ class RemoteLease:
     def _git(self, *args, check: bool = False) -> subprocess.CompletedProcess:
         if self._run is not None:
             return self._run(list(args))
-        p = subprocess.run(["git", "-C", self.repo, *args],
-                           capture_output=True, text=True, timeout=180)
+        try:
+            p = subprocess.run(["git", "-C", self.repo, *args],
+                               capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired as e:
+            # Named rather than raised as a bare timeout: a lease push that
+            # hangs looks exactly like an empty backlog from the outside.
+            raise LeaseLost(
+                f"git {args[0]} against {self.remote} exceeded {self.timeout}s. The remote lease "
+                "cannot be taken, so no worker starts. Check the remote, or pass "
+                "--no-remote-lease if this repository has no shared one."
+            ) from e
         if check and p.returncode:
             raise LeaseLost((p.stderr or p.stdout).strip()[:200])
         return p
@@ -152,7 +183,7 @@ class RemoteLease:
 
     def acquire(self) -> dict:
         """Claim the task, or say who holds it."""
-        held = self.remote_sha()
+        held = self._known if self._known is not None else self.remote_sha()
         if held:
             who = self.owner(held)
             if who.mine or who.holder_is_gone:
