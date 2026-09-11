@@ -1065,6 +1065,7 @@ with tempfile.TemporaryDirectory() as td:
         (["backoff", "--repo", str(repo), "--task", "mytask"], {0}),
         (["mutate", "--repo", str(repo), "--task", "mytask"], {0, 1}),
         (["passatk", str(payload)], {0, 1}),
+        (["reconcile", "--repo", str(repo)], {0, 1}),
     ]
     for argv, ok in invocations:
         try:
@@ -1541,6 +1542,203 @@ check("a saturated model under test blocks",
       any("saturated" in b for b in _sat["blocking"]), True)
 check("an unknown agent is excluded, not pooled",
       any("unknown agent" in n for n in pk.measure([_R("gpt-9", True)], "b")["notes"]), True)
+
+
+# --- discovery: where the backlog comes from ---------------------------------
+
+from benchsmith import sources as src  # noqa: E402
+from benchsmith.queue import TIER_GSD_REVIEW, TIER_GSD_SCAFFOLD, TIER_IDEA  # noqa: E402
+
+_rows = [
+    {"name": "a", "status": "draft", "validationStatus": "failed"},
+    {"name": "b", "status": "needs_revision"},
+    {"name": "c", "status": "accepted"},
+    {"name": "d", "status": "used_in_training"},
+    {"name": "e", "status": "being_reviewed"},
+    {"name": "f", "status": "needs_reviewers_assigned"},
+    {"name": "g", "status": "brand_new_status"},
+]
+_keep, _notes = src.normalise_codimango(_rows)
+check("only actionable statuses are queued", sorted(r["name"] for r in _keep), ["a", "b"])
+# Only the unrecognised status earns a note; the known-terminal ones are
+# dropped quietly because nothing about them needs a decision.
+check("only unrecognised statuses produce notes",
+      sorted(n.split(":")[0] for n in _notes), ["g"])
+# A status we have never seen must surface, not vanish: silently dropping it is
+# how a whole class of work disappears from the backlog.
+check("an unrecognised status is reported", any("brand_new_status" in n for n in _notes), True)
+
+_gsd = [
+    {"number": "T1", "title": "Fix the widget", "progress": "Task needs review"},
+    {"number": "T2", "title": "Scaffold me", "progress": "Task is ready to scaffold"},
+    {"number": "T3", "title": "Some idea", "progress": "Task ideas (auto-generated)"},
+    {"number": "T4", "title": "Unmapped column", "progress": "Something Else"},
+]
+_items, _ = src.normalise_gsd(_gsd)
+check("board columns map to kinds", [i["kind"] for i in _items],
+      ["gsd_review", "gsd_scaffold", "idea", "idea"])
+
+# There is no link field, so duplicates can only be guessed -- and a guess must
+# not delete work.
+_dup, _dn = src.normalise_gsd(
+    [{"number": "T9", "title": "ollo scholar paused enforcement rework"}],
+    known_tasks=["ollo-scholar-paused-enforcement"])
+check("a probable duplicate is flagged", "duplicateOf" in _dup[0], True)
+check("...and kept, not dropped", len(_dup), 1)
+check("...and explained", any("flagged, not dropped" in n for n in _dn), True)
+check("an unrelated card is not called a duplicate",
+      "duplicateOf" in src.normalise_gsd([{"number": "T8", "title": "Totally other thing"}],
+                                         known_tasks=["ollo-scholar-paused-enforcement"])[0][0],
+      False)
+
+# Board cards sort below every platform task: a card claims work exists, a row
+# demonstrates it.
+_q = build_queue(_keep, ideas=[{"name": "T1", "kind": "gsd_review", "title": "x"},
+                               {"name": "T3", "kind": "idea", "title": "y"}])
+check("gsd tiers sort below drafts", [i.tier for i in _q],
+      [10, 20, TIER_GSD_REVIEW, TIER_IDEA])
+check("a flagged duplicate is not dispatchable",
+      build_queue([], ideas=[{"name": "T9", "kind": "idea", "duplicateOf": "z"}])[0].dispatchable,
+      False)
+
+# A response we failed to parse is unknown, not empty -- "no tasks" for a full
+# backlog is the worst possible answer here.
+_none, _nn = src.fetch_codimango(binary="definitely-not-a-binary")
+check("a failed fetch reports empty with a reason", (_none, bool(_nn)), ([], True))
+
+
+# --- required NOT_RUN blocks --------------------------------------------------
+#
+# "NOT_RUN is never a pass" was stated everywhere and enforced nowhere: a check
+# that did not run cleared the gate exactly like one that passed. That made every
+# other gate optional, because arranging for a check not to run was enough.
+
+_rr = gate_mod.Report()
+_rr.add("oracle", gate_mod.NOT_RUN, "no oracle command resolved")
+check("an unrequired NOT_RUN still clears", _rr.ok, True)
+_rr.require(["oracle"])
+check("a required NOT_RUN blocks", _rr.ok, False)
+check("...and is named in the report", _rr.as_dict()["blockedByNotRun"], ["oracle"])
+
+_rp = gate_mod.Report()
+_rp.add("oracle", gate_mod.PASS, "reward 1.0")
+_rp.require(["oracle"])
+check("requiring a check that passed changes nothing", _rp.ok, True)
+
+# A required check that produced no entry at all is the strongest not-run.
+_rm = gate_mod.Report()
+_rm.add("scope", gate_mod.PASS, "1 path")
+_rm.require(["oracle"])
+check("a required check that never reported blocks", _rm.ok, False)
+check("...and appears as a NOT_RUN entry",
+      [c.state for c in _rm.checks if c.name == "oracle"], [gate_mod.NOT_RUN])
+
+check("the push-required set names the oracle", "oracle" in gate_mod.PUSH_REQUIRED, True)
+check("the push-required set names scope", "scope" in gate_mod.PUSH_REQUIRED, True)
+
+# The hook is the push boundary, so the required set has to be applied there --
+# a flag nothing passes protects nothing.
+_hook_src = Path(gate_mod.__file__).read_text()
+check("the installed hook applies the push-required set",
+      "--require-push-set" in _hook_src, True)
+
+
+# --- stage 4: one publisher per repository -----------------------------------
+
+from benchsmith import publish as pub  # noqa: E402
+
+_pr = Path(tempfile.mkdtemp()) / "pubrepo"
+_pr.mkdir(parents=True)
+_lane = pub.Lane(_pr, run_id="r1")
+
+check("the lane starts free", _lane.holder(), None)
+check("a task can claim it", _lane.acquire("t1"), True)
+check("a second task cannot", _lane.acquire("t2"), False)
+check("the same task is re-entrant", _lane.acquire("t1"), True)
+# Releasing somebody else's lane would let two publishers coexist, which is the
+# one thing this file exists to prevent.
+_lane.release("t2")
+check("a stranger cannot release it", _lane.holder() is not None, True)
+_lane.release("t1")
+check("the owner can", _lane.holder(), None)
+
+_expired = pub.Lane(_pr, ttl=0)
+_expired.acquire("t1")
+check("an expired lane is reapable", pub.Lane(_pr, ttl=0).acquire("t2"), True)
+pub.Lane(_pr, ttl=0).release("t2")
+
+check("the idempotency key is stable across restarts",
+      pub.Lane(_pr, run_id="r1").key("t1", "abc"), pub.Lane(_pr, run_id="r1").key("t1", "abc"))
+check("...and distinguishes commits",
+      pub.Lane(_pr, run_id="r1").key("t1", "abc") != pub.Lane(_pr, run_id="r1").key("t1", "def"),
+      True)
+
+# --- reconciliation: the question a crash leaves behind ---
+def _fake_remote(head):
+    def g(repo, *args, **kw):
+        class R:
+            returncode = 0
+            stdout = f"{head}\trefs/heads/main"
+            stderr = ""
+        return R()
+    return g
+
+
+def _dead_remote():
+    def g(repo, *args, **kw):
+        class R:
+            returncode = 128
+            stdout = ""
+            stderr = "Could not read from remote repository"
+        return R()
+    return g
+
+
+check("no intent means nothing to reconcile", _lane.reconcile(_pr)["state"], "clean")
+_lane.record_intent(pub.Intent("t1", "b" * 40, "c" * 40, "origin", "main", "k", 0.0))
+check("remote at our commit means it landed",
+      _lane.reconcile(_pr, git=_fake_remote("c" * 40))["state"], pub.LANDED)
+check("remote at our base means it did not",
+      _lane.reconcile(_pr, git=_fake_remote("b" * 40))["state"], pub.NOT_LANDED)
+check("remote somewhere else means someone published",
+      _lane.reconcile(_pr, git=_fake_remote("f" * 40))["state"], pub.DIVERGED)
+# Not knowing is not the same as not landed; conflating them double-pushes.
+check("an unreachable remote is unknown, never not-landed",
+      _lane.reconcile(_pr, git=_dead_remote())["state"], pub.UNKNOWN)
+_lane.clear_intent()
+
+# --- publish refusals ---
+_ok = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
+       "gate_receipt": "sha256:deadbeef"}
+for label, h in [
+    ("a handoff that is not ready", {**_ok, "state": "blocked"}),
+    ("no commit_sha", {**_ok, "commit_sha": ""}),
+    ("no gate receipt — an ungated commit", {**_ok, "gate_receipt": ""}),
+]:
+    try:
+        pub.publish(_pr, "t1", h, git=_fake_remote("b" * 40))
+        check(f"publish refuses: {label}", "published", "refused")
+    except pub.PublishRefused:
+        check(f"publish refuses: {label}", True, True)
+
+_plan = pub.publish(_pr, "t1", _ok, git=_fake_remote("b" * 40))
+check("planning does not push", _plan["applied"], False)
+check("...and the lane is free afterwards", pub.Lane(_pr).holder(), None)
+check("...and no intent was left behind", pub.Lane(_pr).pending(), None)
+
+try:
+    pub.publish(_pr, "t1", _ok, git=_fake_remote("9" * 40))
+    check("publish refuses a moved remote", "published", "refused")
+except pub.PublishRefused as e:
+    check("publish refuses a moved remote", "rebase and re-gate" in str(e), True)
+
+_busy = pub.Lane(_pr); _busy.acquire("other-task")
+try:
+    pub.publish(_pr, "t1", _ok, git=_fake_remote("b" * 40))
+    check("publish refuses while the lane is held", "published", "refused")
+except pub.PublishRefused as e:
+    check("publish refuses while the lane is held", "one publisher per repository" in str(e), True)
+_busy.release("other-task")
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

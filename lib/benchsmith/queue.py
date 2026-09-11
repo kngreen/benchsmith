@@ -25,13 +25,22 @@ TIER_REVISION = 10       # a human named the defect
 TIER_DRAFT_FAILED = 20   # broken, and the evidence is already on the SHA
 TIER_DRAFT_PENDING = 30  # needs a round before anything is knowable
 TIER_DRAFT_PASSING = 40  # green but unaccepted; usually a difficulty question
-TIER_IDEA = 50           # most expensive: intake, screen, scaffold
+TIER_GSD_REVIEW = 50     # a board card someone asked to have looked at
+TIER_GSD_SCAFFOLD = 60   # screened, not yet a task tree
+TIER_IDEA = 70           # most expensive: intake, screen, scaffold
+
+# Board cards sort below every Codimango task on purpose. A card is a claim that
+# work exists; a platform row is work that demonstrably exists.
+GSD_TIERS = {"gsd_review": TIER_GSD_REVIEW, "gsd_scaffold": TIER_GSD_SCAFFOLD,
+             "idea": TIER_IDEA}
 
 TIER_NAMES = {
     TIER_REVISION: "needs_revision",
     TIER_DRAFT_FAILED: "draft/validation-failed",
     TIER_DRAFT_PENDING: "draft/validation-pending",
     TIER_DRAFT_PASSING: "draft/validation-passing",
+    TIER_GSD_REVIEW: "gsd/needs-review",
+    TIER_GSD_SCAFFOLD: "gsd/ready-to-scaffold",
     TIER_IDEA: "idea",
 }
 
@@ -138,11 +147,18 @@ def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
         name = str(idea.get("name") or idea.get("id") or "")
         if not name:
             continue
-        # Deduplicate against a linked Codimango task before dispatching.
         if any(i.task == name for i in items) or name in journals:
             continue
-        items.append(Item(task=name, tier=TIER_IDEA, reason="unscaffolded idea",
-                          claimed_by=leases.get(name)))
+        tier = GSD_TIERS.get(str(idea.get("kind") or "idea"), TIER_IDEA)
+        item = Item(task=name, tier=tier,
+                    reason=str(idea.get("title") or "")[:80] or "unscaffolded idea",
+                    claimed_by=leases.get(name))
+        # A suspected duplicate is queued and marked, never dropped. There is no
+        # link field between a board card and a platform task, so the match is a
+        # guess -- and a wrong guess that deletes loses real work silently.
+        if idea.get("duplicateOf"):
+            item.skip = f"probably duplicates {idea['duplicateOf']}; confirm before dispatch"
+        items.append(item)
 
     # Stable and total: tier, then name. Never insertion order -- a coordinator
     # that restarts must compute the identical plan.

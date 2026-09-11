@@ -21,6 +21,8 @@ from . import coverage
 from . import dispatch as dispatch_mod
 from . import mutate as mutate_mod
 from . import passatk as passatk_mod
+from . import publish as publish_mod
+from . import sources
 from . import stats as stats_mod
 from .queue import Leases, build_queue, read_journals
 from .adapter import Identity, Platform, Unresolved, discover
@@ -159,6 +161,8 @@ def cmd_gate(args) -> int:
         task_name=args.task,
         measured=args.measured,
         oracle_cmd=args.oracle.split() if args.oracle else None,
+        require=(gate_mod.PUSH_REQUIRED if args.require_push_set
+                 else tuple(x for x in (args.require or "").split(",") if x)),
     )
     receipt = gate_mod.write_receipt(repo, args.task, report) if report.ok else None
     if args.json:
@@ -173,7 +177,11 @@ def cmd_gate(args) -> int:
 def cmd_queue(args) -> int:
     """Read-only prioritised backlog. Mutates nothing."""
     repo = Path(args.repo).resolve()
-    raw = json.loads(Path(args.input).read_text()) if args.input else {}
+    if args.fetch:
+        raw = sources.discover(gsd_owner=args.gsd_owner, gsd_tags=args.gsd_tags,
+                               with_gsd=not args.no_gsd)
+    else:
+        raw = json.loads(Path(args.input).read_text()) if args.input else {}
     tasks = raw.get("tasks") if isinstance(raw, dict) else raw
     items = build_queue(
         tasks or [],
@@ -185,6 +193,7 @@ def cmd_queue(args) -> int:
     payload = {
         "total": len(items),
         "dispatchable": len(ready),
+        "notes": raw.get("notes") if isinstance(raw, dict) else [],
         "next": [i.as_dict() for i in ready[: args.workers]],
         "queue": [i.as_dict() for i in items],
     }
@@ -262,6 +271,30 @@ def cmd_passatk(args) -> int:
     return 0 if res["ok"] else 1
 
 
+def cmd_publish(args) -> int:
+    """The single publication lane. Plans unless --apply."""
+    repo = Path(args.repo).resolve()
+    handoff = json.loads(Path(args.handoff).read_text()) if args.handoff else json.load(sys.stdin)
+    lane = publish_mod.Lane(repo, run_id=args.run_id)
+    try:
+        _out(publish_mod.publish(repo, args.task, handoff, remote=args.remote,
+                                 branch=args.branch, lane=lane, apply=args.apply))
+    except publish_mod.PublishRefused as e:
+        _out({"ok": False, "reason": str(e)})
+        return 2
+    return 0
+
+
+def cmd_reconcile(args) -> int:
+    """After a crash: did the pending push land?"""
+    repo = Path(args.repo).resolve()
+    res = publish_mod.Lane(repo, run_id=args.run_id).reconcile(repo)
+    _out(res)
+    # `unknown` must not read as success -- a caller that retries on 0 would
+    # double-push exactly when it is least able to tell.
+    return 0 if res["state"] in ("clean", publish_mod.NOT_LANDED, publish_mod.LANDED) else 1
+
+
 def cmd_hash(args) -> int:
     _out(surface_hashes(Path(args.repo) / args.task))
     return 0
@@ -335,11 +368,20 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--json", action="store_true")
     s.add_argument("--verify-receipt", action="store_true",
                    help="check an existing receipt against the exact clean HEAD")
+    s.add_argument("--require", default="",
+                   help="comma-separated checks whose NOT_RUN must block")
+    s.add_argument("--require-push-set", action="store_true",
+                   help=f"require the push-critical set: {','.join(gate_mod.PUSH_REQUIRED)}")
     s.set_defaults(fn=cmd_gate)
 
     s = sub.add_parser("queue", help="read-only prioritised backlog")
     s.add_argument("--repo", default=".")
     s.add_argument("--input", default="", help="tasks payload JSON (from `read`/`tasks list`)")
+    s.add_argument("--fetch", action="store_true",
+                   help="discover work from codimango and GSD instead of --input")
+    s.add_argument("--gsd-owner", default="", help="GSD owner (default: you)")
+    s.add_argument("--gsd-tags", default="", help="comma-separated GSD tags to scope the board")
+    s.add_argument("--no-gsd", action="store_true", help="codimango only")
     s.add_argument("--workers", type=int, default=3)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_queue)
@@ -379,6 +421,19 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("input", nargs="?", default="-")
     s.add_argument("--k", type=int, default=1)
     s.set_defaults(fn=cmd_passatk)
+
+    s = common(sub.add_parser("publish", help="the single publication lane for this repository"))
+    s.add_argument("--handoff", default="", help="worker handoff JSON (default: stdin)")
+    s.add_argument("--remote", default="origin")
+    s.add_argument("--branch", default="main")
+    s.add_argument("--run-id", default="")
+    s.add_argument("--apply", action="store_true", help="actually push")
+    s.set_defaults(fn=cmd_publish)
+
+    s = sub.add_parser("reconcile", help="after a crash: did the pending push land?")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--run-id", default="")
+    s.set_defaults(fn=cmd_reconcile)
 
     s = common(sub.add_parser("hash", help="graded and visible surface hashes"))
     s.set_defaults(fn=cmd_hash)

@@ -27,18 +27,31 @@ TEAM_TAG_PREFIX = "aai-labs-"
 PASS, FAIL, NOT_RUN = "PASS", "FAIL", "NOT_RUN"
 
 
+# Checks whose absence makes a push unsafe rather than merely unmeasured. These
+# are the ones where NOT_RUN and FAIL have the same consequence: you do not know
+# the thing you would have to know in order to push.
+PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags")
+
+
 @dataclass
 class Check:
     name: str
     state: str
     detail: str = ""
     blocking: bool = True
+    required: bool = False
 
     @property
     def blocks(self) -> bool:
-        # NOT_RUN does not block on its own, but it never clears a box either:
-        # it is reported, and a terminal claim that depends on it is not available.
-        return self.blocking and self.state == FAIL
+        # NOT_RUN does not block on its own -- at scaffold time half these checks
+        # legitimately cannot run yet. But a check marked REQUIRED that did not
+        # run does block, because at that point "we did not measure it" and "it
+        # failed" have the same consequence. Without this, every gate the loop
+        # depends on is skippable by arranging for it not to run, which is the
+        # one hole that makes all the others optional.
+        if self.blocking and self.state == FAIL:
+            return True
+        return bool(self.required and self.state == NOT_RUN)
 
 
 @dataclass
@@ -47,6 +60,19 @@ class Report:
 
     def add(self, *a, **kw) -> None:
         self.checks.append(Check(*a, **kw))
+
+    def require(self, names) -> None:
+        """Mark checks whose NOT_RUN must block. Names that ran are unaffected."""
+        wanted = set(names or ())
+        for c in self.checks:
+            if c.name in wanted:
+                c.required = True
+        missing = wanted - {c.name for c in self.checks}
+        for name in sorted(missing):
+            # A required check that produced no entry at all is the strongest
+            # form of not-run: it did not even get as far as reporting.
+            self.checks.append(Check(name, NOT_RUN, "required, but the check never ran",
+                                     required=True))
 
     @property
     def ok(self) -> bool:
@@ -57,6 +83,8 @@ class Report:
             "ok": self.ok,
             "checks": [c.__dict__ for c in self.checks],
             "notRun": [c.name for c in self.checks if c.state == NOT_RUN],
+            "blockedByNotRun": [c.name for c in self.checks
+                                if c.required and c.state == NOT_RUN],
         }
 
     def render(self) -> str:
@@ -436,6 +464,7 @@ def run(
     task_name: str,
     measured: str | None = None,
     oracle_cmd: list[str] | None = None,
+    require: tuple[str, ...] | None = None,
 ) -> Report:
     report = Report()
     journal = Journal.open(Path(repo_root), task_name)
@@ -454,6 +483,8 @@ def run(
     check_oracle(oracle_cmd, report)
     h = surface_hashes(task_dir)
     report.add("graded-hash", PASS, f"{h['gradedHash']} ({h['gradedFiles']} files)", blocking=False)
+    if require:
+        report.require(require)
     return report
 
 
@@ -567,7 +598,8 @@ PRE_PUSH = """#!/bin/sh
 # benchsmith pre-push gate. Never bypass with --no-verify.
 set -eu
 exec python3 "$BENCHSMITH_BIN" gate --repo "$(git rev-parse --show-toplevel)" \\
-     --task "${BENCHSMITH_TASK:?set BENCHSMITH_TASK to the task directory name}"
+     --task "${BENCHSMITH_TASK:?set BENCHSMITH_TASK to the task directory name}" \\
+     --require-push-set
 """
 
 

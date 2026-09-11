@@ -71,6 +71,14 @@ benchsmith probe                      # resolve the CLI surface; never hardcode 
 benchsmith install-hooks --repo .     # pre-push gate, into the hooks dir the repo already uses
 ```
 
+**A required check that did not run blocks the push.** `benchsmith gate --require-push-set` (which
+the installed pre-push hook passes) makes `NOT_RUN` blocking for `oracle`, `scope`,
+`config-integrity` and `tags`. Elsewhere `NOT_RUN` is reported but does not block, because at
+scaffold time half these checks legitimately cannot run yet. At the push boundary the two states
+have the same consequence: you do not know the thing you would need to know in order to push.
+Without this, arranging for a check *not to run* was enough to skip it — which made every other
+gate optional.
+
 **Run preflight first, every session.** Composed skills that are absent must fail loudly: a
 field run spent nine rounds improvising the mechanics by hand because nothing said they were
 missing. Preflight names each dependency, what it is used for, and exactly what degrades
@@ -824,10 +832,16 @@ it when the ask is "work the backlog", not "loop this task".
 handoff, and publishes. The moment it starts editing a task itself it has stopped supervising, and
 the other N-1 items stall behind it.
 
-### Ordering
+### Finding the work
 
-`benchsmith queue --root <dir>` is a pure function of the journals on disk — same inputs, same
-order, every time. Tiers, most urgent first:
+```bash
+benchsmith queue --repo . --fetch --json          # discover from codimango + GSD
+benchsmith queue --repo . --input payload.json    # or order a payload you already have
+```
+
+`--fetch` reads `codimango api tasks list` and the GSD board; ordering itself stays a pure function
+of that data, so the same inputs always produce the same plan and a restarted coordinator never
+disagrees with itself.
 
 | Tier | Meaning | Why here |
 |---|---|---|
@@ -835,10 +849,23 @@ order, every time. Tiers, most urgent first:
 | 20 | draft, failing | Known-broken and already scaffolded — the shortest path to a submission. |
 | 30 | draft, pending | Work in flight; may need only a read. |
 | 40 | draft, passing | Passing is not the goal. **Too easy is still a defect**, and these need hardening. |
-| 50 | idea | Nothing exists yet. Most expensive, least certain. |
+| 50 | GSD, needs review | A board card someone asked to have looked at. |
+| 60 | GSD, ready to scaffold | Screened, but not yet a task tree. |
+| 70 | idea | Nothing exists yet. Most expensive, least certain. |
 
-A journal that cannot be read is **flagged, never skipped silently** — an unreadable ledger is an
-unknown item, not an absent one.
+**Board cards sort below every platform task.** A card is a claim that work exists; a platform row
+is work that demonstrably exists.
+
+Three things are surfaced rather than swallowed:
+
+- A journal that cannot be read is **flagged, never skipped** — an unreadable ledger is an unknown
+  item, not an absent one.
+- A platform status the queue does not recognise is **reported**, not dropped. Silently ignoring a
+  new status is how a whole class of work disappears from the backlog.
+- There is **no link field between a GSD card and a Codimango task**, so a duplicate can only be
+  guessed from the wording. A suspected duplicate is queued and marked non-dispatchable, never
+  deleted: a wrong guess that deletes loses real work silently, while a wrong guess that keeps
+  costs an idea-tier slot.
 
 ### Dispatch
 
@@ -893,9 +920,37 @@ doing anything. A fresh worker continues the history; it does not restart the ta
 
 ### Publishing
 
-**Workers do not push.** They prepare a commit, run `benchsmith gate`, and stop. Publishing runs
-in one lane, in the supervisor, one repository at a time — N workers racing to push the same
-branch is the contention that makes a fleet slower than a single agent.
+**Workers do not push.** They prepare a commit, run `benchsmith gate`, and stop.
+
+```bash
+benchsmith publish --repo . --task <name> --handoff h.json          # plan
+benchsmith publish --repo . --task <name> --handoff h.json --apply  # push
+benchsmith reconcile --repo .                                        # after a crash
+```
+
+One lane **per repository**, not per task. The platform validates the branch tip, so two loops
+pushing to one repository invalidate each other's evidence and the second push quietly turns the
+first one's measurement into somebody else's.
+
+Publishing refuses unless all of these hold: the handoff says `ready_to_publish`, it carries a
+`commit_sha`, it carries a **`gate_receipt`** (without which the lane's one job — that only gated
+work reaches the remote — was never done), the lane is free, and the remote head still matches the
+base the commit was prepared on. A moved remote means rebase and re-gate; pushing anyway would
+measure a tree nobody gated.
+
+**The intent is written down before the push.** The hard part is not the lock, it is crashing while
+holding it. `benchsmith reconcile` compares the recorded intent against the actual remote head and
+returns one of four answers:
+
+| State | Meaning |
+|---|---|
+| `landed` | the push went through; clear the intent and record the round |
+| `not-landed` | the remote is still at our base; safe to retry |
+| `diverged` | someone else published; rebase and re-gate, the evidence is stale |
+| `unknown` | the remote could not be read |
+
+`unknown` is not `not-landed`, and `reconcile` exits non-zero for it. Conflating the two is exactly
+how a crash becomes a double push.
 
 ## 13. Attribution, levers, and the near-miss question
 
