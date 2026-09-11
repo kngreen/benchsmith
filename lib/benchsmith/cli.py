@@ -29,6 +29,7 @@ from . import dispatch as dispatch_mod
 from . import mutate as mutate_mod
 from . import passatk as passatk_mod
 from . import causal as causal_mod
+from . import remote_lease as rlease_mod
 from . import rerun as rerun_mod
 from . import resolve as resolve_mod
 from . import worktree as wt_mod
@@ -411,6 +412,26 @@ def cmd_fleet(args) -> int:
         name = (info.get("suggestedSlug") or item.task) if mode == "scaffold" else item.task
         # Its own working tree, or eight workers share one index and stage over
         # each other long before anything reaches a remote.
+        # Claim the task across hosts before spending a worker on it. A local
+        # lease says nothing about a second machine, and two hosts repairing one
+        # task interleave their commits on one branch.
+        lease = None
+        if args.apply and not args.no_remote_lease:
+            try:
+                lease = rlease_mod.RemoteLease(item.task, target)
+                got = lease.acquire()
+            except rlease_mod.LeaseLost as e:
+                # Not knowing who holds it is not the same as nobody holding it.
+                plans.append({"task": item.task,
+                              "skipped": f"remote lease unreadable: {e}. Pass --no-remote-lease "
+                                         "if this repository has no shared remote"})
+                continue
+            if not got.get("held"):
+                plans.append({"task": item.task,
+                              "skipped": f"claimed elsewhere: {got.get('reason', '')}",
+                              "owner": got.get("owner")})
+                continue
+
         work_in = target
         if args.apply and not args.shared_tree:
             try:
@@ -427,6 +448,8 @@ def cmd_fleet(args) -> int:
         entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
                  "repo": target, "worktree": work_in if work_in != target else None,
                  "mode": mode}
+        if lease is not None:
+            entry["remoteLease"] = lease.ref
         if mode == "scaffold":
             entry["card"] = info.get("gsd")
             entry["proposedName"] = name
@@ -577,6 +600,38 @@ def cmd_relieve(args) -> int:
         dispatch_mod.snooze(sid)
     _out({**out, "successor": sid, "applied": True,
           "note": "the successor resumes from the journal, not from the old session"})
+    return 0
+
+
+def cmd_lease(args) -> int:
+    """The cross-host claim on a task: show, take, or drop it."""
+    repo = Path(args.repo).resolve()
+    try:
+        lease = rlease_mod.RemoteLease(args.task, repo)
+        if args.action == "show":
+            sha = lease.remote_sha()
+            _out({"ref": lease.ref, "held": bool(sha),
+                  "owner": lease.owner(sha).as_dict() if sha else None})
+        elif args.action == "take":
+            _out({"ref": lease.ref, **lease.acquire()})
+        else:
+            sha = lease.remote_sha()
+            if not sha:
+                _out({"ref": lease.ref, "released": False, "reason": "not held"})
+                return 0
+            who = lease.owner(sha)
+            # A lease taken by an earlier command has a dead PID by now. Only
+            # a live foreign holder is a reason to refuse.
+            if not (who.mine or who.holder_is_gone) and not args.force:
+                _out({"ref": lease.ref, "released": False, "owner": who.as_dict(),
+                      "reason": (f"held by {who.host} pid {who.pid}, which is still running; "
+                                 "pass --force only if you know it is gone")})
+                return 2
+            lease.sha = sha
+            _out({"ref": lease.ref, **lease.release()})
+    except rlease_mod.LeaseLost as e:
+        _out({"ok": False, "reason": str(e)})
+        return 2
     return 0
 
 
@@ -987,6 +1042,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--apply", action="store_true")
     s.set_defaults(fn=cmd_scaffold)
 
+    s = sub.add_parser("lease", help="the cross-host claim on a task")
+    s.add_argument("action", choices=("show", "take", "release"))
+    s.add_argument("--repo", default=".")
+    s.add_argument("--task", required=True)
+    s.add_argument("--force", action="store_true", help="release a lease you do not hold")
+    s.set_defaults(fn=cmd_lease)
+
     s = sub.add_parser("worktree", help="per-task working trees")
     s.add_argument("action", choices=("list", "add", "release"))
     s.add_argument("--repo", default=".")
@@ -1038,6 +1100,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="leave worker sessions in the AgentCloud inbox")
     s.add_argument("--shared-tree", action="store_true",
                    help="run workers in the checkout itself instead of per-task worktrees")
+    s.add_argument("--no-remote-lease", action="store_true",
+                   help="skip the cross-host claim (single host, or no shared remote)")
     s.add_argument("--max-runtime", type=float, default=24.0,
                    help="hours before the run should wind down (recorded, not enforced)")
     s.set_defaults(fn=cmd_fleet)

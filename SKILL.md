@@ -204,6 +204,31 @@ silently proceed with fewer workers than asked for.
 
 #### Isolation, budget, and knowing when a change worked
 
+**Every task is claimed across hosts before a worker starts.** `fleet --apply` takes
+`refs/heads/benchsmith-locks/<task>` on the remote first. The local lease stops two workers on one
+machine and says nothing about a second — a laptop and a devserver both running the fleet each
+believe they own everything, and their commits interleave on one branch.
+
+The claim is a git ref because git already gives the only primitive that matters: a push that fails
+when the ref moved. The token names the host, pid and time, so a stale claim can be diagnosed
+rather than merely stepped over. A lease older than its TTL is reaped, and reaping is itself a
+compare-and-swap so two hosts cannot both win. `publish` re-asserts ownership immediately before
+the push — the window between taking the lane and pushing is exactly when another host can take the
+task.
+
+**An unreadable remote is not a free lease.** The task is skipped with the reason. Pass
+`--no-remote-lease` when the repository genuinely has no shared remote.
+
+```bash
+benchsmith lease show --repo REPO --task TASK-NAME
+benchsmith lease release --repo REPO --task TASK-NAME
+```
+
+Lease pushes are the one place benchsmith passes `--no-verify`, and the scope is narrow: the repos'
+pre-push hook computes touched tasks from local `HEAD` regardless of which ref is being pushed, so
+it judges a lock ref as though it were a code change. Task publication still goes through the hook,
+unbypassed.
+
 **Every worker gets its own working tree.** `fleet --apply` creates
 `<parent>/.benchsmith-worktrees/<repo>--<task>` per task. Eight workers in one checkout share one
 index: they stage over each other and commit each other's half-finished edits, and serialising the

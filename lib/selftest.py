@@ -3700,5 +3700,36 @@ check("landscape never fetches submitted task instructions",
       any("instruction" in " ".join(call) for call in _landscape_calls), False)
 
 
+# --- a command-model lease is not a daemon lease -----------------------------
+#
+# benchsmith runs as commands, so the process that took a lease has usually
+# exited by the time another command wants it. A strict PID check made a lease
+# releasable by nobody -- including the person who took it.
+
+import socket as _sock  # noqa: E402
+
+_here = _sock.gethostname()
+_mine = rl.parse_owner(f"uuid=a host={_here} pid={os.getpid()} task=t acquired=9")
+check("this process owns its own lease", _mine.mine, True)
+
+_dead = rl.parse_owner(f"uuid=a host={_here} pid=999999 task=t acquired=9")
+check("a dead process on this host is reclaimable", _dead.holder_is_gone, True)
+check("...but is not 'mine'", _dead.mine, False)
+
+_live = rl.parse_owner(f"uuid=a host={_here} pid={os.getppid()} task=t acquired=9")
+check("a live process on this host is not reclaimable", _live.holder_is_gone, False)
+
+_far = rl.parse_owner("uuid=a host=another-box pid=1 task=t acquired=9")
+check("a foreign host is never reclaimed on PID", _far.holder_is_gone, False)
+check("...because its PIDs mean nothing here", _far.same_host, False)
+
+# The one hook bypass in benchsmith, and its scope.
+_src = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/remote_lease.py").read_text()
+check("lease pushes bypass the repo hook", "--no-verify" in _src, True)
+check("...and only lease pushes do",
+      "--no-verify" in Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/publish.py").read_text(),
+      False)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

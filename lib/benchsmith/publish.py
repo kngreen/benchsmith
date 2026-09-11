@@ -147,7 +147,7 @@ class Lane:
 def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin",
             branch: str = "main", lane: Lane | None = None, apply: bool = False,
             git=_git, check_review: bool = True, rebase: bool = False,
-            allow_review_status: str = "") -> dict:
+            allow_review_status: str = "", remote_lease=None) -> dict:
     """Verify, claim the lane, record the intent, then push exactly once."""
     repo_root = Path(repo_root)
     lane = lane or Lane(repo_root)
@@ -273,6 +273,11 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
         # first check happened before the lane was acquired and before a
         # possible rebase; a task can be accepted in that window.
         _freeze_check("immediately before the push")
+        if remote_lease is not None:
+            # Same rule as the freeze check, for the same reason: the window
+            # between acquiring the lane and pushing is exactly when another
+            # host can take the task.
+            remote_lease.assert_owned()
         lane.record_intent(intent)
         pr = git(repo_root, "push", remote, f"{commit_sha}:refs/heads/{branch}", timeout=600)
         if pr.returncode != 0:
