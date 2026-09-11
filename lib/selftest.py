@@ -4041,6 +4041,10 @@ check("the session title says review",
 _ios = [a for a in dsp.plan("ollo-some-task", str(_revrepo), mode="review",
                             idea={"track": "ios-swe-bench"}).argv if "READ-ONLY" in a][0]
 check("a track with no reviewer is called out", "No canonical reviewer exists" in _ios, True)
+# The doc edit for this feature silently no-oped once; assert it is present.
+_s6 = " ".join(Path("/home/kngreen/.claude/skills/benchsmith/SKILL.md").read_text().split())
+check("the review queue is documented", "benchsmith review-fleet" in _s6, True)
+check("...and reachable from the invocation routing", "Case 1a" in _s6, True)
 check("...and substitution is forbidden", "Do NOT substitute" in _ios, True)
 check("...while the critic still runs", "codimango-review-critic" in _ios, True)
 

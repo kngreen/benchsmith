@@ -62,6 +62,11 @@ writing "you can run…", you have already failed the invocation — run it.
 "Benchsmith is ready, send me a task" is the specific failure to avoid. They either named a task or
 they meant the backlog. Those are the only two cases.
 
+### Case 1a — they said `review` or `reviews`
+
+The other backlog: tasks assigned to **you** to review. `benchsmith review-fleet --apply`. See
+§0b.
+
 ### Case 1 — they gave you something
 
 **You do this work yourself, in this session, start to finish.** Do not dispatch a worker for one
@@ -391,6 +396,30 @@ tested behaviour stays stated in `instruction.md` or inferable from the contract
 base still fails and the reference still passes; correct alternatives still pass; dummy,
 hard-coded, artifact-spoofing and grader-tampering solutions still fail. Never weaken, delete,
 skip or bypass a legitimate test to get a green.
+
+## 0b. Working a review queue
+
+Reviewing is the other half of the job, and it has its own backlog:
+
+```bash
+benchsmith review-fleet --workers 3           # plan
+benchsmith review-fleet --workers 3 --apply   # start reviewers
+```
+
+Ordered by who is blocked: overdue SLA, then due, then assigned with no deadline, then a TBD-clean
+draft worth a look before submission. A task you already sent back is the **author's** move and is
+excluded by name — it belongs in their queue, and showing it in both double-counts the work.
+
+A task whose validation is still pending is held: a review of moving evidence cites numbers that
+change under it.
+
+Each worker runs the canonical track reviewer, then `codimango-review-critic` as the second pass.
+Where a track has **no** canonical reviewer — iOS today — that is reported, never substituted:
+another track's rubric assumes a different task shape and produces confident findings about the
+wrong thing.
+
+**The repository is read-only and the review is never submitted.** A worker drafts every field;
+submitting stays a human decision, exactly as publishing does.
 
 ## 0a. Repairing a revision request
 
