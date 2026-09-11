@@ -3642,6 +3642,63 @@ check("the description says a bare invocation needs no argument",
 check("...and does not describe the skill as one-task-only",
       "Iterate one Codimango benchmark task" in _desc, False)
 
+# The service parses frontmatter with a hand-rolled reader: an unquoted scalar
+# containing double quotes reads as empty, and publish is rejected with
+# "Frontmatter must declare a non-empty string description". A local check
+# beats finding out at publish time.
+check("the description carries no double quotes", chr(34) in _desc, False)
+check("...and is a single line", "\n" in _desc.split("description:", 1)[1], False)
+_val = _desc.split("description:", 1)[1].strip()
+check("...and is non-empty", len(_val) > 40, True)
+
+
+# --- idea landscape is metadata-only and fail-closed -------------------------
+
+from benchsmith import ideas as _ideas  # noqa: E402
+
+_landscape_calls = []
+
+
+def _landscape_run(argv):
+    _landscape_calls.append(argv)
+    if "taxonomy" in argv:
+        return 0, json.dumps({
+            "last_synced_at": "now", "total_tasks": 100,
+            "sub_domains": [
+                {"label": "full", "rag": "green", "gap_pct": 4, "current_pct": 9,
+                 "target_pct": 5},
+                {"label": "gap", "rag": "red", "gap_pct": -4, "current_pct": 1,
+                 "target_pct": 5},
+            ],
+            "use_cases": [], "languages": [], "domains": [],
+        }), ""
+    if argv[:3] == ["/c", "task", "list"]:
+        return 0, json.dumps({
+            "tasks": [{"id": "7", "name": "Stateful Chess Variant", "status": "accepted",
+                       "tags": ["chess", "variant", "state-management"]}],
+            "hasMore": True, "totalExact": False,
+        }), ""
+    if argv[:3] == ["meta", "ideation.idea", "search"]:
+        return 0, json.dumps({"ideas": []}), ""
+    return 1, "", "unexpected command"
+
+
+_landscape = _ideas.landscape(
+    tags=["chess"], seed="chess variant state management", binary="/c",
+    run=_landscape_run,
+)
+check("landscape preserves the human-seed boundary",
+      _landscape["policy"]["seedOrigin"], "human-required")
+check("landscape orders live under-target coverage",
+      _landscape["coverage"]["underTargetSubdomains"][0]["label"], "gap")
+check("landscape labels truncated corpus counts as lower bounds",
+      (_landscape["samples"][0]["count"], _landscape["samples"][0]["complete"]),
+      (">=1", False))
+check("landscape flags a lexical collision for human review",
+      _landscape["seedCheck"]["state"], "REVIEW_REQUIRED")
+check("landscape never fetches submitted task instructions",
+      any("instruction" in " ".join(call) for call in _landscape_calls), False)
+
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

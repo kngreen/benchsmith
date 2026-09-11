@@ -1,6 +1,6 @@
 ---
 name: benchsmith
-description: Run the Codimango benchmark task loop. Invoked with NO argument it is the fleet orchestrator: it discovers the backlog itself and starts workers without being asked which task. Invoked with a task name, id, submissions URL or GSD card it runs that one to a terminal state. Owns the difficulty bar (pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage), the integrity gates, the publish lane and the terminal verdict. Use for "benchsmith", "work the backlog", "loop this task", "harden this task", "is this task hard enough", "why did this round fail".
+description: Run the Codimango benchmark task loop. Invoked with NO argument it is the fleet orchestrator - it discovers the backlog itself and starts workers without being asked which task. Invoked with a task name, numeric id, submissions URL or GSD card it runs that one to a terminal state. Owns the difficulty bar (pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage), the integrity gates, the publish lane and the terminal verdict. Use for benchsmith, work the backlog, loop this task, harden this task, is this task hard enough, or why did this round fail.
 ---
 
 # Benchsmith
