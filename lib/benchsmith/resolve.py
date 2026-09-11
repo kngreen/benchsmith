@@ -22,6 +22,10 @@ from pathlib import Path
 # Statuses where the task is submitted and a reviewer owns it. Iterating now
 # changes the thing they are looking at, and their feedback arrives against a
 # revision that no longer exists.
+# Frozen: the task is finished. Modifying it corrupts shipped data, and there is
+# no override.
+FROZEN = {"accepted", "used_in_training"}
+
 AWAITING_REVIEW = {
     "needs_reviewers_assigned": "submitted; waiting for a reviewer to be assigned",
     "being_reviewed": "a reviewer has it now",

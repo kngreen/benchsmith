@@ -51,7 +51,13 @@ def task_list_argv(binary: str = "codimango") -> tuple[list[str] | None, str]:
         return None, f"{type(e).__name__}: {e}"
     if not surface.tasks_list:
         return None, "the installed CLI exposes no task-list subcommand"
-    return [binary, *surface.site, *surface.tasks_list, "--json"], ""
+    argv = [binary, *surface.site, *surface.tasks_list, "--json"]
+    # Every read that decides what to work on must be uncached. A cached list
+    # shows a task as a draft after a reviewer sent it back, or as ours after it
+    # was submitted -- and the queue acts on both.
+    if surface.supports_no_cache:
+        argv.append("--no-cache")
+    return argv, ""
 
 
 def fetch_codimango(binary: str = "codimango") -> tuple[list[dict], list[str]]:

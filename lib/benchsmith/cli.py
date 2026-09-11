@@ -758,7 +758,8 @@ def cmd_publish(args) -> int:
     try:
         _out(publish_mod.publish(repo, args.task, handoff, remote=args.remote,
                                  branch=args.branch, lane=lane, apply=args.apply,
-                                 rebase=args.rebase))
+                                 rebase=args.rebase,
+                                 allow_review_status=args.allow_review_status))
     except publish_mod.PublishRefused as e:
         _out({"ok": False, "reason": str(e)})
         return 2
@@ -1041,6 +1042,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--branch", default="main")
     s.add_argument("--run-id", default="")
     s.add_argument("--apply", action="store_true", help="actually push")
+    s.add_argument("--allow-review-status", default="",
+                   help="override a review hold; must name the CURRENT status exactly, "
+                        "and never permits a frozen (accepted / training) task")
     s.add_argument("--rebase", action="store_true",
                    help="if the remote moved but this task is untouched, rebase onto it")
     s.set_defaults(fn=cmd_publish)

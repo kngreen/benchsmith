@@ -271,6 +271,11 @@ benchsmith rerun --repo REPO --task TASK-NAME --apply
 
 Editing in response to an infra failure changes the tree, so whatever the platform was hiding is
 now hidden behind a different tree too, and the round that would have told you something is gone.
+**A wave with no progress for 45 minutes is orphaned, not slow.** Request one fresh wave rather
+than waiting indefinitely — but only if there is no deterministic local defect outstanding.
+Re-running the same commit cannot clear one of those, so the rerun burns a wave and returns the
+identical failure. Fix the local thing first, then push.
+
 `rerun` is authorised **only** by an infrastructure classification — `infra`, `not-measured`,
 `platform-stale`. It refuses on a real measurement, because re-running one of those is rerolling
 for a better sample and the numbers it produces are not evidence.
@@ -1111,10 +1116,19 @@ This is not a failure and not convergence — it is a hand-off. Nothing is wrong
 been accepted yet.
 
 Iterating anyway does concrete harm: the reviewer is reading a revision, and a push moves it under
-them. Their findings then cite a commit that no longer exists, and reconciling that costs more than
-the round saved. `benchsmith publish` refuses on a positive read for exactly this reason. When the
-platform cannot be reached it notes the uncertainty rather than blocking — deadlocking every push
-while offline is worse than the risk it prevents.
+them. Their findings then cite a commit that no longer exists.
+
+**`accepted` and `used_in_training` are frozen, and there is no override.** They are finished;
+changing one corrupts data that has already shipped.
+
+**An unreadable status is not permission.** `publish` refuses when it cannot read the status at
+all. A blocked push is recoverable in a minute; a push onto an accepted task is not, and that
+asymmetry decides it. The check runs twice — once before the lane is taken, and again inside it
+immediately before the push, because a task can be accepted in the window between.
+
+To override a *review* hold deliberately, `--allow-review-status` must name the **current** status
+exactly. An override that does not name it does not apply, so it cannot keep granting permission
+after the state moves on. No override unfreezes a frozen task.
 
 **The loop resumes on its own.** If the reviewer asks for changes the status becomes
 `needs_revision`, which is tier 10 — the top of the queue — and `resolve` returns `mode: repair`.

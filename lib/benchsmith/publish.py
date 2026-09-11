@@ -146,7 +146,8 @@ class Lane:
 
 def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin",
             branch: str = "main", lane: Lane | None = None, apply: bool = False,
-            git=_git, check_review: bool = True, rebase: bool = False) -> dict:
+            git=_git, check_review: bool = True, rebase: bool = False,
+            allow_review_status: str = "") -> dict:
     """Verify, claim the lane, record the intent, then push exactly once."""
     repo_root = Path(repo_root)
     lane = lane or Lane(repo_root)
@@ -167,22 +168,46 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
     # and their findings then cite a revision that no longer exists. Refused on
     # a positive read; noted, not blocked, when the platform cannot be reached,
     # because a deadlock on every push while offline is worse than the risk.
-    review_note = ""
-    if check_review:
-        try:
-            from .resolve import Unresolved, resolve as _resolve
+    def _freeze_check(when: str) -> None:
+        """Fail closed. An unreadable status is not permission.
 
+        The earlier version noted the uncertainty and pushed anyway, reasoning
+        that deadlocking while offline was worse. It is not: a blocked push is
+        recoverable in a minute, and a push onto an accepted or training-used
+        task corrupts data that has already shipped. The asymmetry decides it.
+        """
+        if not check_review:
+            return
+        from .resolve import FROZEN, Unresolved, resolve as _resolve
+
+        try:
             info = _resolve(task)
-            if info.get("awaitingReview"):
-                raise PublishRefused(
-                    f"{task} is {info.get('awaitingReason')}. Pushing now changes what the "
-                    "reviewer is looking at. Wait for their verdict; if they asked for changes "
-                    "the status becomes needs_revision and the loop resumes on its own."
-                )
-        except PublishRefused:
-            raise
         except Exception as e:  # noqa: BLE001
-            review_note = f"could not confirm review status: {type(e).__name__}"
+            raise PublishRefused(
+                f"could not read {task}'s status {when} ({type(e).__name__}); refusing to "
+                "publish. An unreadable status is not permission — a blocked push costs a "
+                "minute, a push onto an accepted task cannot be undone."
+            ) from e
+        status = str(info.get("status") or "")
+        if status in FROZEN:
+            raise PublishRefused(
+                f"{task} is {status}: frozen. There is no override — it is finished, and "
+                "changing it now corrupts data that has already shipped."
+            )
+        if info.get("awaitingReview"):
+            # An override must NAME the status it is overriding, so it cannot
+            # silently keep applying after the state moves on.
+            if allow_review_status and allow_review_status == status:
+                return
+            raise PublishRefused(
+                f"{task} is {info.get('awaitingReason')}. Pushing now changes what the reviewer "
+                "is looking at. Wait for their verdict; if they ask for changes the status "
+                f"becomes needs_revision and the loop resumes on its own. To override "
+                f"deliberately, pass allow_review_status={status!r}."
+            )
+
+    _freeze_check("before publishing")
+    review_note = ""
 
     pend = lane.reconcile(repo_root, git=git)
     if pend["state"] in (LANDED, DIVERGED, UNKNOWN):
@@ -244,6 +269,10 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
 
         # Written before the push, so a crash between here and the next line is
         # recoverable rather than ambiguous.
+        # Rechecked here, inside the lane and immediately before the push. The
+        # first check happened before the lane was acquired and before a
+        # possible rebase; a task can be accepted in that window.
+        _freeze_check("immediately before the push")
         lane.record_intent(intent)
         pr = git(repo_root, "push", remote, f"{commit_sha}:refs/heads/{branch}", timeout=600)
         if pr.returncode != 0:

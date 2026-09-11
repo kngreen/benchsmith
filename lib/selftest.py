@@ -1797,12 +1797,12 @@ for label, h in [
     ("no gate receipt — an ungated commit", {**_ok, "gate_receipt": ""}),
 ]:
     try:
-        pub.publish(_pr, "t1", h, git=_fake_remote("b" * 40))
+        pub.publish(_pr, "t1", h, git=_fake_remote("b" * 40), check_review=False)
         check(f"publish refuses: {label}", "published", "refused")
     except pub.PublishRefused:
         check(f"publish refuses: {label}", True, True)
 
-_plan = pub.publish(_pr, "t1", _ok, git=_fake_remote("b" * 40))
+_plan = pub.publish(_pr, "t1", _ok, git=_fake_remote("b" * 40), check_review=False)
 check("planning does not push", _plan["applied"], False)
 check("...and the lane is free afterwards", pub.Lane(_pr).holder(), None)
 check("...and no intent was left behind", pub.Lane(_pr).pending(), None)
@@ -1818,7 +1818,7 @@ except pub.PublishRefused as e:
 
 _busy = pub.Lane(_pr); _busy.acquire("other-task")
 try:
-    pub.publish(_pr, "t1", _ok, git=_fake_remote("b" * 40))
+    pub.publish(_pr, "t1", _ok, git=_fake_remote("b" * 40), check_review=False)
     check("publish refuses while the lane is held", "published", "refused")
 except pub.PublishRefused as e:
     check("publish refuses while the lane is held", "one publisher per repository" in str(e), True)
@@ -2989,21 +2989,27 @@ try:
               "needs_revision" in str(e) and "resumes" in str(e), True)
 
     rv._tasks = lambda binary="codimango": _rows("needs_revision")
-    _ok = pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40))
+    _ok = pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40), check_review=False)
     check("a needs_revision task still publishes", _ok["applied"], False)
 finally:
     rv._tasks = _saved3
 
-# Blocking every push whenever the platform is unreachable is worse than the
-# risk it prevents, so an unreadable status is noted rather than fatal.
+# An unreadable status is NOT permission. This reverses an earlier decision: a
+# blocked push is recoverable in a minute, a push onto an accepted task is not.
 _saved4 = rv._tasks
 try:
     def _boom_tasks(binary="codimango"):
         raise rv.Unresolved("platform unreachable")
     rv._tasks = _boom_tasks
-    _n = pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40))
-    check("an unreadable review status does not deadlock the push", _n["applied"], False)
-    check("...but is reported", bool(_n.get("reviewNote")), True)
+    try:
+        pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40))
+        check("an unreadable status refuses rather than proceeding", "published", "refused")
+    except pub.PublishRefused as e:
+        check("an unreadable status refuses rather than proceeding",
+              "not permission" in str(e), True)
+    check("...and an explicit opt-out still works for callers that know",
+          pub.publish(_pr, "t", _h2, git=_fake_remote("b" * 40),
+                      check_review=False)["applied"], False)
 finally:
     rv._tasks = _saved4
 
@@ -3419,6 +3425,84 @@ def _spy_relieve(argv):
 
 check("a worker can be ended", dsp.relieve("s1", runner=_spy_relieve)["relieved"], True)
 check("...by archiving its session", "archive" in _calls4[-1], True)
+
+
+# --- fail closed on a status we could not read -------------------------------
+#
+# The first version noted the uncertainty and pushed anyway, reasoning that
+# deadlocking while offline was worse. It is not: a blocked push is recoverable
+# in a minute, a push onto an accepted task corrupts data that has shipped.
+
+_hh2 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
+        "gate_receipt": "r"}
+_saved5 = rv._tasks
+
+
+def _status(s):
+    return lambda binary="codimango": [{"name": "t", "id": "1", "status": s,
+                                        "currentUserIsTaskOwner": True}]
+
+
+try:
+    rv._tasks = _status("accepted")
+    try:
+        pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40))
+        check("an accepted task is frozen", "published", "refused")
+    except pub.PublishRefused as e:
+        check("an accepted task is frozen", "no override" in str(e), True)
+    # Not even with an explicit override: frozen means finished.
+    try:
+        pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40), allow_review_status="accepted")
+        check("...and no override unfreezes it", "published", "refused")
+    except pub.PublishRefused:
+        check("...and no override unfreezes it", True, True)
+
+    rv._tasks = _status("used_in_training")
+    try:
+        pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40))
+        check("a training-used task is frozen", "published", "refused")
+    except pub.PublishRefused:
+        check("a training-used task is frozen", True, True)
+
+    def _offline(binary="codimango"):
+        raise rv.Unresolved("platform unreachable")
+
+    rv._tasks = _offline
+    try:
+        pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40))
+        check("an unreadable status refuses the push", "published", "refused")
+    except pub.PublishRefused as e:
+        check("an unreadable status refuses the push", "not permission" in str(e), True)
+
+    # An override must NAME the status, so it cannot keep applying after the
+    # state moves on.
+    rv._tasks = _status("being_reviewed")
+    try:
+        pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40),
+                    allow_review_status="needs_reviewers_assigned")
+        check("an override naming the wrong status does not apply", "published", "refused")
+    except pub.PublishRefused:
+        check("an override naming the wrong status does not apply", True, True)
+    check("an override naming the current status applies",
+          pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40),
+                      allow_review_status="being_reviewed")["applied"], False)
+
+    rv._tasks = _status("draft")
+    check("a draft still publishes",
+          pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40))["applied"], False)
+finally:
+    rv._tasks = _saved5
+
+# --- an orphaned wave is replaced, not waited on ------------------------------
+
+check("a young wave is not orphaned", rr.orphaned(10 * 60)[0], False)
+check("a wave with no progress for 45 minutes is", rr.orphaned(50 * 60)[0], True)
+check("no wave is not an orphan", rr.orphaned(None)[0], False)
+# Re-running the same commit cannot clear a deterministic local defect, so the
+# rerun would burn a wave and return the identical failure.
+check("a local defect is repaired before any rerun",
+      rr.orphaned(50 * 60, local_defect=True)[0], False)
+check("...and says why", "cannot clear it" in rr.orphaned(50 * 60, local_defect=True)[1], True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

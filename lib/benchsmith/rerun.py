@@ -43,6 +43,30 @@ def authorised(last_class: str, *, budget_left: int = 1) -> tuple[bool, str]:
     return True, f"last round was {cls}: the platform failed, not the task"
 
 
+# A wave that has not progressed in this long is orphaned, not slow. Waiting on
+# one indefinitely is how a loop spends a day producing nothing.
+ORPHAN_SECONDS = 45 * 60
+
+
+def orphaned(pending_seconds: float | None, *, local_defect: bool = False) -> tuple[bool, str]:
+    """Should a stuck wave be replaced with a fresh one?
+
+    Not when there is a deterministic local defect outstanding: re-running the
+    same commit cannot clear one, so the rerun would burn a wave and return the
+    identical failure. Fix the local thing first.
+    """
+    if local_defect:
+        return False, ("a deterministic local defect is outstanding; re-running the same commit "
+                       "cannot clear it. Repair that first, then push")
+    if pending_seconds is None:
+        return False, "no pending wave"
+    if pending_seconds < ORPHAN_SECONDS:
+        return False, (f"the wave has been pending {int(pending_seconds / 60)} minutes; "
+                       f"orphaned is {int(ORPHAN_SECONDS / 60)}")
+    return True, (f"the wave has made no progress for {int(pending_seconds / 60)} minutes; "
+                  "request one fresh wave rather than waiting indefinitely")
+
+
 def trigger(task: str, *, binary: str = "codimango", apply: bool = False) -> dict:
     """Ask the platform to validate the same commit again."""
     argv = [binary, "api", "tasks", "rerun", task, "--json"]
