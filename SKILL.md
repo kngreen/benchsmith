@@ -92,6 +92,36 @@ New task: repo, full base SHA, full reference SHA, proposed name, deliberately c
 Ask only for what is actually missing. Never infer the task from the working directory, recent
 files, or another session. Never substitute a different task for the one specified.
 
+### Bind platform identity, not a basename
+
+Resolve and record these once, and address **every** API call by ID:
+
+| | |
+|---|---|
+| `TASK_ID` / `TASK_UUID` | the platform's identity. Every read and every rerun uses this |
+| `TASK_NAME` | the directory basename. Display and paths only — **never a lookup key** |
+| `SOURCE_REPO` | as the task record reports it, not as you assume it |
+| `ACTIVE_SHA` | the full SHA every signal this round must be attributed to |
+
+A directory basename is not unique across repos or across a rename, and resolving by name has
+already returned another task's record. If a name lookup is the only surface available, verify
+the returned `TASK_ID`/`TASK_UUID` against the recorded one before reading a single number off
+it, and treat a mismatch as `not-measured`.
+
+### Pick the target profile at intake
+
+`ASSAY_TARGET` selects the terminal mapping in §10, and it is chosen **before** the first
+measurement so it cannot be relaxed to fit an outcome:
+
+- **`hard-only`** — GREEN — HARD, IMPROVED, or REJECTED — NOT HARD. `GREEN — MEDIUM` does not
+  exist; a measured-medium task is IMPROVED — ABOVE BAND at best. Use this when the commission
+  is hard tasks.
+- **`hard-preferred`** *(default)* — adds GREEN — MEDIUM under §8, after the mandatory hardening
+  attempt.
+
+Record the choice beside the intake hypothesis. Changing it after a measurement is outcome
+selection; changing it before the first push is a decision.
+
 ## 2. Routing
 
 ```
@@ -140,8 +170,11 @@ Ripen STEP S governs. Three additions:
 - Pin the participant environment to the full base SHA; use the reference SHA only to design
   the oracle and tests.
 - Keep the reference solution proportionate. 4,000 lines for a 500-line change is a defect.
-- If behavioural requirements are absent, stop after scaffolding and ask for them. Do not
-  invent them.
+- If behavioural requirements are absent, **delegate the spec to Muse rather than pausing** —
+  brief it from the base repo and the intended behaviour, preserve the prompt and output hashes,
+  and inspect the full diff (§9, `references/authorship.md`). Pausing for a human is the
+  fallback when no behaviour can be described at all, not the default: an unattended run that
+  stops here is a run that produced nothing. Never invent requirements yourself.
 
 ### Tags — set on the first round, before the first push
 
@@ -166,8 +199,12 @@ tags = ["swe-bench-pro", "SWEBench-External", "private_repos_1p", "aai-labs", "a
 ```
 
 **Only `aai-labs` is enforced.** Ripen's gate blocks a push missing `ripen-v1` or `aai-labs` (via
-`labs_scope.sh`) and knows nothing about the rest. Nothing will tell you the team tag is absent —
-add them at scaffold time and check them before every push.
+`labs_scope.sh`) and knows nothing about the rest.
+
+**Gate the full set before the first push, not at the terminal check.** A task that reaches its
+first cloud round untagged is already mis-attributed, and the §5 checklist catches it far too
+late. Run the check in `references/provenance.md` as a pre-push step and treat a missing tag as
+blocking; the durable version is a `bin/` script and a gate row, same argument as §6.
 
 `long-horizon` here is a scope tag and **never** a routing signal — the track comes from the
 platform (§2), not from this list.
@@ -225,6 +262,9 @@ not converged until they hold on the exact final SHA:
 
 Freeze the strongest set **before** outcomes, from the platform designation where one exists,
 otherwise from every configured GPT/Codex and Opus/Claude cohort. Never select it from results.
+Freeze the whole slot plan with it — job IDs, stages, exact model builds, ordinals, step IDs and
+replacement authority (`references/gates.md`). **A planned slot with zero rows is incomplete, not
+absent**; a measurement missing one carries no rate, however green the summary line reads.
 
 Three cohorts of five is a coarse instrument — one flipped trial moves the rate by about 6.7
 points. So:
@@ -353,7 +393,22 @@ member below 0.20. If it fails, record why and **take the next lever off the sla
 re-derivation, no revision of the one that failed.
 
 One lever per *push*; `RIPEN_HARDENING_BUDGET` (default 5) counts pushes, not attempts. **A lever
-that dies at local replay spends nothing.**
+that dies at local replay spends nothing** — nothing was measured, so nothing was spent.
+
+**Two caps run concurrently; the stricter one governs.**
+
+| Cap | Counts | Fires when |
+|---|---|---|
+| Hardening budget | pushed levers | `RIPEN_HARDENING_BUDGET` reached (default 5) |
+| Ineffective-round cap | **measured** corrective rounds | three consecutive rounds move the pooled rate less than one trial-equivalent toward the band |
+
+The second is the tighter one in practice and assay previously omitted it. Three measured rounds
+that do not move `d(p)` by at least `1/N` stop the campaign even with budget left — unless an
+audit of the preceding rounds identifies the root cause and records a *mechanically different*
+correction strategy, not merely a different file or a reworded rationale.
+
+Neither cap counts a locally-rejected lever, and neither counts an `infra`, `not-measured` or
+`platform-stale` round. Both stop at `escalated` with the pack, never `abandoned`.
 
 #### What does not stop the campaign
 
@@ -445,14 +500,33 @@ Ripen's ending is the mechanism; the terminal state is what you report.
 | Ripen status | Terminal state |
 |---|---|
 | `converged`, §5 bar holds at hard | **GREEN — HARD** |
-| `converged`, §8 medium conditions hold | **GREEN — MEDIUM** |
+| `converged`, §8 medium conditions hold | **GREEN — MEDIUM** — *`hard-preferred` only* |
 | `escalated`, materially better calibrated, all other bar items hold | **IMPROVED — ABOVE BAND** / **BELOW BAND** |
 | `escalated`, otherwise | **ESCALATED** — hand over the evidence pack |
 | `abandoned` | **REJECTED — NOT HARD** |
-| `blocked-on-platform` | **BLOCKED — PLATFORM**, naming the stale gate |
+| `blocked-on-platform` | **BLOCKED — PLATFORM**, naming the gate and the evidence below |
+
+Under **`ASSAY_TARGET=hard-only`** (§1) the medium row does not exist: a task that would have
+finalised GREEN — MEDIUM reports **IMPROVED — ABOVE BAND** instead, with its measured
+classification stated plainly. Do not silently upgrade it, and do not switch profile to make it
+fit.
 
 Keep `blocked-on-platform`. A known-stale gate is not a finding, not a clearance and not an
 escalation, and the same blocker has otherwise produced three different endings on three tasks.
+
+**BLOCKED — PLATFORM has three conditions, all required.** One watcher timeout is not one of
+them:
+
+1. a **bounded wait** has expired — deadline and basis recorded, extended once on concrete
+   progress, not a self-chosen short deadline;
+2. every **allowed recovery** is exhausted — the narrowest supported action attempted and
+   recorded, with the capability probe that proves broader scopes unavailable;
+3. either a **durable pending ID** from the control plane (job, request or event) or an
+   **explicit no-recovery confirmation** — a published contract statement or a platform response
+   saying no permitted recovery exists.
+
+Local inference, an elapsed clock, or a command you did not run is never confirmation. Missing
+all three, the honest state is `blocked` on the unresolved term (§11), not a platform verdict.
 
 **REJECTED — NOT HARD has a precondition.** It requires a wrong premise, or a spent hardening
 budget *and* an exhausted slate (§8). A too-easy task with a passing oracle and unspent budget is

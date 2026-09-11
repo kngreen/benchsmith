@@ -3,6 +3,22 @@
 The exact-head contract every flow ends on. §5's difficulty bar is *additional* to this — these
 gates say the task is valid, the bar says it is hard. Both, or it is not done.
 
+## Do not hardcode the CLI
+
+The commands below are the **legacy** `codimango` surface. The installed binary prints a banner
+announcing it is legacy and pointing at a replacement fbcode CLI that keeps the `codimango`
+command and changes the subcommand shape. Treat every literal invocation here as an *example of
+the invariant*, never as the contract.
+
+Resolve the commands once, through ripen's STEP 0 adapter slots (`LOCAL_VALIDATE`,
+`LOCAL_ORACLE`, `CLOUD_STATUS`, `CLOUD_JOBS`), by probing with `command -v` and `--help` — and
+route every collector through them. **An unresolved slot is declared and degraded, never
+substituted with a command you have not run**, and a command that errors is `not_run`, not a
+pass.
+
+What must hold regardless of surface: the read is uncached, it is addressed by `TASK_ID`/
+`TASK_UUID` rather than basename (§1), and every number it returns is attributed to `ACTIVE_SHA`.
+
 ## Read fresh, always
 
 **Every Codimango read carries `--no-cache`.** A cached read after a push is how one commit's
@@ -92,6 +108,50 @@ Every item, on one exact commit, from fresh reads:
 Checks a task format does not have are not applicable — record that, never fabricate them.
 Embedding dedup is informational unless project policy makes it blocking; **contamination is
 not** — assay keeps ripen's rule that `NOT EVALUATED` leaves the box unchecked rather than green.
+
+## The review manifest
+
+A prose claim that "reviews passed" is not auditable and has been wrong. Emit one row per review
+the track requires, and treat a missing row as a missing pass:
+
+| field | meaning |
+|---|---|
+| `review` | canonical name — `tbr`, `agentic-full-task`, the track's `review-task-*`, `codimango-review-critic`, `aai-code-review` where required |
+| `jobId` | the job the verdict came from |
+| `reviewedSha` | the SHA the review actually ran on |
+| `matchesActive` | `reviewedSha == ACTIVE_SHA` |
+| `verdict` | verbatim, not paraphrased |
+| `state` | `completed` / `pending` / `errored` / `absent` |
+| `selection` | `exact-head` or `fallback` — a fallback report is not a pass |
+| `stale` | true when the head moved after the review ran |
+
+The gate passes only when every required row is `state: completed`, `matchesActive: true`,
+`selection: exact-head`, `stale: false`, and a passing `verdict`. Any other combination is the
+**absence** of a verdict, not a weaker one — including `NOT_RUN`, `STALE_COMMIT`, and a review
+selected from an older attempt.
+
+## Freeze the slot plan before results
+
+Capture from configuration, **before the first participant result exists**, and persist it:
+
+- the exact **job IDs** and validation stages that will produce participant rows;
+- **family and exact model build** per cohort, resolved from aliases;
+- **attempts per cohort** and stable **slot ordinals**;
+- stable **step IDs** and their order, plus the mapping from display names and runner
+  boundaries onto them — a renamed label never creates, merges, drops or reorders a step;
+- **replacement authority**: which scopes are available (replay / named slot / cohort / full
+  generation), and that exactly one replacement wave is permitted per SHA.
+
+Then bind actual rows to planned slots by (stage, family, build, step, ordinal). **A planned slot
+with zero rows is incomplete, not absent** — an empty cohort must appear in `runsIncomplete`
+rather than silently shrinking the denominator, and a measurement missing any planned slot
+carries no rate.
+
+**A replacement generation supersedes the original mechanically**, by slot key, not by judgment:
+a cohort retry supersedes every original row in that cohort, a full-generation retry supersedes
+every row in the generation, and superseded rows are diagnostic only — never pooled, never
+counted, never hardness evidence. Original and replacement generations of the same SHA never
+pool with each other.
 
 ## Reward unforgeability — the full closure
 
