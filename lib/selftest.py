@@ -2458,7 +2458,7 @@ check("...and says the surface could not be resolved",
 
 # --- the board is the third source, asked for only when it matters -----------
 
-_skill = Path("/home/kngreen/.claude/skills/benchsmith/SKILL.md").read_text()
+_skill = " ".join(Path("/home/kngreen/.claude/skills/benchsmith/SKILL.md").read_text().split())
 check("the invocation section states the source order",
       "Codimango `needs_revision`" in _skill and "only when 1 and 2 cannot fill" in _skill, True)
 check("the agent is told to announce the picks", "I'm going to start iterating on these" in _skill, True)
@@ -2675,6 +2675,30 @@ finally:
 
 check("scaffold is a dispatchable mode",
       "scaffold" in dsp.plan.__doc__ or True, True)
+
+
+# --- one task is one agent, start to finish ----------------------------------
+#
+# The original loop prompt flowed because a single agent scaffolded, authored,
+# gated and looped in one narrative. Routing a single task through dispatch put
+# a handoff between every phase, and each handoff was somewhere to stop.
+
+# Prose wraps, so a phrase spanning a line break is invisible to a plain
+# substring check. Collapse whitespace before asserting on wording.
+_s2 = " ".join(Path("/home/kngreen/.claude/skills/benchsmith/SKILL.md").read_text().split())
+check("a single task is not dispatched to a worker",
+      "Do not dispatch a worker for one task" in _s2, True)
+check("the idea route continues past scaffolding",
+      "Scaffolding is one phase of the route, not the end of it" in _s2, True)
+check("pre-first-push work needs no platform finding",
+      "you do not need a platform finding to act" in _s2, True)
+# An agent that waits for a measurement on a task that was never pushed waits
+# forever; this is the sentence that prevents it.
+check("...and the deadlock is named", "will wait forever" in _s2, True)
+check("unregistered is stated to be correct, not an error",
+      "That is correct, not an error" in _s2, True)
+check("the track still comes from the platform, never a tag",
+      "Free-text tags never choose a track" in _s2, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

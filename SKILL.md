@@ -28,53 +28,39 @@ they meant the backlog. Those are the only two cases.
 
 ### Case 1 — they gave you something
 
-A task name, a numeric id, or a submissions URL pasted from the browser. Do not parse it yourself:
+**You do this work yourself, in this session, start to finish.** Do not dispatch a worker for one
+task: a worker is for parallelism, and every handoff between one is a place the flow stops. The
+commands below are your tools, not a pipeline you hand to someone else.
 
 ```bash
 benchsmith resolve "<whatever they gave you>"
 ```
 
-It handles a **task** or an **idea**, and the two go different places. Read `kind` and `mode`:
+Read `kind`, then run the whole route without pausing between phases:
 
-| `kind` | What you were given | Route |
-|---|---|---|
-| task | a name, a Codimango id, or a submissions URL | the round, in `repair` or `harden` |
-| idea | a GSD card (`T288273925`) | §3 intake → STEP S scaffold → §4 |
+| `kind` | Route, in one continuous pass |
+|---|---|
+| task | STEP 1 read → §7 classify → fix → STEP 5 gate → push → STEP 7 wait → back to STEP 1 |
+| idea | §3 intake → §2 routing → STEP S scaffold → §4 author → gate → push → then the round, above |
 
-**A GSD card is not a task.** It has no slug, no directory, no oracle and no measurements. Running
-the repair loop on one points a worker at a checkout with nothing in it. The resolver returns
-`needsScaffold: true`, the `track` read off the card, the canonical checkout for that track, and a
-`suggestedSlug` derived from the title.
+**An idea becomes a task and keeps going.** Scaffolding is one phase of the route, not the end of
+it. When intake says GO, scaffold through the flow §2 resolves to, author it until the oracle
+passes and the unchanged base fails, gate it, push it, and then run rounds against it. Do not stop
+and report a new directory; a bare skeleton is not a result.
 
-That slug is a **proposal, and permanent once scaffolded** — say it out loud when you announce, and
-change it if it misdescribes the task. Do not stop to ask for it.
+`benchsmith scaffold <card>` exists for the fleet, where scaffolding is dispatched to a worker. For
+a single invocation, use it without `--apply` to get the resolved card, slug, track and checkout —
+then do the scaffolding yourself.
 
-Intake comes first and **intake can say KILL. That is a successful outcome**, not a failure to
-work around: report it and stop rather than scaffolding something the screen rejected.
+**Before the first push, you do not need a platform finding to act.** Intake, scaffolding,
+instruction preflight and the initial authoring are all authorized on their own. Only *after* the
+first cloud submission does a corrective change require evidence from the exact current SHA. An
+agent that waits for a measurement before authoring a task that has never been pushed will wait
+forever.
 
-```bash
-benchsmith scaffold T288273925 --apply     # card -> task, on this host
-```
-
-**Scaffolding is not the finish line — keep going.** The moment the task exists, resolve it and
-start the round on it in the same session. Do not stop and report a new directory.
-
-```bash
-benchsmith resolve ordering-schema-rollout-consumer
-```
-
-A task scaffolded a minute ago is **`status: unregistered`** — it exists in the checkout and not on
-the platform. That is normal and not an error. It means there are no measurements to read yet: run
-the local gate, author until the oracle passes and the unchanged base fails, then push. The bar
-comes after the first validated round, not before.
-
-`benchsmith scaffold` on a card that is already scaffolded reports `already-scaffolded` and exits
-**zero**, because the thing you wanted — a task the loop can run — exists. Pick it up; do not treat
-it as a failure.
-
-For a task, **start the round immediately** in the `repo` and `mode` returned (`repair` when the
-platform says `needs_revision`, else `harden`). Keep looping rounds in this session until a
-terminal state; do not report after round one and wait.
+A task scaffolded a minute ago resolves as **`status: unregistered`**. That is correct, not an
+error: it exists in the checkout and not on the platform, so there is nothing to measure yet. Run
+the local gate, author, push — the bar applies from the first validated round onward.
 
 Stop only for these, and say which:
 
@@ -82,8 +68,9 @@ Stop only for these, and say which:
 |---|---|
 | `owned: false` | it is someone else's task; name the owner |
 | `repo: null` | no checkout on this host holds it |
-| unresolved | the reference matches nothing; quote what you tried |
 | `kind: idea` with `repo: null` | no checkout for that track; scaffolding into the wrong repo is invisible until validation |
+| unresolved | the reference matches nothing on the platform or on disk; quote what you tried |
+| intake says KILL | the screen rejected the idea; that is a successful outcome, report it |
 
 `otherRepos` is not a stop. Proceed in the canonical one and mention the others exist.
 
