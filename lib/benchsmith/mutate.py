@@ -81,6 +81,51 @@ class Mutant:
                 "outcome": self.outcome}
 
 
+def code_mask(src: str, suffix: str) -> list:
+    """True at every index that is real code, not a string or a comment.
+
+    A line-level comment skip is not enough. `assert msg == "use == here"`
+    mutates inside the literal, producing a mutant that changes a message rather
+    than a behaviour: it compiles, the tests pass, and it is reported as a
+    survivor -- a hole in the grader that is not one.
+
+    Taken from ripen's mutation probe, which walks the source character by
+    character rather than trusting line shape.
+    """
+    n = len(src)
+    mask = [True] * n
+    line_comment = "#" if suffix == ".py" else "//"
+    tri = ('"' * 3, "'" * 3)
+    i = 0
+    while i < n:
+        c = src[i]
+        if src.startswith(line_comment, i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+        elif suffix != ".py" and src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+        elif suffix == ".py" and any(src.startswith(q, i) for q in tri):
+            q = next(q for q in tri if src.startswith(q, i))
+            j = src.find(q, i + 3)
+            j = n if j < 0 else j + 3
+        elif c == "`":
+            j = src.find("`", i + 1)
+            j = n if j < 0 else j + 1
+        elif c in "\"'":
+            j = i + 1
+            while j < n and src[j] != c and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            j = min(j + 1, n)
+        else:
+            i += 1
+            continue
+        for k in range(i, j):
+            mask[k] = False
+        i = j
+    return mask
+
+
 def _skip(line: str, suffix: str) -> bool:
     s = line.strip()
     if not s:
@@ -104,16 +149,32 @@ def build_battery(files: dict[str, str], *, cap: int = MAX_BATTERY) -> tuple[lis
         if rules is None:
             notes.append(f"{path}: {suffix or 'no extension'} unsupported; not probed")
             continue
-        for lineno, line in enumerate(files[path].splitlines(), 1):
-            if _skip(line, suffix):
-                continue
-            for pattern, repl, op in rules:
-                m = re.search(pattern, line)
-                if not m:
-                    continue
-                out.append(Mutant(path=path, line=lineno, operator=op, before=line,
-                                  after=line[: m.start()] + repl + line[m.end():]))
-                break  # one mutant per line keeps each survivor a single edit
+        src = files[path]
+        mask = code_mask(src, suffix)
+        offset = 0
+        for lineno, raw in enumerate(src.splitlines(keepends=True), 1):
+            line = raw.rstrip("\n")
+            if not _skip(line, suffix):
+                placed = False
+                for pattern, repl, op in rules:
+                    pos = 0
+                    while not placed:
+                        m = re.search(pattern, line[pos:])
+                        if not m:
+                            break
+                        s, e = pos + m.start(), pos + m.end()
+                        # Only mutate where the whole match is real code. A
+                        # match inside a string changes a message, not a
+                        # behaviour: it survives every honest test and is
+                        # reported as a hole in the grader that is not one.
+                        if all(mask[offset + k] for k in range(s, min(e, len(line)))):
+                            out.append(Mutant(path=path, line=lineno, operator=op,
+                                              before=line, after=line[:s] + repl + line[e:]))
+                            placed = True
+                        pos = e
+                    if placed:
+                        break  # one mutant per line keeps each survivor a single edit
+            offset += len(raw)
     if len(out) > cap:
         notes.append(f"battery capped at {cap} of {len(out)} candidate mutants")
         # Spread across files rather than exhausting the first one, so a

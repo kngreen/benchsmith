@@ -37,8 +37,31 @@ MAX_ARG = 128 * 1024  # a single argv entry; the whole file-set travels as one
 # Discovery, not a literal path. Baking in the publisher's home directory means
 # the skill only works for the person who published it -- everyone else gets a
 # CLI at a path that does not exist on their machine.
+# The routing decision goes FIRST, before the binding block. An agent that meets
+# a wall of setup bash before it meets the instruction to act asks what to do --
+# observed repeatedly on bare `/benchsmith`, which routes to the backlog and
+# needs no argument at all.
+ROUTE_FIRST = """
+## Read this before anything else
+
+**You were invoked with an argument, or without one. Neither case involves asking
+the user what to work on.**
+
+- **No argument** → you are the fleet orchestrator. The backlog answers "what
+  next", so do not ask. Bind the CLI below, then run
+  `benchsmith fleet --apply`, announce the tasks it picked, and supervise them.
+- **An argument** (task name, numeric id, submissions URL, or a `T...` GSD card)
+  → bind the CLI, run `benchsmith resolve "<it>"`, and start work on that task
+  in this session.
+
+"Which benchmark do you want?" is a failed invocation. If you genuinely cannot
+proceed, say which command failed and what it said — never ask the user to
+choose the work for you.
+
+"""
+
 PREAMBLE = """
-> **Binding — do this first.** This skill's commands are a package installed on a
+> **Binding — do this second.** This skill's commands are a package installed on a
 > host, not files delivered with this skill. Find the CLI before anything else:
 >
 > ```bash
@@ -74,7 +97,7 @@ def build() -> list[dict]:
     head, body = text[: end + 5], text[end + 5:]
     # The publisher's own install is offered LAST, as a hint for colleagues on the
     # same host, never as the answer.
-    published = head + PREAMBLE.format(hint=f'"{ROOT}/bin/benchsmith"') + body
+    published = head + ROUTE_FIRST + PREAMBLE.format(hint=f'"{ROOT}/bin/benchsmith"') + body
 
     return [{"path": "SKILL.md", "content": published}]
 

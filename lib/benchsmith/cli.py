@@ -274,6 +274,14 @@ def cmd_ideas_references(args) -> int:
     return 0
 
 
+def cmd_ideas_landscape(args) -> int:
+    _out(ideas_mod.landscape(
+        tags=args.tag, seed=args.seed, task_ids=args.task_id,
+        limit=args.limit, idea_limit=args.idea_limit, binary=args.codimango,
+    ))
+    return 0
+
+
 def cmd_claim(args) -> int:
     r = Leases(Path(args.repo).resolve()).claim(args.task)
     _out(r)
@@ -911,6 +919,21 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("task_id", nargs="+")
     i.add_argument("--codimango", default="/usr/local/bin/codimango")
     i.set_defaults(fn=cmd_ideas_references)
+
+    i = idea_sub.add_parser(
+        "landscape", help="map submitted-task saturation and compare a human seed")
+    i.add_argument("--tag", action="append", default=[],
+                   help="sample submitted T-Bench tasks with this tag; repeatable (default: ripen-v1)")
+    i.add_argument("--task-id", action="append", default=[],
+                   help="include an exact Codimango reference task; repeatable")
+    i.add_argument("--seed", default="",
+                   help="human-authored seed to compare; omission produces coverage only")
+    i.add_argument("--limit", type=int, default=20,
+                   help="maximum tasks per tag (1-20)")
+    i.add_argument("--idea-limit", type=int, default=10,
+                   help="maximum Idea Exchange collision candidates (1-100)")
+    i.add_argument("--codimango", default="/usr/local/bin/codimango")
+    i.set_defaults(fn=cmd_ideas_landscape)
 
     s = common(sub.add_parser("claim", help="take an exclusive lease on a task"))
     s.set_defaults(fn=cmd_claim)

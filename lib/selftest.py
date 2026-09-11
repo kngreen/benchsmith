@@ -3505,5 +3505,143 @@ check("a local defect is repaired before any rerun",
 check("...and says why", "cannot clear it" in rr.orphaned(50 * 60, local_defect=True)[1], True)
 
 
+# --- mutants must land in code, not in prose ---------------------------------
+#
+# A line-level comment skip is not enough. Mutating inside a string literal
+# changes a message rather than a behaviour: it compiles, every honest test
+# still passes, and the probe reports a survivor -- a hole in the grader that is
+# not one. Taken from ripen's probe, which walks the source character by
+# character.
+
+_STR = 'def f():\n    msg = "use == here"\n    return 1\n'
+_CMT = "def f():\n    return 1  # x == y\n"
+_MIX = 'def f(x):\n    m = "a == b"; return x == 1\n'
+_DOC = 'def f(x):\n    """a == b"""\n    return x == 1\n'
+
+check("a comparison inside a string is not mutated",
+      [m.after for m in mu.build_battery({"a.py": _STR})[0] if "!=" in m.after], [])
+check("a comparison inside a comment is not mutated",
+      mu.build_battery({"a.py": _CMT})[0], [])
+check("a comparison inside a docstring is not mutated",
+      [m.line for m in mu.build_battery({"a.py": _DOC})[0]], [3])
+# ...but a real comparison on the same line as a string still is.
+_mix = mu.build_battery({"a.py": _MIX})[0]
+check("real code after a string literal is still mutated",
+      _mix[0].after.strip(), 'm = "a == b"; return x != 1')
+
+_mask = mu.code_mask("a == b  # c == d\n", ".py")
+check("the mask marks code as code", _mask[2], True)
+check("...and a comment as not code", _mask[13], False)
+check("go uses // and /* */",
+      mu.code_mask("x := 1 // a == b\n", ".go")[9], False)
+
+# --- a remote lease, so two hosts cannot repair one task ---------------------
+
+from benchsmith import remote_lease as rl  # noqa: E402
+
+_o = rl.parse_owner("benchsmith lease uuid=abc host=other-host pid=4242 task=t acquired=1000")
+check("an owner is parsed from the token", (_o.host, _o.pid, _o.task), ("other-host", 4242, "t"))
+check("...and a foreign one is not ours", _o.mine, False)
+check("an old lease is stale", _o.age > rl.TTL_SECONDS, True)
+check("an unparseable token yields an empty owner", rl.parse_owner("junk").host, "")
+# An empty owner has infinite age, so a lease we cannot read the owner of is
+# reapable rather than permanent.
+check("...whose age is infinite, not zero", rl.parse_owner("junk").age == float("inf"), True)
+
+for _bad in ("../evil", "a/b", "", "has space"):
+    try:
+        rl.RemoteLease(_bad, "/tmp")
+        check(f"unsafe lease name refused: {_bad!r}", "accepted", "refused")
+    except rl.LeaseLost:
+        check(f"unsafe lease name refused: {_bad!r}", True, True)
+
+_seen = []
+
+
+def _lease_git(state):
+    """A fake remote whose ref we can move under the lease."""
+    def run(args):
+        _seen.append(args)
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        if args[0] == "ls-remote":
+            R.stdout = f"{state['ref']}\trefs/heads/x" if state["ref"] else ""
+        elif args[0] == "rev-parse":
+            R.stdout = "treeish"
+        elif args[0] == "commit-tree":
+            state["n"] = state.get("n", 0) + 1
+            R.stdout = f"token{state['n']}"
+        elif args[0] == "show":
+            R.stdout = state.get("msg", "")
+        elif args[0] == "push":
+            if state.get("push_fails"):
+                R.returncode = 1
+                R.stderr = "rejected"
+            else:
+                state["ref"] = args[-1].split(":")[0]
+        return R
+    return run
+
+
+_st = {"ref": ""}
+_l = rl.RemoteLease("mytask", "/tmp", runner=_lease_git(_st))
+check("an unheld task can be claimed", _l.acquire()["held"], True)
+check("...and the lease is remembered", bool(_l.sha), True)
+
+# assert_owned is the whole point: fail closed right before a mutation.
+_l.assert_owned()
+check("owning the lease asserts cleanly", True, True)
+_st["ref"] = "somebody-else"
+try:
+    _l.assert_owned()
+    check("a moved lease fails closed", "proceeded", "refused")
+except rl.LeaseLost as e:
+    check("a moved lease fails closed", "another host owns this task now" in str(e), True)
+
+# A live foreign lease is respected; not knowing is not the same as free.
+_st2 = {"ref": "theirs",
+        "msg": f"uuid=z host=other pid=1 task=mytask acquired={int(__import__('time').time())}"}
+check("a live foreign lease is not stolen",
+      rl.RemoteLease("mytask", "/tmp", runner=_lease_git(_st2)).acquire()["held"], False)
+_st3 = {"ref": "theirs", "msg": "uuid=z host=other pid=1 task=mytask acquired=1000"}
+check("an expired foreign lease is reaped",
+      rl.RemoteLease("mytask", "/tmp", runner=_lease_git(_st3)).acquire()["held"], True)
+_st4 = {"ref": "theirs", "msg": "uuid=z host=other pid=1 task=mytask acquired=1000",
+        "push_fails": True}
+check("losing the race to reap is not owning it",
+      rl.RemoteLease("mytask", "/tmp", runner=_lease_git(_st4)).acquire()["held"], False)
+
+
+# --- the published skill must route before it sets up ------------------------
+#
+# Bare `/benchsmith` kept answering "which benchmark do you want?". The routing
+# directive was 70KB in, behind a wall of binding bash, and the description said
+# "one task" -- which invites the question.
+
+import subprocess as _sp3  # noqa: E402
+
+_pf = Path(tempfile.mkdtemp()) / "pub.json"
+_sp3.run([sys.executable, "/home/kngreen/.claude/skills/benchsmith/scripts/build_skillbook.py",
+          str(_pf)], capture_output=True)
+_pubbed = json.loads(_pf.read_text())[0]["content"]
+_head = _pubbed[:1600]
+
+check("routing comes before the binding block",
+      _pubbed.index("Read this before anything else") < _pubbed.index("Binding"), True)
+check("the no-argument case is in the first screen", "No argument" in _head, True)
+check("...and names the command to run", "benchsmith fleet --apply" in _head, True)
+check("asking is called out as a failure",
+      "is a failed invocation" in _pubbed, True)
+
+# The description is what an agent sees before it reads anything else.
+_desc = _pubbed[_pubbed.index("description:"):_pubbed.index("\n---\n", 4)]
+check("the description says a bare invocation needs no argument",
+      "NO argument" in _desc, True)
+check("...and does not describe the skill as one-task-only",
+      "Iterate one Codimango benchmark task" in _desc, False)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

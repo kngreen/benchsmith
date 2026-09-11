@@ -1,6 +1,6 @@
 ---
 name: benchsmith
-description: Iterate one Codimango benchmark task until it is genuinely hard and every exact-head gate is green — reading the platform fresh, classifying each round, gating the push, and stopping only on a real finding. Owns the difficulty bar (pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage), the integrity checks, provenance tagging, and the terminal verdict. Use for "loop this task", "iterate until it passes", "is this task hard enough", "harden this task", "why did this round fail", or "what terminal state should I report".
+description: Run the Codimango benchmark task loop. Invoked with NO argument it is the fleet orchestrator: it discovers the backlog itself and starts workers without being asked which task. Invoked with a task name, id, submissions URL or GSD card it runs that one to a terminal state. Owns the difficulty bar (pooled band, Wilson interval, strongest-cohort mixedness, two-family hardness, single-gate coverage), the integrity gates, the publish lane and the terminal verdict. Use for "benchsmith", "work the backlog", "loop this task", "harden this task", "is this task hard enough", "why did this round fail".
 ---
 
 # Benchsmith
@@ -343,7 +343,12 @@ A confirmation round-trip buys nothing those do not already guarantee.
 | **Repair review findings** | the review itself, never the balance row → §7 | both reviews green + §11 |
 | **Run the fleet** | `references/coordinator.md` | the queue drains or every remaining item needs a human |
 | **Local iOS / macOS-VM task** | `references/passatk.md` → §5 bar | §5 + §11 |
-| **Generate ideas** | not this skill — `swebench-idea-triage`, then `task-hardness-screen` | a GO'd idea |
+| **Map idea space** | `benchsmith ideas landscape` — coverage and duplicate radar only; the seed remains human | a human seed ready for `task-hardness-screen` |
+
+`ideas landscape` reads global T-Bench taxonomy coverage and bounded metadata-only samples of
+submitted tasks. It can compare a human-written seed with task names/tags and Idea Exchange
+records, but it never reads task instructions or invents a seed. Treat truncated tag counts as
+lower bounds and lexical distance as a warning signal, never as a novelty verdict.
 
 **Repair means the smallest correct fix, not the fastest green.** Preserve original intent; every
 tested behaviour stays stated in `instruction.md` or inferable from the contract; the unchanged

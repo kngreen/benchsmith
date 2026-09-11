@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -541,3 +542,218 @@ def inspect_reference(task_ids: list[str], *, binary: str = "/usr/local/bin/codi
             "note": "Summary fields can only select a deep-audit candidate; the Benchsmith §5 bar, semantic attribution, and critic are still required.",
         })
     return {"references": rows}
+
+
+_LANDSCAPE_TOKEN = re.compile(r"[a-z0-9]+")
+_LANDSCAPE_STOPWORDS = {
+    "a", "an", "and", "as", "at", "be", "by", "for", "from", "in", "into",
+    "is", "it", "of", "on", "or", "that", "the", "this", "to", "with",
+    "build", "create", "implement", "task", "tool",
+}
+
+
+def _landscape_tokens(*values: object) -> set[str]:
+    words: set[str] = set()
+    for value in values:
+        if isinstance(value, list):
+            text = " ".join(str(item) for item in value)
+        else:
+            text = str(value or "")
+        words.update(
+            token for token in _LANDSCAPE_TOKEN.findall(text.casefold())
+            if len(token) > 2 and token not in _LANDSCAPE_STOPWORDS
+        )
+    return words
+
+
+def _lexical_neighbor(seed_tokens: set[str], task: dict) -> dict:
+    task_tokens = _landscape_tokens(task.get("name"), task.get("tags") or [])
+    overlap = sorted(seed_tokens & task_tokens)
+    union = seed_tokens | task_tokens
+    return {
+        "id": str(task.get("id") or ""),
+        "name": task.get("name"),
+        "status": task.get("status"),
+        "githubUrl": task.get("githubUrl"),
+        "overlap": overlap,
+        "score": round(len(overlap) / len(union), 3) if union else 0.0,
+    }
+
+
+def _coverage_rows(document: dict, key: str) -> list[dict]:
+    rows = document.get(key) or []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _under_target(document: dict, key: str, limit: int = 15) -> list[dict]:
+    return sorted(
+        (row for row in _coverage_rows(document, key)
+         if row.get("rag") in {"red", "yellow"}),
+        key=lambda row: (
+            float(row.get("gap_pct") or 0),
+            float(row.get("current_pct") or 0),
+            -float(row.get("target_pct") or 0),
+            str(row.get("label") or ""),
+        ),
+    )[:limit]
+
+
+def _task_list_for_tag(run: _Run, binary: str, tag: str, limit: int) -> tuple[list[dict], dict]:
+    document = _call_json(
+        run,
+        [binary, "task", "list", "--tag", tag, "--track", "tbench", "--compact",
+         "--limit", str(limit), "--json"],
+        f"Codimango T-Bench tag {tag}",
+    )
+    return _rows(document, "tasks"), document if isinstance(document, dict) else {}
+
+
+def landscape(*, tags: list[str] | None = None, seed: str = "",
+              task_ids: list[str] | None = None, limit: int = 20,
+              idea_limit: int = 10, binary: str = "/usr/local/bin/codimango",
+              run: _Run = _run) -> dict:
+    """Read-only coverage and collision radar for a human-authored seed."""
+    if not 1 <= limit <= 20:
+        raise IdeasError("--limit must be between 1 and 20; larger live pages are unreliable")
+    if not 1 <= idea_limit <= 100:
+        raise IdeasError("--idea-limit must be between 1 and 100")
+
+    requested_tags = []
+    for tag in tags or ["ripen-v1"]:
+        clean = tag.strip().casefold()
+        if clean and clean not in requested_tags:
+            requested_tags.append(clean)
+
+    taxonomy = _call_json(
+        run,
+        [binary, "taxonomy", "--hackathon", "t-bench", "--axis", "sub-domains", "--json"],
+        "Codimango T-Bench taxonomy",
+    )
+    subdomains = _coverage_rows(taxonomy, "sub_domains")
+    saturated = sorted(
+        (row for row in subdomains if float(row.get("gap_pct") or 0) > 0),
+        key=lambda row: (-float(row.get("gap_pct") or 0), str(row.get("label") or "")),
+    )
+
+    samples = []
+    corpus: dict[str, dict] = {}
+    for tag in requested_tags:
+        tasks, document = _task_list_for_tag(run, binary, tag, limit)
+        for task in tasks:
+            corpus[str(task.get("id") or task.get("name"))] = task
+        incomplete = bool(document.get("hasMore")) or document.get("totalExact") is False
+        samples.append({
+            "tag": tag,
+            "observed": len(tasks),
+            "count": f">={len(tasks)}" if incomplete else len(tasks),
+            "complete": not incomplete,
+            "tasks": [
+                {
+                    "id": str(task.get("id") or ""),
+                    "name": task.get("name"),
+                    "status": task.get("status"),
+                    "tags": task.get("tags") or [],
+                    "subdomains": sorted({
+                        str(item.get("subDomain")) for item in (task.get("domainContext") or [])
+                        if isinstance(item, dict) and item.get("subDomain")
+                    }),
+                    "useCases": sorted({
+                        str(item.get("specificTask")) for item in (task.get("useCases") or [])
+                        if isinstance(item, dict) and item.get("specificTask")
+                    }),
+                    "githubUrl": task.get("githubUrl"),
+                }
+                for task in tasks
+            ],
+        })
+
+    exact_references = []
+    for task_id in task_ids or []:
+        task = _call_json(
+            run, [binary, "task", "show", str(task_id), "--json"],
+            f"Codimango task {task_id}",
+        )
+        corpus[str(task.get("id") or task_id)] = task
+        exact_references.append({
+            "id": str(task.get("id") or task_id),
+            "name": task.get("name"),
+            "status": task.get("status"),
+            "tags": task.get("tags") or [],
+            "classification": task.get("classification"),
+            "githubUrl": task.get("githubUrl"),
+        })
+
+    tag_counts = Counter(
+        str(tag).casefold() for task in corpus.values() for tag in (task.get("tags") or [])
+    )
+    result = {
+        "policy": {
+            "seedOrigin": "human-required",
+            "use": "coverage map and duplicate warning, not automatic task generation",
+            "taskContentRead": False,
+        },
+        "coverage": {
+            "asOf": taxonomy.get("last_synced_at"),
+            "totalTasks": taxonomy.get("total_tasks"),
+            "underTargetSubdomains": _under_target(taxonomy, "sub_domains"),
+            "underTargetUseCases": _under_target(taxonomy, "use_cases"),
+            "underTargetLanguages": _under_target(taxonomy, "languages"),
+            "underTargetDomains": _under_target(taxonomy, "domains"),
+            "overTargetSubdomains": saturated[:15],
+        },
+        "samples": samples,
+        "exactReferences": exact_references,
+        "repeatedTags": [
+            {"tag": tag, "observed": count}
+            for tag, count in sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))[:25]
+        ],
+        "limitations": [
+            "Coverage is global, but tag samples may be truncated; incomplete samples are lower bounds.",
+            "Only task metadata is read. Similarity here is lexical and is not a novelty verdict.",
+            "A human must supply the task seed before hardness screening or scaffolding.",
+        ],
+    }
+
+    if not seed.strip():
+        result["seedCheck"] = {"state": "NOT_RUN", "reason": "no human seed supplied"}
+        return result
+
+    seed_tokens = _landscape_tokens(seed)
+    neighbors = sorted(
+        (_lexical_neighbor(seed_tokens, task) for task in corpus.values()),
+        key=lambda row: (-row["score"], -len(row["overlap"]), str(row["name"] or "")),
+    )
+    idea_document = _call_json(
+        run,
+        ["meta", "ideation.idea", "search", "--track=tbench", f"--query={seed.strip()}",
+         f"--limit={idea_limit}", "--output=json"],
+        "Idea Exchange seed search",
+    )
+    idea_neighbors = []
+    for row in _rows(idea_document, "ideas"):
+        tokens = _landscape_tokens(row.get("title"), row.get("description"))
+        overlap = sorted(seed_tokens & tokens)
+        union = seed_tokens | tokens
+        idea_neighbors.append({
+            "id": str(row.get("id") or ""),
+            "title": row.get("title"),
+            "status": row.get("status"),
+            "overlap": overlap,
+            "score": round(len(overlap) / len(union), 3) if union else 0.0,
+            "url": IDEA_URL.format(id=row.get("id")),
+        })
+    idea_neighbors.sort(key=lambda row: (-row["score"], -len(row["overlap"]), str(row["title"] or "")))
+    strongest = max(
+        [row["score"] for row in neighbors[:10]] + [row["score"] for row in idea_neighbors[:10]] + [0.0]
+    )
+    result["seedCheck"] = {
+        "state": "REVIEW_REQUIRED" if strongest >= 0.25 else "NO_LEXICAL_COLLISION_IN_SAMPLE",
+        "seed": seed.strip(),
+        "tokens": sorted(seed_tokens),
+        "nearestTasks": neighbors[:10],
+        "nearestIdeas": idea_neighbors[:10],
+        "strongestScore": strongest,
+        "requiresHumanReview": True,
+        "next": "If the seed is genuinely yours and materially distinct, run task-hardness-screen before creating a card.",
+    }
+    return result
