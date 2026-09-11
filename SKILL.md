@@ -843,6 +843,43 @@ benchsmith queue --repo . --input payload.json    # or order a payload you alrea
 of that data, so the same inputs always produce the same plan and a restarted coordinator never
 disagrees with itself.
 
+**Only work you own is queued.** `currentUserIsTaskOwner` is computed by the platform for your
+credential, so it is an ownership answer rather than an inference from a name — and it matters
+because `tasks list` does not only return your own tasks: `--filter reviewing`, `--pod` and `--tag`
+all return other people's. A task you do not own is reported with its owner and left out.
+`--include-others` waives this deliberately. A row with **no** ownership field is kept: absent is
+not `False`.
+
+### Telling benchsmith where your board is
+
+**The GSD board is not hard-coded, and there is no default.** A board is a project id, which cannot
+be inferred — a devserver user owns or watches many.
+
+```bash
+benchsmith config --repo .                                    # what is set, and how to set it
+meta tasks.gsd.project list --owner-is-me --output=json       # find your project id
+```
+
+Then any one of these, highest precedence first: `--gsd-project <id>`, `BENCHSMITH_GSD_PROJECT`,
+`<repo>/.benchsmith/config.json`, `~/.config/benchsmith/config.json`.
+
+```json
+{"gsd": {"projectId": "<id>", "assignee": "<unixname>",
+         "sections": {"Task needs review": "gsd_review",
+                      "Task is ready to scaffold": "gsd_scaffold",
+                      "Task ideas (auto-generated)": "idea"}}}
+```
+
+`sections` are your board's **column names** — check them with
+`meta tasks.gsd.task list --project-id=<id> --columns=number,title,section`. An unmapped section
+falls to the idea tier and is named in the notes, so the map can be corrected rather than silently
+mis-firing.
+
+With no board configured, **no cards are queued and preflight says so.** That is deliberate. An
+earlier version defaulted to "every open task you own" and pulled 94 oncall parents, translation
+requests and unrelated work items into a task queue. A wrong board is worse than no board: no board
+is visibly empty, a wrong one looks like work.
+
 | Tier | Meaning | Why here |
 |---|---|---|
 | 10 | needs revision | A reviewer is already waiting. Latency is the whole cost. |

@@ -157,6 +157,28 @@ def run(repo_root: Path | None = None, task: str | None = None) -> dict:
         )
         degraded.append("cli-surface-drift")
 
+    # Not blocking and not even degraded: a fleetless single-task run never
+    # touches the board. It is reported so that an empty idea tier reads as
+    # "unconfigured" rather than "nothing to do".
+    try:
+        from .config import load as _load_cfg
+
+        _cfg = _load_cfg(Path(repo_root) if repo_root else None)
+        rows.append(
+            {
+                "kind": "config",
+                "name": "GSD board",
+                "state": "present" if _cfg.configured else "unset",
+                "path": _cfg.project_id or None,
+                "usedFor": "§12 queue tiers 50-70 (board cards)",
+                "degradesTo": None if _cfg.configured else
+                "no board cards are queued; `benchsmith config` prints how to set one",
+            }
+        )
+    except Exception as e:  # noqa: BLE001 - preflight must never crash the round
+        rows.append({"kind": "config", "name": "GSD board", "state": "MISSING", "path": None,
+                     "usedFor": "§12 queue tiers 50-70", "degradesTo": f"could not read: {e}"})
+
     if repo_root and task:
         legacy = Path(repo_root) / ".ripen" / f"{task}.json"
         current = Path(repo_root) / ".benchsmith" / f"{task}.json"

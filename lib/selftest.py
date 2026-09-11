@@ -14,6 +14,7 @@ runs on scratch under $TMPDIR.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1569,14 +1570,16 @@ check("only unrecognised statuses produce notes",
 check("an unrecognised status is reported", any("brand_new_status" in n for n in _notes), True)
 
 _gsd = [
-    {"number": "T1", "title": "Fix the widget", "progress": "Task needs review"},
-    {"number": "T2", "title": "Scaffold me", "progress": "Task is ready to scaffold"},
-    {"number": "T3", "title": "Some idea", "progress": "Task ideas (auto-generated)"},
-    {"number": "T4", "title": "Unmapped column", "progress": "Something Else"},
+    {"number": "T1", "title": "Fix the widget", "section": "Task needs review"},
+    {"number": "T2", "title": "Scaffold me", "section": "Task is ready to scaffold"},
+    {"number": "T3", "title": "Some idea", "section": "Task ideas (auto-generated)"},
+    {"number": "T4", "title": "Unmapped column", "section": "Something Else"},
 ]
-_items, _ = src.normalise_gsd(_gsd)
-check("board columns map to kinds", [i["kind"] for i in _items],
+_items, _gn = src.normalise_gsd(_gsd)
+check("board sections map to kinds", [i["kind"] for i in _items],
       ["gsd_review", "gsd_scaffold", "idea", "idea"])
+# A section we do not recognise must be named, or the map can never be fixed.
+check("an unmapped section is reported", any("Something Else" in n for n in _gn), True)
 
 # There is no link field, so duplicates can only be guessed -- and a guess must
 # not delete work.
@@ -1739,6 +1742,63 @@ try:
 except pub.PublishRefused as e:
     check("publish refuses while the lane is held", "one publisher per repository" in str(e), True)
 _busy.release("other-task")
+
+
+# --- ownership and board scoping ---------------------------------------------
+#
+# `tasks list` does not only return your own work: --filter reviewing, --pod and
+# --tag all return other people's tasks, and hardening somebody else's task by
+# accident is not a recoverable mistake.
+
+_mine = {"name": "mine", "status": "draft", "currentUserIsTaskOwner": True}
+_theirs = {"name": "theirs", "status": "draft", "currentUserIsTaskOwner": False,
+           "importedBy": "999", "currentUserIsReviewer": True}
+_kept, _on = src.normalise_codimango([_mine, _theirs])
+check("a task you do not own is not queued", [r["name"] for r in _kept], ["mine"])
+check("...and the reason names the owner", any("owned by 999" in n for n in _on), True)
+check("...and notes you are its reviewer", any("you are the reviewer" in n for n in _on), True)
+check("ownership can be waived explicitly",
+      len(src.normalise_codimango([_mine, _theirs], require_owner=False)[0]), 2)
+# Absent is not False: an older payload without the field must not be discarded.
+check("a row with no ownership field is kept",
+      len(src.normalise_codimango([{"name": "x", "status": "draft"}])[0]), 1)
+
+# GSD rows are assignee-filtered server-side; verifying the field too is the
+# difference between trusting a flag and checking an answer.
+_mixed = [{"number": "T1", "title": "a", "section": "Task ideas", "assignee": "kngreen"},
+          {"number": "T2", "title": "b", "section": "Task ideas", "assignee": "someone"}]
+_ga, _gan = src.normalise_gsd(_mixed, assignee="kngreen")
+check("a card assigned to someone else is not queued", [i["name"] for i in _ga], ["T1"])
+check("...and says who has it", any("assigned to someone" in n for n in _gan), True)
+
+# --- configuration ---
+from benchsmith import config as cfgmod  # noqa: E402
+
+_c = cfgmod.GsdConfig()
+check("no board is configured by default", _c.configured, False)
+# A guessed board is worse than none: an empty queue is visibly empty, a wrong
+# one looks like work. This is the 94-oncall-tasks bug.
+_none, _cn = src.fetch_gsd(_c)
+check("no board means no cards", _none, [])
+check("...and says how to set one", any("benchsmith config" in n for n in _cn), True)
+
+_cfgdir = Path(tempfile.mkdtemp())
+(_cfgdir / ".benchsmith").mkdir()
+(_cfgdir / ".benchsmith" / "config.json").write_text(json.dumps(
+    {"gsd": {"projectId": "12345", "assignee": "someone", "sections": {"Inbox": "idea"}}}))
+_loaded = cfgmod.load(_cfgdir)
+check("a repo config supplies the board", _loaded.project_id, "12345")
+check("...and its own section map", _loaded.sections, {"Inbox": "idea"})
+check("an explicit flag overrides the config file",
+      cfgmod.load(_cfgdir, project_id="999").project_id, "999")
+_prev = os.environ.get("BENCHSMITH_GSD_PROJECT")
+os.environ["BENCHSMITH_GSD_PROJECT"] = "777"
+check("the environment overrides the config file", cfgmod.load(_cfgdir).project_id, "777")
+check("a flag still beats the environment", cfgmod.load(_cfgdir, project_id="888").project_id, "888")
+if _prev is None:
+    del os.environ["BENCHSMITH_GSD_PROJECT"]
+else:
+    os.environ["BENCHSMITH_GSD_PROJECT"] = _prev
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

@@ -16,17 +16,6 @@ import json
 import re
 import subprocess
 
-# GSD board columns, matched case-insensitively against a task's progress and
-# its tags. Defaults follow the fleet blueprint's column names; a board that
-# spells them differently supplies its own mapping rather than being silently
-# mismatched into the idea tier.
-DEFAULT_GSD_COLUMNS = {
-    "task needs review": "gsd_review",
-    "task is ready to scaffold": "gsd_scaffold",
-    "task ideas (auto-generated)": "idea",
-    "task ideas": "idea",
-}
-
 # Statuses that are somebody else's move, not ours. Kept explicit so a new
 # platform status shows up as unrecognised rather than being quietly worked on.
 NOT_OUR_WORK = {
@@ -63,28 +52,52 @@ def fetch_codimango(binary: str = "codimango") -> tuple[list[dict], list[str]]:
     return rows, []
 
 
-def fetch_gsd(owner: str = "", tags: str = "", limit: int = 200) -> tuple[list[dict], list[str]]:
-    """Open GSD cards for a board."""
-    argv = ["meta", "tasks.task", "list", "--status-is=OPEN",
+def fetch_gsd(cfg, limit: int = 200) -> tuple[list[dict], list[str]]:
+    """Cards on ONE board.
+
+    `tasks.gsd.task list --project-id` is the board surface; it carries the
+    section, which is the column the blueprint's priority tiers are named after.
+    The earlier version used `tasks.task list --owner-is-me`, which is not a
+    board at all -- it is every open task the user owns, and it filled the queue
+    with 94 oncall parents and translation requests.
+
+    Without a project id this returns nothing and says so. Guessing a board is
+    worse than having none: an empty queue is visibly empty, a wrong one looks
+    like work.
+    """
+    if not cfg.configured:
+        return [], ["no GSD board configured; run `benchsmith config` for how to set one"]
+    argv = ["meta", "tasks.gsd.task", "list", f"--project-id={cfg.project_id}",
             f"--limit={limit}", "--output", "json"]
-    argv.append(f"--owner-is={owner}" if owner else "--owner-is-me")
-    if tags:
-        argv.append(f"--tags-include-any-of={tags}")
+    if cfg.assignee:
+        argv.append(f"--assignee={cfg.assignee}")
     code, out, err = _run(argv)
     if code != 0:
-        return [], [f"GSD task list failed: {err.strip()[:200]}"]
+        return [], [f"GSD board {cfg.project_id} could not be read: {err.strip()[:200]}"]
     try:
         rows = json.loads(out[out.index("["):]) if "[" in out else []
     except ValueError as e:
-        return [], [f"GSD task list did not return JSON: {e}"]
+        return [], [f"GSD board did not return JSON: {e}"]
     return rows if isinstance(rows, list) else [], []
 
 
-def normalise_codimango(rows: list[dict]) -> tuple[list[dict], list[str]]:
-    """Keep the rows that represent work, and say why the rest were dropped."""
+def normalise_codimango(rows: list[dict], *, require_owner: bool = True) -> tuple[list[dict], list[str]]:
+    """Keep the rows that represent work THIS caller owns.
+
+    `currentUserIsTaskOwner` is computed by the server for the calling
+    credential, so it is an ownership answer rather than an inference from a
+    name. It matters because `tasks list` does not always return your own work:
+    `--filter reviewing`, `--pod` and `--tag` all return other people's tasks,
+    and hardening somebody else's task is not a thing to do by accident.
+    """
     keep, notes = [], []
     for r in rows:
         status = str(r.get("status") or "")
+        if require_owner and r.get("currentUserIsTaskOwner") is False:
+            notes.append(f"{r.get('name') or r.get('id')}: owned by {r.get('importedBy') or 'someone else'}"
+                         f"{' (you are the reviewer)' if r.get('currentUserIsReviewer') else ''}; "
+                         "not queued for work")
+            continue
         if status in NOT_OUR_WORK:
             continue
         if status not in ("draft", "needs_revision"):
@@ -103,7 +116,8 @@ def _tokens(text: str) -> set[str]:
 
 
 def normalise_gsd(rows: list[dict], columns: dict[str, str] | None = None,
-                  known_tasks: list[str] | None = None) -> tuple[list[dict], list[str]]:
+                  known_tasks: list[str] | None = None,
+                  assignee: str = "") -> tuple[list[dict], list[str]]:
     """Map GSD cards onto queue kinds, flagging probable duplicates.
 
     There is no link field between a GSD card and a Codimango task, so a
@@ -112,23 +126,30 @@ def normalise_gsd(rows: list[dict], columns: dict[str, str] | None = None,
     merely suspect is a duplicate loses real work silently, while keeping a
     flagged one costs an idea-tier slot -- the cheapest slot there is.
     """
-    columns = columns or DEFAULT_GSD_COLUMNS
+    from .config import DEFAULT_SECTIONS
+
+    columns = columns or DEFAULT_SECTIONS
+    lowered = {k.lower(): v for k, v in columns.items()}
     known = {t.lower(): _tokens(t) for t in (known_tasks or [])}
     out, notes = [], []
     for r in rows:
         title = str(r.get("title") or "")
         number = str(r.get("number") or r.get("id") or "")
-        haystack = " ".join([str(r.get("progress") or ""),
-                             " ".join(r.get("tags") or []) if isinstance(r.get("tags"), list) else str(r.get("tags") or "")]).lower()
-        kind = None
-        for column, mapped in columns.items():
-            if column in haystack:
-                kind = mapped
-                break
+        who = str(r.get("assignee") or r.get("owner") or "")
+        if assignee and who and who != assignee:
+            # The server filter should have handled this; verifying it anyway is
+            # the difference between trusting a flag and checking a field.
+            notes.append(f"{number}: assigned to {who}, not {assignee}; not queued")
+            continue
+        section = str(r.get("section") or "").strip().lower()
+        kind = lowered.get(section)
         if kind is None:
-            # An unmapped card is an idea by default: lowest priority, so a
-            # mis-mapping costs the least it can.
+            # An unmapped section is an idea: lowest priority, so a mis-mapping
+            # costs the least it can. Name it, so the map can be corrected.
             kind = "idea"
+            if section:
+                notes.append(f"section {r.get('section')!r} is not in the section map; "
+                             "queued as an idea")
         item = {"name": number or title[:60], "title": title, "kind": kind}
         tok = _tokens(title)
         for name, ntok in known.items():
@@ -140,16 +161,18 @@ def normalise_gsd(rows: list[dict], columns: dict[str, str] | None = None,
     return out, notes
 
 
-def discover(*, binary: str = "codimango", gsd_owner: str = "", gsd_tags: str = "",
-             with_gsd: bool = True) -> dict:
+def discover(*, binary: str = "codimango", cfg=None, with_gsd: bool = True,
+             require_owner: bool = True) -> dict:
     """The payload `build_queue` already expects."""
     tasks, notes = fetch_codimango(binary)
-    tasks, n2 = normalise_codimango(tasks)
+    tasks, n2 = normalise_codimango(tasks, require_owner=require_owner)
     notes += n2
     ideas: list[dict] = []
-    if with_gsd:
-        rows, n3 = fetch_gsd(gsd_owner, gsd_tags)
+    if with_gsd and cfg is not None:
+        rows, n3 = fetch_gsd(cfg)
         notes += n3
-        ideas, n4 = normalise_gsd(rows, known_tasks=[str(t.get("name") or "") for t in tasks])
+        ideas, n4 = normalise_gsd(rows, columns=cfg.sections, assignee=cfg.assignee,
+                                  known_tasks=[str(t.get("name") or "") for t in tasks])
         notes += n4
-    return {"tasks": tasks, "ideas": ideas, "notes": notes}
+    return {"tasks": tasks, "ideas": ideas, "notes": notes,
+            "gsd": cfg.as_dict() if cfg is not None else None}

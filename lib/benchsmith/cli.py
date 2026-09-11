@@ -17,6 +17,7 @@ from pathlib import Path
 from . import gate as gate_mod
 from . import preflight as preflight_mod
 from . import backoff as backoff_mod
+from . import config as config_mod
 from . import coverage
 from . import dispatch as dispatch_mod
 from . import mutate as mutate_mod
@@ -178,8 +179,9 @@ def cmd_queue(args) -> int:
     """Read-only prioritised backlog. Mutates nothing."""
     repo = Path(args.repo).resolve()
     if args.fetch:
-        raw = sources.discover(gsd_owner=args.gsd_owner, gsd_tags=args.gsd_tags,
-                               with_gsd=not args.no_gsd)
+        cfg = config_mod.load(repo, project_id=args.gsd_project, assignee=args.gsd_assignee)
+        raw = sources.discover(cfg=cfg, with_gsd=not args.no_gsd,
+                               require_owner=not args.include_others)
     else:
         raw = json.loads(Path(args.input).read_text()) if args.input else {}
     tasks = raw.get("tasks") if isinstance(raw, dict) else raw
@@ -245,6 +247,27 @@ def cmd_mutate(args) -> int:
     # NOT_RUN is not a pass. It exits non-zero so a caller cannot read an
     # unrun probe as a clean one.
     return 0 if res["status"] == "PASS" else 1
+
+
+def cmd_config(args) -> int:
+    """Show the resolved configuration, and how to set what is missing."""
+    cfg = config_mod.load(Path(args.repo).resolve())
+    payload = {"gsd": cfg.as_dict(),
+               "sources": {"user": str(config_mod.USER_CONFIG),
+                           "repo": str(Path(args.repo).resolve() / config_mod.REPO_CONFIG),
+                           "env": "BENCHSMITH_GSD_PROJECT / BENCHSMITH_GSD_ASSIGNEE"}}
+    if args.json:
+        _out(payload)
+    else:
+        print(f"GSD board:  {cfg.project_id or '(not configured)'}")
+        print(f"assignee:   {cfg.assignee or '(none)'}")
+        print(f"sections:   {json.dumps(cfg.sections)}")
+        print(f"user cfg:   {config_mod.USER_CONFIG}")
+        print(f"repo cfg:   {Path(args.repo).resolve() / config_mod.REPO_CONFIG}")
+        if not cfg.configured:
+            print()
+            print(config_mod.HOWTO)
+    return 0
 
 
 def cmd_stats(args) -> int:
@@ -379,9 +402,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--input", default="", help="tasks payload JSON (from `read`/`tasks list`)")
     s.add_argument("--fetch", action="store_true",
                    help="discover work from codimango and GSD instead of --input")
-    s.add_argument("--gsd-owner", default="", help="GSD owner (default: you)")
-    s.add_argument("--gsd-tags", default="", help="comma-separated GSD tags to scope the board")
+    s.add_argument("--gsd-project", default="", help="GSD project id (overrides config/env)")
+    s.add_argument("--gsd-assignee", default="", help="GSD assignee (default: you)")
     s.add_argument("--no-gsd", action="store_true", help="codimango only")
+    s.add_argument("--include-others", action="store_true",
+                   help="queue tasks you do not own (default: refuse)")
     s.add_argument("--workers", type=int, default=3)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_queue)
@@ -409,6 +434,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--target", action="append", help="file to mutate; repeatable")
     s.add_argument("--test-cmd", default="", help="command that runs the suite")
     s.set_defaults(fn=cmd_mutate)
+
+    s = sub.add_parser("config", help="show the resolved configuration")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("stats", help="what this loop has actually done")
     s.add_argument("--root", default=".")
