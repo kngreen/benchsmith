@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -475,6 +477,88 @@ def surface(sid: str, *, runner=None) -> dict:
 
 # States where a person is the next step, so the session goes back in the inbox.
 NEEDS_A_HUMAN = frozenset({"blocked", "needs_human", "failed"})
+
+# A worker with no journal activity for this long is not thinking, it is stuck.
+# Generous, because a Codimango validation wave legitimately takes a long time
+# and a worker waiting on one is doing exactly the right thing.
+STALL_SECONDS = 90 * 60
+# Wall clock for one worker. Long, because a task can legitimately need many
+# validation waves; past it the answer is a fresh worker resuming from the
+# journal, not a longer leash on a session whose context is exhausted.
+MAX_WORKER_HOURS = 24
+
+_ERRORY = re.compile(r"\berror\b|\bexception\b|traceback|fatal|failed to", re.I)
+
+
+def _stamp(text: str) -> float | None:
+    """Parse an event timestamp. Unparseable is None, never now()."""
+    from datetime import datetime
+
+    for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(text).strip(), fmt).timestamp()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def health(sid: str, *, runner=None, now: float | None = None) -> dict:
+    """Is this worker working, stuck, erroring, or done?
+
+    A supervisor that only asks "did it produce a handoff" cannot tell a worker
+    thinking hard from one that died twenty minutes ago, and both look like
+    silence.
+    """
+    events, why = poll_session(sid, runner=runner)
+    if why and not events:
+        return {"session": sid, "state": "unreadable", "reason": why}
+    if not events:
+        return {"session": sid, "state": "starting", "events": 0}
+
+    now = time.time() if now is None else now
+    stamps = [s for s in (_stamp(e.get("created")) for e in events) if s]
+    last = max(stamps) if stamps else None
+    first = min(stamps) if stamps else None
+    idle = (now - last) if last else None
+    ran_for = (last - first) if (last and first) else None
+
+    finished = any(str(e.get("type")) in ("run_finished", "session_archived") for e in events)
+    errors = [str(e.get("type")) for e in events
+              if _ERRORY.search(json.dumps(e.get("event") or "")[:2000])]
+
+    if finished:
+        state = "finished"
+    elif idle is None:
+        # No parseable timestamps: we cannot tell, and guessing "healthy" is how
+        # a dead worker holds a slot all day.
+        state = "unknown"
+    elif idle > STALL_SECONDS:
+        state = "stalled"
+    else:
+        state = "working"
+
+    return {
+        "session": sid, "state": state, "events": len(events),
+        "idleSeconds": None if idle is None else int(idle),
+        "ranForSeconds": None if ran_for is None else int(ran_for),
+        "overRuntime": bool(ran_for and ran_for > MAX_WORKER_HOURS * 3600),
+        "errorEvents": len(errors),
+        "reason": {
+            "finished": "the run ended",
+            "stalled": f"no activity for {int((idle or 0) / 60)} minutes",
+            "unknown": "no parseable timestamps; treat as unverified, not healthy",
+            "working": f"last activity {int((idle or 0) / 60)} minutes ago",
+        }.get(state, ""),
+    }
+
+
+def relieve(sid: str, *, runner=None) -> dict:
+    """End a worker's session so its slot can be reused."""
+    argv = ["meta", "agentcloud.ui", "archive", "--session-id", sid]
+    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=120))
+    r = run(argv)
+    code = r[0] if isinstance(r, tuple) else r.returncode
+    return {"session": sid, "relieved": code == 0}
 
 
 def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:

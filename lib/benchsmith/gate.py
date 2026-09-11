@@ -745,6 +745,31 @@ def canonical_receipt(repo_root: Path) -> Path | None:
     return None
 
 
+HOOK_RECEIPT = "/tmp/gate-receipt-{task}.json"
+
+
+def _emit_hook_receipt(repo_root: Path, task_name: str, report: Report,
+                       head: str, dirty: bool) -> str:
+    """Also write the receipt the repo's own pre-push hook reads."""
+    path = Path(os.environ.get("GATE_RECEIPT") or HOOK_RECEIPT.format(task=task_name))
+    gates = {}
+    for c in report.checks:
+        if not c.blocking:
+            continue
+        gates[c.name] = {PASS: "pass", FAIL: "fail",
+                         NOT_RUN: "not_run", TIMEOUT: "timeout"}.get(c.state, c.state.lower())
+    try:
+        path.write_text(json.dumps({
+            "task": task_name, "commit": head, "dirty": dirty, "gates": gates,
+            "source": "benchsmith",
+            "note": "gate names are benchsmith's checks, not the repo's G1-G5; "
+                    "not_run and timeout are not pass",
+        }, indent=1))
+    except OSError:
+        return ""
+    return str(path)
+
+
 def write_receipt(repo_root: Path, task_name: str, report: Report) -> dict:
     """Bind a passing gate run to an exact clean HEAD."""
     repo_root = Path(repo_root)
@@ -762,6 +787,18 @@ def write_receipt(repo_root: Path, task_name: str, report: Report) -> dict:
         return {"state": "not_written", "reason": "worktree is dirty; commit before gating"}
     if not report.ok:
         return {"state": "not_written", "reason": "gate did not pass"}
+
+    # The task repos ship their own pre-push hook, and it reads a receipt at
+    # $GATE_RECEIPT (default /tmp/gate-receipt-<task>.json) with `commit`,
+    # `dirty` and a `gates` map that must be all-pass. Benchsmith wrote its
+    # receipt somewhere else in its own shape, so every benchsmith-gated push
+    # was rejected by the repo's hook -- two systems enforcing the same rule and
+    # refusing to believe each other.
+    #
+    # The emitted gates are benchsmith's own check names, not the repo's G1-G5.
+    # Renaming them to match would claim checks that did not run; a reader of
+    # this receipt sees exactly what was verified.
+    _emit_hook_receipt(repo_root, task_name, report, head.strip(), dirty)
 
     body = {
         "task": task_name,

@@ -146,7 +146,7 @@ class Lane:
 
 def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin",
             branch: str = "main", lane: Lane | None = None, apply: bool = False,
-            git=_git, check_review: bool = True) -> dict:
+            git=_git, check_review: bool = True, rebase: bool = False) -> dict:
     """Verify, claim the lane, record the intent, then push exactly once."""
     repo_root = Path(repo_root)
     lane = lane or Lane(repo_root)
@@ -201,10 +201,38 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
             raise PublishRefused(f"cannot read the remote: {r.stderr.strip()[:160]}")
         head = (r.stdout.split() or [""])[0]
         if base_sha and head and head != base_sha:
-            raise PublishRefused(
-                f"the remote is at {head[:8]} but this commit was prepared on {base_sha[:8]}; "
-                "rebase and re-gate — pushing now would measure a tree nobody gated"
-            )
+            # A sibling publishing a DIFFERENT task is the common case, and
+            # refusing outright turned it into a dead end that stopped the whole
+            # loop. Whether it is safe is answerable: if our task's graded and
+            # agent-visible surfaces are unchanged between our base and the new
+            # head, nobody touched our task and rebasing onto it is sound.
+            from .coverage import attribute
+
+            att = attribute(repo_root, task, base_sha, head)
+            if not att.covers:
+                raise PublishRefused(
+                    f"the remote moved to {head[:8]} and {att.verdict} — {att.reason}. "
+                    "Someone changed this task; reconcile by hand rather than rebasing over them."
+                )
+            if not rebase:
+                raise PublishRefused(
+                    f"the remote moved to {head[:8]}, but this task is untouched between the two. "
+                    "Re-run with rebase=True to move the commit onto it and re-gate."
+                )
+            rb = git(repo_root, "rebase", "--onto", head, base_sha, commit_sha, timeout=600)
+            if rb.returncode != 0:
+                git(repo_root, "rebase", "--abort")
+                raise PublishRefused(f"rebase onto {head[:8]} failed: {rb.stderr.strip()[:200]}")
+            # First field only: a git wrapper that appends anything would
+            # otherwise put a ref name inside the SHA we publish.
+            moved = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
+            git(repo_root, "checkout", "--detach", moved)
+            # A rebased commit is a DIFFERENT commit, so the receipt that
+            # attested to the old one does not attest to this. Re-gate; do not
+            # carry the receipt across.
+            return {"state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
+                    "onto": head, "needsRegate": True,
+                    "detail": "rebased onto the new head; re-gate this SHA, then publish it"}
 
         intent = Intent(task=task, base_sha=base_sha or head, commit_sha=commit_sha,
                         remote=remote, branch=branch,

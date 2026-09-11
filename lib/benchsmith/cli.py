@@ -528,6 +528,50 @@ def cmd_scaffold(args) -> int:
     return 0
 
 
+def cmd_relieve(args) -> int:
+    """End a worker and start a successor that resumes from the journal.
+
+    A worker that has stalled, errored out, or exhausted its wall clock is
+    holding a slot and producing nothing. Its work is not lost: the journal is
+    the durable record, so a fresh worker picks up where it left off with a
+    clean context rather than inheriting an exhausted one.
+    """
+    repo = Path(args.repo).resolve()
+    out = {"task": args.task, "oldSession": args.session_id}
+    if args.session_id:
+        out["ended"] = dispatch_mod.relieve(args.session_id)["relieved"]
+    if args.no_successor:
+        _out({**out, "successor": None})
+        return 0
+    try:
+        info = resolve_mod.resolve(args.task)
+    except resolve_mod.Unresolved as e:
+        _out({**out, "successor": None, "reason": str(e)})
+        return 2
+    work_in = info.get("repo") or str(repo)
+    if not args.shared_tree:
+        try:
+            work_in = wt_mod.ensure(Path(info.get("repo") or repo), args.task).path
+        except wt_mod.WorktreeRefused as e:
+            _out({**out, "successor": None, "reason": f"worktree: {e}"})
+            return 2
+    try:
+        p = dispatch_mod.plan(args.task, work_in, mode=info.get("mode", "harden"))
+    except dispatch_mod.DispatchRefused as e:
+        _out({**out, "successor": None, "reason": str(e)})
+        return 2
+    if not args.apply:
+        _out({**out, "successorPlanned": p.shell, "applied": False})
+        return 0
+    res = dispatch_mod.run(p, apply=True)
+    sid = dispatch_mod.session_id(res.get("stdout") or "")
+    if sid and not args.no_snooze:
+        dispatch_mod.snooze(sid)
+    _out({**out, "successor": sid, "applied": True,
+          "note": "the successor resumes from the journal, not from the old session"})
+    return 0
+
+
 def cmd_status(args) -> int:
     """What every dispatched worker is doing right now, in one line each."""
     repo = Path(args.repo).resolve()
@@ -541,11 +585,25 @@ def cmd_status(args) -> int:
         sid = pl.get("session") or ""
         res = dispatch_mod.collect(sid, repo=pl.get("repo", ""), task=pl.get("task", ""))
         hand = res.get("handoff") or {}
-        rows.append({"task": pl.get("task"), "mode": pl.get("mode"), "session": sid,
-                     "state": hand.get("state") or res.get("state"),
-                     "note": (hand.get("note") or res.get("reason") or "")[:110]})
+        row = {"task": pl.get("task"), "mode": pl.get("mode"), "session": sid,
+               "state": hand.get("state") or res.get("state"),
+               "note": (hand.get("note") or res.get("reason") or "")[:110]}
+        # A worker with no handoff yet may be thinking or may have died twenty
+        # minutes ago. Both look like silence, and only one deserves the slot.
+        if not hand and sid:
+            h = dispatch_mod.health(sid)
+            row["health"] = h["state"]
+            row["idleSeconds"] = h.get("idleSeconds")
+            row["errorEvents"] = h.get("errorEvents")
+            if h["state"] == "stalled" or h.get("overRuntime"):
+                row["relieve"] = (f"benchsmith relieve --repo {args.repo} "
+                                  f"--task {pl.get('task')} --session-id {sid} --apply")
+                row["why"] = ("over its wall clock" if h.get("overRuntime") else h["reason"])
+        rows.append(row)
     done = [r for r in rows if r["state"] not in ("running", "starting")]
-    _out({"workers": rows, "running": len(rows) - len(done), "finished": len(done)})
+    stuck = [r for r in rows if r.get("relieve")]
+    _out({"workers": rows, "running": len(rows) - len(done), "finished": len(done),
+          "needRelief": len(stuck)})
     return 0
 
 
@@ -699,7 +757,8 @@ def cmd_publish(args) -> int:
     lane = publish_mod.Lane(repo, run_id=args.run_id)
     try:
         _out(publish_mod.publish(repo, args.task, handoff, remote=args.remote,
-                                 branch=args.branch, lane=lane, apply=args.apply))
+                                 branch=args.branch, lane=lane, apply=args.apply,
+                                 rebase=args.rebase))
     except publish_mod.PublishRefused as e:
         _out({"ok": False, "reason": str(e)})
         return 2
@@ -919,6 +978,16 @@ def main(argv: list[str] | None = None) -> int:
     s = common(sub.add_parser("causal", help="did the last hardening change move the rate?"))
     s.set_defaults(fn=cmd_causal)
 
+    s = sub.add_parser("relieve", help="end a stuck worker and start a successor")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--task", required=True)
+    s.add_argument("--session-id", default="")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--no-successor", action="store_true", help="end it without replacing it")
+    s.add_argument("--no-snooze", action="store_true")
+    s.add_argument("--shared-tree", action="store_true")
+    s.set_defaults(fn=cmd_relieve)
+
     s = sub.add_parser("status", help="what every dispatched worker is doing")
     s.add_argument("--repo", default=".")
     s.set_defaults(fn=cmd_status)
@@ -945,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="leave worker sessions in the AgentCloud inbox")
     s.add_argument("--shared-tree", action="store_true",
                    help="run workers in the checkout itself instead of per-task worktrees")
-    s.add_argument("--max-runtime", type=float, default=8.0,
+    s.add_argument("--max-runtime", type=float, default=24.0,
                    help="hours before the run should wind down (recorded, not enforced)")
     s.set_defaults(fn=cmd_fleet)
 
@@ -972,6 +1041,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--branch", default="main")
     s.add_argument("--run-id", default="")
     s.add_argument("--apply", action="store_true", help="actually push")
+    s.add_argument("--rebase", action="store_true",
+                   help="if the remote moved but this task is untouched, rebase onto it")
     s.set_defaults(fn=cmd_publish)
 
     s = sub.add_parser("reconcile", help="after a crash: did the pending push land?")

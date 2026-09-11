@@ -1807,11 +1807,14 @@ check("planning does not push", _plan["applied"], False)
 check("...and the lane is free afterwards", pub.Lane(_pr).holder(), None)
 check("...and no intent was left behind", pub.Lane(_pr).pending(), None)
 
+# A remote head that resolves to nothing is UNKNOWN, and unknown never counts
+# as "this task is untouched" -- so it is refused rather than rebased over.
 try:
-    pub.publish(_pr, "t1", _ok, git=_fake_remote("9" * 40))
-    check("publish refuses a moved remote", "published", "refused")
+    pub.publish(_pr, "t1", _ok, git=_fake_remote("9" * 40), check_review=False)
+    check("publish refuses an unresolvable moved remote", "published", "refused")
 except pub.PublishRefused as e:
-    check("publish refuses a moved remote", "rebase and re-gate" in str(e), True)
+    check("publish refuses an unresolvable moved remote",
+          "reconcile by hand" in str(e) or "unknown" in str(e), True)
 
 _busy = pub.Lane(_pr); _busy.acquire("other-task")
 try:
@@ -3221,6 +3224,181 @@ check("an unmeasured hardening round is unknown",
 check("only 'confirmed' counts as useful",
       [cz.assess([_rnd(0.8, False), _rnd(0.4)]).useful,
        cz.assess([_rnd(0.40, False), _rnd(0.44)]).useful], [True, False])
+
+
+# --- a moved remote is a rebase, not a dead end ------------------------------
+#
+# A sibling publishing a different task stopped the whole loop: publish refused,
+# and the coordinator had nowhere to go. Whether it is safe is answerable.
+
+_rb = Path(tempfile.mkdtemp()) / "rb"
+for _d in ("mine", "theirs"):
+    (_rb / _d / "tests").mkdir(parents=True)
+
+
+def _rg(*a):
+    return subprocess.run(["git", "-C", str(_rb), *a], capture_output=True, text=True)
+
+
+_rg("init", "-q", "-b", "main"); _rg("config", "user.email", "t@t"); _rg("config", "user.name", "t")
+for _d in ("mine", "theirs"):
+    (_rb / _d / "tests" / "t.py").write_text("def test():\n    assert True\n")
+    (_rb / _d / "instruction.md").write_text("spec\n")
+_rg("add", "-A"); _rg("commit", "-qm", "base")
+_BASE = _rg("rev-parse", "HEAD").stdout.strip()
+(_rb / "mine" / "tests" / "t.py").write_text("def test():\n    assert 1 == 1\n")
+_rg("add", "-A"); _rg("commit", "-qm", "ours")
+_OURS = _rg("rev-parse", "HEAD").stdout.strip()
+_rg("checkout", "-q", _BASE)
+(_rb / "theirs" / "tests" / "t.py").write_text("def test():\n    assert 2 == 2\n")
+_rg("add", "-A"); _rg("commit", "-qm", "sibling")
+_THEIRS = _rg("rev-parse", "HEAD").stdout.strip()
+
+
+def _remote_at(head):
+    """Intercept only ls-remote; everything else is real git, or the rebase is
+    not being tested at all."""
+    def g(repo, *args, **kw):
+        if args and args[0] == "ls-remote":
+            class R:
+                returncode = 0
+                stdout = f"{head}\trefs/heads/main"
+                stderr = ""
+            return R()
+        return subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True)
+    return g
+
+
+_hh = {"state": "ready_to_publish", "commit_sha": _OURS, "base_sha": _BASE, "gate_receipt": "r"}
+
+try:
+    pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False)
+    check("a moved remote is refused without rebase", "published", "refused")
+except pub.PublishRefused as e:
+    check("a moved remote is refused without rebase", "rebase=True" in str(e), True)
+
+_res = pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False, rebase=True)
+check("with rebase it moves onto the new head", _res["state"], "rebased")
+check("...producing a real sha", len(_res["newSha"]) == 40 and " " not in _res["newSha"], True)
+check("...that is a descendant of the sibling's commit",
+      _rg("merge-base", "--is-ancestor", _THEIRS, _res["newSha"]).returncode, 0)
+# A rebased commit is a different commit; the old receipt does not attest to it.
+check("...and demands a fresh gate", _res["needsRegate"], True)
+
+# When the sibling touched OUR task, rebasing over them would be silent.
+_rg("checkout", "-q", _BASE)
+(_rb / "mine" / "tests" / "t.py").write_text("def test():\n    assert 3 == 3\n")
+_rg("add", "-A"); _rg("commit", "-qm", "sibling touched mine")
+_CLASH = _rg("rev-parse", "HEAD").stdout.strip()
+try:
+    pub.publish(_rb, "mine", _hh, git=_remote_at(_CLASH), check_review=False, rebase=True)
+    check("a sibling touching our task is not rebased over", "rebased", "refused")
+except pub.PublishRefused as e:
+    check("a sibling touching our task is not rebased over",
+          "Someone changed this task" in str(e), True)
+
+# --- the receipt the repo's own hook reads -----------------------------------
+
+_hr = Path(tempfile.mkdtemp()) / "hr"
+(_hr / "mytask").mkdir(parents=True)
+subprocess.run(["git", "-C", str(_hr), "init", "-q", "-b", "main"], capture_output=True)
+for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+    subprocess.run(["git", "-C", str(_hr), *_a], capture_output=True)
+(_hr / "mytask" / "task.toml").write_text("[t]\n")
+subprocess.run(["git", "-C", str(_hr), "add", "-A"], capture_output=True)
+subprocess.run(["git", "-C", str(_hr), "commit", "-qm", "base"], capture_output=True)
+
+_hrp = Path(tempfile.mkdtemp()) / "receipt.json"
+os.environ["GATE_RECEIPT"] = str(_hrp)
+try:
+    _rep5 = gate_mod.Report()
+    _rep5.add("oracle", gate_mod.PASS, "1.0")
+    _rep5.add("scope", gate_mod.PASS, "1 path")
+    gate_mod.write_receipt(_hr, "mytask", _rep5)
+    _doc = json.loads(_hrp.read_text())
+    _head = subprocess.run(["git", "-C", str(_hr), "rev-parse", "HEAD"],
+                           capture_output=True, text=True).stdout.strip()
+    # The repo's hook checks exactly these three things.
+    check("the hook receipt binds to HEAD", _doc["commit"], _head)
+    check("...records cleanliness", _doc["dirty"], False)
+    check("...and every gate passes", all(v == "pass" for v in _doc["gates"].values()), True)
+
+    _rep6 = gate_mod.Report()
+    _rep6.add("oracle", gate_mod.NOT_RUN, "no oracle command")
+    gate_mod.write_receipt(_hr, "mytask", _rep6)
+    _doc2 = json.loads(_hrp.read_text())
+    # not_run is not pass, in the repo's hook as much as in ours.
+    check("a not-run check is recorded as not_run", _doc2["gates"]["oracle"], "not_run")
+finally:
+    os.environ.pop("GATE_RECEIPT", None)
+
+
+# --- worker liveness ----------------------------------------------------------
+#
+# A supervisor that only asks "did it produce a handoff" cannot tell a worker
+# thinking hard from one that died twenty minutes ago. Both look like silence,
+# and only one deserves to keep the slot.
+
+import datetime as _dt  # noqa: E402
+
+
+def _ev(mins_ago, typ="block", body="ok"):
+    ts = (_dt.datetime.now() - _dt.timedelta(minutes=mins_ago)).strftime("%Y-%m-%d %H:%M:%S")
+    return {"seq": "1", "type": typ, "created": ts,
+            "event": json.dumps({"block": {"text": body}})}
+
+
+def _feed(events):
+    def run(argv):
+        return 0, json.dumps(events) + "\n" + json.dumps({"has_more": "no"}), ""
+    return run
+
+
+check("a recently active worker is working",
+      dsp.health("s", runner=_feed([_ev(120), _ev(3)]))["state"], "working")
+check("a long-silent worker is stalled",
+      dsp.health("s", runner=_feed([_ev(300), _ev(200)]))["state"], "stalled")
+check("...and says for how long",
+      "200 minutes" in dsp.health("s", runner=_feed([_ev(300), _ev(200)]))["reason"], True)
+check("a finished run is finished, not stalled",
+      dsp.health("s", runner=_feed([_ev(500), _ev(400, "run_finished")]))["state"], "finished")
+check("error events are counted",
+      dsp.health("s", runner=_feed([_ev(5, body="Traceback: fatal error")]))["errorEvents"], 1)
+
+# A Codimango wave legitimately takes a long time, and a worker waiting on one
+# is doing the right thing -- so the stall threshold is generous.
+check("waiting an hour on a validation wave is not a stall",
+      dsp.health("s", runner=_feed([_ev(70), _ev(60)]))["state"], "working")
+check("the stall threshold is generous", dsp.STALL_SECONDS >= 60 * 60, True)
+
+# Unparseable timestamps must not read as healthy: that is how a dead worker
+# holds a slot all day.
+check("no parseable timestamp is unknown, not working",
+      dsp.health("s", runner=_feed([{"seq": "1", "type": "block", "created": "???",
+                                     "event": "{}"}]))["state"], "unknown")
+check("...and says it is unverified",
+      "not healthy" in dsp.health("s", runner=_feed([{"seq": "1", "type": "block",
+                                                      "created": "???", "event": "{}"}]))["reason"],
+      True)
+
+check("a worker's wall clock is a day, not a shift", dsp.MAX_WORKER_HOURS, 24)
+_long = dsp.health("s", runner=_feed([_ev(60 * 30), _ev(5)]))
+check("a worker past its wall clock is flagged", _long["overRuntime"], True)
+check("...even while it is still active", _long["state"], "working")
+
+_calls4 = []
+
+
+def _spy_relieve(argv):
+    _calls4.append(argv)
+    class R:
+        returncode = 0
+    return R()
+
+
+check("a worker can be ended", dsp.relieve("s1", runner=_spy_relieve)["relieved"], True)
+check("...by archiving its session", "archive" in _calls4[-1], True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

@@ -213,9 +213,55 @@ store is shared, so a commit made in a worktree is immediately publishable from 
 Release one when its work is published or abandoned — `benchsmith worktree release --task NAME`.
 It refuses while the tree is dirty, because uncommitted work in there is somebody's round.
 
-**The run is bounded.** `--max-runtime` (default 8 hours) records a deadline in the run file. It is
-recorded rather than enforced: killing a worker mid-round loses the round. When the deadline
-passes, stop dispatching, let what is running finish, and report.
+**The run is bounded, generously.** `--max-runtime` defaults to **24 hours**, and one worker's wall
+clock is the same. Codimango waves are slow and a task can legitimately need many of them. When the
+deadline passes, stop dispatching, let what is running finish, and report.
+
+**Past 24 hours, hand off rather than extend.** A worker that old has an exhausted context, not a
+hard problem. End it and start a successor — the journal is the durable record, so the successor
+resumes with a clean context rather than inheriting a full one.
+
+### Watching the workers, not just the results
+
+`benchsmith status` reports each worker's **health** as well as its handoff, because a worker
+thinking hard and one that died twenty minutes ago both look like silence:
+
+| Health | Meaning |
+|---|---|
+| `working` | activity within the last 90 minutes |
+| `stalled` | nothing for 90+ minutes — it is stuck, not thinking |
+| `finished` | the run ended |
+| `unknown` | no parseable timestamps; unverified, **not** healthy |
+
+The threshold is deliberately generous: a worker waiting an hour on a validation wave is doing
+exactly the right thing. `errorEvents` counts errors in its journal, and `overRuntime` flags one
+past its day.
+
+**Relieve a worker that is stalled, erroring unrecoverably, or over its clock:**
+
+```bash
+benchsmith relieve --repo REPO --task TASK-NAME --session-id SESSION --apply
+```
+
+That ends the session and dispatches a successor on the same task. `status` prints the exact
+command for any worker that needs it. Try the fix first if the error is something a worker could
+recover from; relieve is for when it cannot.
+
+## One blocked task never stops the others
+
+**A publish that cannot proceed is one task's problem, not the run's.** Ending the whole loop
+because one commit could not land wastes every other worker's slot — and the reasons it usually
+happens are all recoverable:
+
+| What happened | What to do |
+|---|---|
+| The repo's pre-push hook rejected it | `benchsmith gate` writes that hook's receipt too; re-gate and retry |
+| `origin/main` moved | `benchsmith publish --rebase` — safe when this task is untouched between the two |
+| Scope rejected | the commit reaches outside the task directory; narrow it and re-commit |
+| Genuinely stuck | record it, **move to the next task**, and report it at the end |
+
+Only report a run as blocked when *every remaining item* is blocked. Otherwise keep going and list
+the blocked ones in the final report.
 
 **An infrastructure failure is re-measured, not re-edited.**
 
