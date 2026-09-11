@@ -520,6 +520,10 @@ def cmd_fleet(args) -> int:
                   file=sys.stderr, flush=True)
             if sid:
                 claimed = [c for c in claimed if c[1] != item.task]  # in use, keep it
+                if lease is not None:
+                    # Hand the lease to the worker. Until now it named this
+                    # process, which is about to exit.
+                    lease.bind(sid)
             _persist()
         else:
             entry["shell"] = p.shell

@@ -99,7 +99,7 @@ def ensure(repo: Path, task: str, *, base: str = "HEAD") -> Worktree:
     return Worktree(task, str(wt), base, created=True)
 
 
-def release(repo: Path, task: str, *, force: bool = False) -> dict:
+def release(repo: Path, task: str, *, force: bool = False, check_lease: bool = True) -> dict:
     """Remove a task's worktree once its work is published or abandoned.
 
     Refuses while the tree is dirty unless forced: uncommitted work in there is
@@ -109,6 +109,23 @@ def release(repo: Path, task: str, *, force: bool = False) -> dict:
     wt = path_for(repo, task)
     if not wt.is_dir():
         return {"task": task, "removed": False, "reason": "no worktree"}
+    if check_lease and not force:
+        # A worktree whose task is leased to a live worker is in use. Removing
+        # it stops that worker mid-round -- which is exactly what happened.
+        try:
+            from .remote_lease import RemoteLease
+
+            lease = RemoteLease(task, repo)
+            sha = lease.remote_sha()
+            if sha:
+                who = lease.owner(sha)
+                if who.session or not who.holder_is_gone:
+                    return {"task": task, "removed": False, "owner": who.as_dict(),
+                            "reason": f"leased to worker {who.session or who.pid}; releasing this "
+                                      "worktree would stop it mid-round"}
+        except Exception:  # noqa: BLE001 - an unreadable lease is not a licence
+            return {"task": task, "removed": False,
+                    "reason": "could not confirm the task is unleased; refusing to remove it"}
     dirty = _git(wt, "status", "--porcelain").stdout.strip()
     if dirty and not force:
         return {"task": task, "removed": False,

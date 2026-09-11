@@ -216,6 +216,17 @@ compare-and-swap so two hosts cannot both win. `publish` re-asserts ownership im
 the push — the window between taking the lane and pushing is exactly when another host can take the
 task.
 
+**The lease belongs to the worker, not to the process that took it.** `fleet` claims the ref, starts
+the worker, then binds the lease to that worker's session id. Until it is bound the lease names
+only the dispatcher — which exits seconds later — so a lease judged by that process's liveness
+frees itself the moment dispatch finishes. That is worse than no lease: a second run claims tasks
+already being worked, two sessions edit one task, and worktrees get released out from under live
+workers.
+
+**Never release a worktree or lease on a task you have not confirmed is idle.** `worktree release`
+refuses when the task is leased to a session, and refuses when it cannot read the lease at all — an
+unconfirmable lease is not a licence. `--force` is for a human who knows the worker is gone.
+
 **An unreadable remote is not a free lease.** The task is skipped with the reason. Pass
 `--no-remote-lease` when the repository genuinely has no shared remote.
 

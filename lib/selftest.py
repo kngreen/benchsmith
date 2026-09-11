@@ -3203,9 +3203,12 @@ check("its commit is visible from the main checkout",
 
 # Uncommitted work in there is somebody's round.
 (Path(_b.path) / "y").write_text("1\n")
-check("an untracked file makes the tree dirty", wtm.release(_wr, "taskB")["removed"], False)
-check("...and the refusal says what to do",
-      "commit or pass force" in wtm.release(_wr, "taskB")["reason"], True)
+# Two independent reasons to refuse, and both must hold. The lease guard runs
+# first: an unconfirmable lease is not a licence to remove a worktree.
+check("an untracked file makes the tree dirty",
+      wtm.release(_wr, "taskB")["removed"], False)
+check("...and with the lease check off, the dirty reason is given",
+      "commit or pass force" in wtm.release(_wr, "taskB", check_lease=False)["reason"], True)
 check("force releases it", wtm.release(_wr, "taskB", force=True)["removed"], True)
 
 for _bad in ("../escape", "a/b", "", "-flag"):
@@ -3843,6 +3846,78 @@ check("the run file is written after every worker, not at the end",
       _clisrc.count("def _persist()") == 1 and "_persist()" in _clisrc, True)
 check("claims that never dispatched are released",
       "releasedUnused" in _clisrc, True)
+
+
+# --- a lease belongs to the worker, not to the dispatcher --------------------
+#
+# The process that takes a lease is the dispatcher, and it exits seconds after
+# dispatching. Judging liveness by its pid made every lease reclaimable the
+# moment dispatch finished: a second run claimed tasks that were already being
+# worked, two sessions edited one task, and worktrees were released out from
+# under live workers. Worse than having no lease at all.
+
+_h2h = _sock.gethostname()
+_dispatcher_only = rl.parse_owner(f"uuid=a host={_h2h} pid=999999 task=t acquired=9")
+_bound = rl.parse_owner(f"uuid=a host={_h2h} pid=999999 task=t acquired=9 session=sess-1")
+
+check("a dispatcher-only lease with a dead pid is reclaimable",
+      _dispatcher_only.holder_is_gone, True)
+check("a lease bound to a worker session is NOT",
+      _bound.holder_is_gone, False)
+check("...even though its recorded pid is long dead", _bound.pid, 999999)
+check("the session is carried in the token", _bound.session, "sess-1")
+check("...and reported to a caller", rl.parse_owner(
+    f"host={_h2h} pid=1 session=s9 acquired=9").as_dict()["session"], "s9")
+
+
+def _bind_git(state):
+    def run(args):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        if args[0] == "ls-remote":
+            R.stdout = f"{state['ref']}\trefs/heads/x" if state["ref"] else ""
+        elif args[0] in ("rev-parse", "commit-tree"):
+            state["n"] = state.get("n", 0) + 1
+            R.stdout = f"tok{state['n']}"
+        elif args[0] == "show":
+            R.stdout = state.get("msg", "")
+        elif args[0] == "push":
+            state["ref"] = args[-1].split(":")[0]
+            state["msg"] = state.get("pending", "")
+        return R
+    return run
+
+
+_bs = {"ref": ""}
+_bl = rl.RemoteLease("t", "/tmp", runner=_bind_git(_bs))
+_bl.acquire()
+_before = _bl.sha
+check("binding moves the lease to a new token", _bl.bind("sess-9")["bound"], True)
+check("...and the sha changes", _bl.sha != _before, True)
+check("...and the session is recorded on the object", _bl.session_id, "sess-9")
+try:
+    rl.RemoteLease("t", "/tmp", runner=_bind_git({"ref": ""})).bind("s")
+    check("binding an unheld lease is refused", "bound", "refused")
+except rl.LeaseLost:
+    check("binding an unheld lease is refused", True, True)
+
+# Releasing a worktree whose task is leased to a live worker stops that worker.
+_wtl = Path(tempfile.mkdtemp()) / "lrepo"
+(_wtl / "t").mkdir(parents=True)
+subprocess.run(["git", "-C", str(_wtl), "init", "-q", "-b", "main"], capture_output=True)
+for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+    subprocess.run(["git", "-C", str(_wtl), *_a], capture_output=True)
+(_wtl / "t" / "task.toml").write_text("[t]\n")
+subprocess.run(["git", "-C", str(_wtl), "add", "-A"], capture_output=True)
+subprocess.run(["git", "-C", str(_wtl), "commit", "-qm", "b"], capture_output=True)
+wtm.ensure(_wtl, "t")
+# No remote here, so the lease is unreadable -- which is not a licence to remove.
+_r9 = wtm.release(_wtl, "t")
+check("an unconfirmable lease blocks worktree removal", _r9["removed"], False)
+check("...saying it could not confirm", "could not confirm" in _r9["reason"], True)
+check("force still works for a human who knows", wtm.release(_wtl, "t", force=True)["removed"], True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

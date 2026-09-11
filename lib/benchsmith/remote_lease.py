@@ -65,6 +65,12 @@ class Owner:
     pid: int = 0
     task: str = ""
     acquired: int = 0
+    # The worker this lease is actually FOR. The process that takes a lease is
+    # the dispatcher, and it exits seconds later; judging liveness by its pid
+    # made every lease reclaimable the moment dispatch finished, which is worse
+    # than having no lease at all. Once a session is recorded, that session's
+    # state is the only thing that says whether the work is still happening.
+    session: str = ""
 
     @property
     def age(self) -> float:
@@ -81,13 +87,19 @@ class Owner:
 
     @property
     def holder_is_gone(self) -> bool:
-        """The recorded process is dead, on this host.
+        """The recorded holder is definitely gone.
 
-        benchsmith runs as commands, so the process that took a lease has
-        usually exited by the time another command wants it. Treating a lease as
-        foreign because the PID differs would make one takeable by nobody --
-        including the person who took it.
+        A lease with a SESSION is owned by that worker, not by whatever process
+        created it. The dispatcher exits within seconds of dispatching, so a
+        dead dispatcher pid says nothing about whether the worker is still
+        running -- and treating it as free released worktrees out from under
+        live workers.
+
+        With no session recorded, the lease belongs to a command that never got
+        as far as starting one, and a dead pid on this host does mean gone.
         """
+        if self.session:
+            return False
         if not self.same_host or not self.pid:
             return False
         try:
@@ -99,7 +111,7 @@ class Owner:
         return False
 
     def as_dict(self) -> dict:
-        return {"uuid": self.uuid, "host": self.host, "pid": self.pid,
+        return {"uuid": self.uuid, "host": self.host, "pid": self.pid, "session": self.session,
                 "task": self.task, "acquiredAgo": int(self.age) if self.acquired else None}
 
 
@@ -115,7 +127,8 @@ def parse_owner(message: str) -> Owner:
 
     return Owner(uuid=grab("uuid", str, "") or "", host=grab("host", str, "") or "",
                  pid=grab("pid", int, 0) or 0, task=grab("task", str, "") or "",
-                 acquired=grab("acquired", int, 0) or 0)
+                 acquired=grab("acquired", int, 0) or 0,
+                 session=grab("session", str, "") or "")
 
 
 class RemoteLease:
@@ -130,6 +143,8 @@ class RemoteLease:
         # A sha the caller already fetched in a batch, so acquire() need not
         # make its own round trip just to discover the ref is free.
         self._known = known
+        # Set once the worker exists, then written into the lease by `bind`.
+        self.session_id = ""
         self._run = runner
 
     # A lease ref is not a task publication, and the repos' pre-push hook does
@@ -178,7 +193,8 @@ class RemoteLease:
     def _token(self) -> str:
         tree = self._git("rev-parse", "HEAD^{tree}", check=True).stdout.strip()
         msg = (f"benchsmith lease uuid={uuid.uuid4()} host={socket.gethostname()} "
-               f"pid={os.getpid()} task={self.task} acquired={int(time.time())}")
+               f"pid={os.getpid()} task={self.task} acquired={int(time.time())}"
+               + (f" session={self.session_id}" if self.session_id else ""))
         return self._git("commit-tree", tree, "-m", msg, check=True).stdout.strip()
 
     def acquire(self) -> dict:
@@ -214,6 +230,24 @@ class RemoteLease:
                                              f"{p.stderr.strip()[:120]}"}
         self.sha = token
         return {"held": True, "owner": self.owner(token).as_dict()}
+
+    def bind(self, session_id: str) -> dict:
+        """Record which worker this lease is for, once one exists.
+
+        Until this is called the lease names only the dispatcher, and the
+        dispatcher is about to exit.
+        """
+        if not self.sha:
+            raise LeaseLost("cannot bind a lease that is not held")
+        self.session_id = session_id
+        token = self._token()
+        p = self._git("push", "-q", *self._NOVERIFY,
+                      f"--force-with-lease={self.ref}:{self.sha}",
+                      self.remote, f"{token}:{self.ref}")
+        if p.returncode:
+            return {"bound": False, "reason": (p.stderr or p.stdout).strip()[:160]}
+        self.sha = token
+        return {"bound": True, "session": session_id}
 
     def assert_owned(self) -> None:
         """Fail closed immediately before a publication mutation."""
