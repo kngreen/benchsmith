@@ -344,6 +344,68 @@ def check_scope(repo_root: Path, task_name: str, report: Report) -> None:
     )
 
 
+# A "lever" is a surface whose change moves the difficulty band. Corrective work
+# (Dockerfiles, flake fixes, environment) touches none of them.
+LEVERS = {
+    "graded": ("tests/", "task.toml"),
+    "spec": ("instruction.md",),
+    "solution": ("solution/", "reference/", ".patch"),
+}
+
+
+def levers_touched(paths: list[str], task_name: str) -> set[str]:
+    """Which difficulty-bearing surfaces a change set moves."""
+    hit: set[str] = set()
+    for raw in paths:
+        rel = raw[len(task_name) + 1:] if raw.startswith(f"{task_name}/") else raw
+        # steps/<n>/tests/... and steps/<n>/instruction.md are the multi-step
+        # spellings of the same two surfaces.
+        if rel.startswith("steps/"):
+            rel = "/".join(rel.split("/")[2:])
+        for name, markers in LEVERS.items():
+            if any(m in rel if m.endswith("/") or m.startswith(".") else rel == m or rel.endswith("/" + m)
+                   for m in markers):
+                hit.add(name)
+    return hit
+
+
+def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Report) -> None:
+    """In hardening mode, move exactly one difficulty lever per round.
+
+    Two levers in one round makes the next measurement unattributable: the band
+    moved, and nothing in the record says which change moved it. That is not a
+    style preference -- it is the difference between evidence and a coincidence,
+    and it is the failure mode that produces a task nobody can tune.
+
+    Corrective rounds are exempt and batch freely; they are not claiming to have
+    moved anything.
+    """
+    if mode != "harden":
+        report.add("single-lever", NOT_RUN, f"mode is {mode!r}; batching corrective work is allowed")
+        return
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--cached", "--name-only"],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as e:
+        report.add("single-lever", NOT_RUN, f"git unavailable: {e}")
+        return
+    staged = [p for p in r.stdout.split() if p]
+    if not staged:
+        report.add("single-lever", NOT_RUN, "nothing staged")
+        return
+    hit = levers_touched(staged, task_name)
+    if len(hit) > 1:
+        report.add("single-lever", FAIL,
+                   "moves " + ", ".join(sorted(hit)) + " in one hardening round; "
+                   "split them so the next measurement is attributable")
+    elif not hit:
+        report.add("single-lever", PASS, "no difficulty lever moved")
+    else:
+        report.add("single-lever", PASS, f"one lever: {hit.pop()}")
+
+
 def check_hygiene(task_dir: Path, report: Report) -> None:
     junk = [str(p.relative_to(task_dir)) for p in Path(task_dir).rglob("*") if p.suffix == ".pyc"]
     junk += [str(p.relative_to(task_dir)) for p in Path(task_dir).rglob("__pycache__")]
@@ -387,6 +449,7 @@ def run(
     check_excursion(journal, report)
     check_budget(journal, report)
     check_scope(repo_root, task_name, report)
+    check_single_lever(repo_root, task_name, journal.mode, report)
     check_hygiene(task_dir, report)
     check_oracle(oracle_cmd, report)
     h = surface_hashes(task_dir)

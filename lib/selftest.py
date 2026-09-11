@@ -1226,5 +1226,279 @@ for label, old, new in _MUTANTS:
     check(f"removing the {label} is caught", _survives(old, new), True)
 
 
+# --- measurement attribution: does this row describe our commit? -------------
+#
+# Exact-SHA selection is correct for one loop and deadlocks a fleet. These
+# fixtures pin the four verdicts against a real git repo, because the rule is
+# about ancestry and tree contents and a stubbed git would only test the stub.
+
+from benchsmith import coverage as cov  # noqa: E402
+
+_cr = Path(tempfile.mkdtemp()) / "cov"
+_cr.mkdir(parents=True)
+
+
+def _cgit(*args):
+    return subprocess.run(["git", "-C", str(_cr), *args], capture_output=True, text=True)
+
+
+_cgit("init", "-q", "-b", "main")
+_cgit("config", "user.email", "t@t"); _cgit("config", "user.name", "t")
+_task = _cr / "mytask"
+(_task / "tests").mkdir(parents=True)
+(_task / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+(_task / "instruction.md").write_text("do the thing\n")
+(_task / "README.md").write_text("notes\n")
+_cgit("add", "-A"); _cgit("commit", "-qm", "base")
+_OURS = _cgit("rev-parse", "HEAD").stdout.strip()
+
+# A sibling loop pushes something that touches neither surface.
+(_cr / "unrelated.txt").write_text("sibling work\n")
+_cgit("add", "-A"); _cgit("commit", "-qm", "sibling")
+_SIBLING = _cgit("rev-parse", "HEAD").stdout.strip()
+
+check("exact SHA covers", cov.attribute(_cr, "mytask", _OURS, _OURS).verdict, cov.EXACT)
+_a = cov.attribute(_cr, "mytask", _OURS, _SIBLING)
+check("descendant with untouched surfaces covers", _a.verdict, cov.ANCESTOR_IDENTICAL)
+check("...and is reported as covering", _a.covers, True)
+
+# A README edit is not a change to what was measured.
+(_task / "README.md").write_text("notes, revised\n")
+_cgit("add", "-A"); _cgit("commit", "-qm", "readme only")
+check("a non-surface edit still covers",
+      cov.attribute(_cr, "mytask", _OURS, _cgit("rev-parse", "HEAD").stdout.strip()).verdict,
+      cov.ANCESTOR_IDENTICAL)
+
+# A graded-surface edit is.
+(_task / "tests" / "test_a.py").write_text("def test_a():\n    assert 1 == 1\n")
+_cgit("add", "-A"); _cgit("commit", "-qm", "graded change")
+_g = _cgit("rev-parse", "HEAD").stdout.strip()
+check("a graded-surface change does not cover",
+      cov.attribute(_cr, "mytask", _OURS, _g).verdict, cov.DIVERGENT)
+check("...and is reported as not covering", cov.attribute(_cr, "mytask", _OURS, _g).covers, False)
+
+# So is a spec edit, which is how a task gets quietly easier.
+(_task / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+(_task / "instruction.md").write_text("do the thing, with a hint\n")
+_cgit("add", "-A"); _cgit("commit", "-qm", "spec change")
+check("a visible-surface change does not cover",
+      cov.attribute(_cr, "mytask", _OURS, _cgit("rev-parse", "HEAD").stdout.strip()).verdict,
+      cov.DIVERGENT)
+
+# A measurement from before our push is not about our push.
+check("an ancestor of ours is stale, not coverage",
+      cov.attribute(_cr, "mytask", _SIBLING, _OURS).verdict, cov.STALE)
+
+# Unknown is never coverage.
+check("an unresolvable sha is unknown",
+      cov.attribute(_cr, "mytask", _OURS, "0" * 40).verdict, cov.UNKNOWN)
+check("unknown does not cover", cov.attribute(_cr, "mytask", _OURS, "0" * 40).covers, False)
+check("a missing sha is unknown", cov.attribute(_cr, "mytask", _OURS, "").verdict, cov.UNKNOWN)
+check("UNKNOWN is not in the covering set", cov.UNKNOWN in cov.COVERING, False)
+check("STALE is not in the covering set", cov.STALE in cov.COVERING, False)
+check("DIVERGENT is not in the covering set", cov.DIVERGENT in cov.COVERING, False)
+
+# --- select_jobs honours the predicate ---
+from benchsmith.snapshot import select_jobs as _sel  # noqa: E402
+
+
+def _job(jid, sha, agent="codex"):
+    return {"id": jid, "status": "completed",
+            "config": {"commitSha": sha, "agentName": agent, "nAttempts": 5},
+            "stats": {"passed": 1, "failed": 4}}
+
+
+_jobs = [_job("j1", _OURS), _job("j2", _SIBLING, "claude-code")]
+_kept, _notes = _sel(_jobs, _OURS)
+check("without a predicate, only the exact SHA survives", len(_kept), 1)
+_kept2, _notes2 = _sel(_jobs, _OURS, covers=cov.covers_factory(_cr, "mytask"))
+check("with the predicate, the buried sibling row is recovered", len(_kept2), 2)
+check("admission by ancestry is journalled, not silent",
+      any("admitted j2 by ancestor-identical" in n for n in _notes2), True)
+
+_bad = [_job("j3", "0" * 40)]
+check("an unknown sha is still excluded with a predicate",
+      len(_sel(_bad, _OURS, covers=cov.covers_factory(_cr, "mytask"))[0]), 0)
+
+
+# --- one difficulty lever per hardening round --------------------------------
+
+from benchsmith.gate import check_single_lever, levers_touched  # noqa: E402
+
+check("a test edit is the graded lever",
+      levers_touched(["mytask/tests/test_a.py"], "mytask"), {"graded"})
+check("a spec edit is the spec lever",
+      levers_touched(["mytask/instruction.md"], "mytask"), {"spec"})
+check("a reference edit is the solution lever",
+      levers_touched(["mytask/solution/fix.py"], "mytask"), {"solution"})
+check("multi-step spellings resolve to the same surfaces",
+      levers_touched(["mytask/steps/2/tests/t.py", "mytask/steps/1/instruction.md"], "mytask"),
+      {"graded", "spec"})
+check("a Dockerfile is not a lever",
+      levers_touched(["mytask/Dockerfile", "mytask/README.md"], "mytask"), set())
+check("task.toml counts as graded", levers_touched(["mytask/task.toml"], "mytask"), {"graded"})
+
+_lr = Path(tempfile.mkdtemp()) / "lever"
+(_lr / "mytask" / "tests").mkdir(parents=True)
+
+
+def _lgit(*a):
+    return subprocess.run(["git", "-C", str(_lr), *a], capture_output=True, text=True)
+
+
+_lgit("init", "-q", "-b", "main")
+_lgit("config", "user.email", "t@t"); _lgit("config", "user.name", "t")
+(_lr / "mytask" / "instruction.md").write_text("spec\n")
+(_lr / "mytask" / "tests" / "t.py").write_text("def test():\n    pass\n")
+_lgit("add", "-A"); _lgit("commit", "-qm", "base")
+
+# Two levers in one hardening round: the next band move is unattributable.
+(_lr / "mytask" / "instruction.md").write_text("spec, tightened\n")
+(_lr / "mytask" / "tests" / "t.py").write_text("def test():\n    assert False\n")
+_lgit("add", "-A")
+
+_r = gate_mod.Report(); check_single_lever(_lr, "mytask", "harden", _r)
+_st = {c.name: c for c in _r.checks}["single-lever"]
+check("two levers in a hardening round fails", _st.state, "FAIL")
+check("...and names both", "graded" in _st.detail and "spec" in _st.detail, True)
+
+# The same change set is fine when the round is not claiming a difficulty move.
+_r2 = gate_mod.Report(); check_single_lever(_lr, "mytask", "repair", _r2)
+check("repair mode batches freely",
+      {c.name: c for c in _r2.checks}["single-lever"].state, "NOT_RUN")
+
+_lgit("reset", "-q")
+(_lr / "mytask" / "instruction.md").write_text("spec\n")
+_lgit("add", "mytask/tests/t.py")
+_r3 = gate_mod.Report(); check_single_lever(_lr, "mytask", "harden", _r3)
+check("one lever passes", {c.name: c for c in _r3.checks}["single-lever"].state, "PASS")
+
+_lgit("reset", "-q")
+(_lr / "mytask" / "Dockerfile").write_text("FROM scratch\n")
+_lgit("add", "mytask/Dockerfile")
+_r4 = gate_mod.Report(); check_single_lever(_lr, "mytask", "harden", _r4)
+check("a corrective-only change moves no lever",
+      {c.name: c for c in _r4.checks}["single-lever"].state, "PASS")
+
+
+# --- infra backoff -----------------------------------------------------------
+
+import random as _rnd  # noqa: E402
+
+from benchsmith import backoff as bo  # noqa: E402
+
+
+def _rounds(*classes):
+    return [{"class": c} for c in classes]
+
+
+check("no streak after a task round", bo.consecutive(_rounds("infra", "too-easy")), 0)
+check("streak counts back from the end", bo.consecutive(_rounds("too-easy", "infra", "infra")), 2)
+check("not-measured counts as platform", bo.consecutive(_rounds("not-measured")), 1)
+check("platform-stale counts", bo.consecutive(_rounds("platform-stale", "infra")), 2)
+check("an empty journal has no streak", bo.consecutive([]), 0)
+check("grader-false-negative is the task's problem, not the platform's",
+      bo.consecutive(_rounds("grader-false-negative")), 0)
+
+check("no wait without a streak", bo.delay(0), 0.0)
+_d1 = bo.delay(1, rng=_rnd.Random(1)); _d3 = bo.delay(3, rng=_rnd.Random(1))
+check("the wait grows with the streak", _d3 > _d1, True)
+check("the wait is capped", bo.delay(50, rng=_rnd.Random(1)) <= bo.CAP_SECONDS, True)
+# Two workers hitting one outage must not retry in lockstep.
+check("jitter separates concurrent workers",
+      bo.delay(3, rng=_rnd.Random(1)) != bo.delay(3, rng=_rnd.Random(2)), True)
+check("jitter never yields a zero wait", bo.delay(3, rng=_rnd.Random(7)) > 0, True)
+
+check("a short streak waits", bo.advise(_rounds("infra"), rng=_rnd.Random(1)).stop, False)
+_stop = bo.advise(_rounds(*["infra"] * bo.STREAK_STOP), rng=_rnd.Random(1))
+check("a long streak stops instead of polling an outage", _stop.stop, True)
+check("...and says blocked-on-platform", "blocked-on-platform" in _stop.reason, True)
+check("a stopped advice asks for no further wait", _stop.delay_seconds, 0.0)
+check("advice serialises", set(bo.advise(_rounds("infra")).as_dict()),
+      {"streak", "delaySeconds", "stop", "reason"})
+
+
+# --- mutation probe ----------------------------------------------------------
+#
+# The probe's own claim -- "the suite catches near-misses" -- has to be
+# falsifiable, so these run it against a suite that genuinely discriminates and
+# one that genuinely does not, and require different answers.
+
+from benchsmith import mutate as mu  # noqa: E402
+
+_b, _n = mu.build_battery({"a.py": "def f(x):\n    return x == 1\n"})
+check("a comparison yields a mutant", len(_b) >= 1, True)
+check("the mutant names a line", _b[0].line, 2)
+check("the mutant is a single edit", "!=" in _b[0].after, True)
+check("comments are not mutated", mu.build_battery({"a.py": "# x == 1\n"})[0], [])
+check("an unsupported language yields no mutants and says so",
+      mu.build_battery({"a.swift": "let x = 1 == 1\n"})[0], [])
+check("...with a note naming the file",
+      any("a.swift" in s for s in mu.build_battery({"a.swift": "let x = 1 == 1\n"})[1]), True)
+check("go is supported", len(mu.build_battery({"a.go": "if x == 1 {\n"})[0]), 1)
+check("generation is deterministic",
+      [m.as_dict() for m in mu.build_battery({"a.py": "x==1\ny<2\n"})[0]],
+      [m.as_dict() for m in mu.build_battery({"a.py": "x==1\ny<2\n"})[0]])
+
+_big = {"a.py": "\n".join(f"v{i} = {i} == {i}" for i in range(30)),
+        "b.py": "\n".join(f"w{i} = {i} == {i}" for i in range(30))}
+_cap, _cn = mu.build_battery(_big)
+check("the battery is capped", len(_cap), mu.MAX_BATTERY)
+check("the cap is reported", any("capped" in s for s in _cn), True)
+# Alphabetical exhaustion would hide every survivor in b.py.
+check("the cap spreads across files", len({m.path for m in _cap}), 2)
+
+# --- run_battery against real suites ---
+_mr = Path(tempfile.mkdtemp()) / "mtask"
+(_mr).mkdir(parents=True)
+(_mr / "impl.py").write_text("def classify(n):\n    return n >= 10\n")
+
+# A suite that only ever checks one side of the boundary cannot see the flip.
+(_mr / "weak_test.py").write_text(
+    "import unittest\nfrom impl import classify\n"
+    "class T(unittest.TestCase):\n"
+    "    def test_big(self):\n        self.assertTrue(classify(100))\n")
+# A suite that pins the boundary can.
+(_mr / "strong_test.py").write_text(
+    "import unittest\nfrom impl import classify\n"
+    "class T(unittest.TestCase):\n"
+    "    def test_boundary(self):\n"
+    "        self.assertTrue(classify(10))\n        self.assertFalse(classify(9))\n")
+
+_muts, _ = mu.build_battery({"impl.py": (_mr / "impl.py").read_text()})
+_weak = mu.run_battery(_mr, _muts, [sys.executable, "-m", "unittest", "-q", "weak_test"])
+_strong = mu.run_battery(_mr, _muts, [sys.executable, "-m", "unittest", "-q", "strong_test"])
+check("a weak suite lets a mutant survive", _weak["status"], "FAIL")
+check("...and the survivor names a line", bool(_weak["survivors"][0]["line"]), True)
+check("a discriminating suite catches them", _strong["status"], "PASS")
+check("the probe is discriminating (the two suites disagree)",
+      _weak["status"] != _strong["status"], True)
+
+check("no test command is NOT_RUN, not clean",
+      mu.run_battery(_mr, _muts, [])["status"], "NOT_RUN")
+check("no mutants is NOT_RUN, not clean",
+      mu.run_battery(_mr, [], ["true"])["status"], "NOT_RUN")
+
+# A mutant the compiler rejects says nothing about the tests.
+_broken = [mu.Mutant(path="impl.py", line=2, operator="x", before="", after="    return ((")]
+_bres = mu.run_battery(_mr, _broken, [sys.executable, "-m", "unittest", "-q", "weak_test"])
+check("an unbuildable mutant is not viable", _bres["mutants"][0]["outcome"], mu.NOT_VIABLE)
+check("...and leaves the denominator", _bres["viable"], 0)
+check("an all-unviable battery proves nothing", _bres["status"], "NOT_RUN")
+
+# A harness that cannot run makes every mutant look caught. That must be
+# NOT_RUN, never a clean bill -- it is how the probe first fooled itself.
+check("a broken baseline is NOT_RUN, not a clean bill",
+      mu.run_battery(_mr, _muts, [sys.executable, "-m", "no_such_runner"])["status"], "NOT_RUN")
+check("...and says why",
+      "does not pass on the unmutated tree"
+      in mu.run_battery(_mr, _muts, [sys.executable, "-m", "no_such_runner"])["reason"], True)
+
+check("a swift target is NOT_RUN, not clean",
+      mu.probe(_mr, ["nope.swift"], ["true"])["status"], "NOT_RUN")
+check("...and says uncovered",
+      "Uncovered, not clean" in mu.probe(_mr, ["nope.swift"], ["true"])["reason"], True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

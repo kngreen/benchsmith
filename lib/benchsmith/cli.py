@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import gate as gate_mod
 from . import preflight as preflight_mod
+from . import coverage
 from . import dispatch as dispatch_mod
 from .queue import Leases, build_queue, read_journals
 from .adapter import Identity, Platform, Unresolved, discover
@@ -81,6 +82,13 @@ def cmd_bar(args) -> int:
     """Compute the §5 bar from a snapshot payload."""
     raw = _load(args)
     strongest = [tuple(x) for x in (raw.get("strongest") or [])]
+    # Attribution needs a checkout to resolve ancestry and hash surfaces. With
+    # no repo, the rule falls back to exact SHA equality -- narrower, never
+    # wider, so a payload-only run cannot admit a row a repo-backed run would
+    # have rejected.
+    covers = None
+    if args.repo and args.task:
+        covers = coverage.covers_factory(Path(args.repo).resolve(), args.task)
     m = build(
         raw.get("task") or {},
         raw.get("jobs") or [],
@@ -89,6 +97,7 @@ def cmd_bar(args) -> int:
         steps=tuple(raw.get("steps") or ("1",)),
         active_sha=raw.get("activeSha") or args.sha or "",
         categories=tuple(raw.get("categories") or ()),
+        covers=covers,
     )
     all_trials = [t for lst in (raw.get("trials") or {}).values() for t in lst]
     result = evaluate(m, target=args.target)
@@ -257,6 +266,11 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("bar", help="compute the hardness bar from a read payload")
     s.add_argument("input", nargs="?", default="-")
     s.add_argument("--sha", default="")
+    # Optional: with a checkout, a measurement taken at a descendant commit
+    # whose graded and visible surfaces are unchanged still counts. Without
+    # one, the rule is exact SHA equality.
+    s.add_argument("--repo", default=None)
+    s.add_argument("--task", default=None)
     s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"),
                    choices=("hard-only", "hard-preferred"))
     s.set_defaults(fn=cmd_bar)

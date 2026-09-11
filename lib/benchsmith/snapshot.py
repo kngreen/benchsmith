@@ -153,8 +153,14 @@ def is_participant(job: dict) -> tuple[bool, str]:
     return (True, "")
 
 
-def select_jobs(jobs: list[dict], validation_sha: str) -> tuple[list[dict], list[str]]:
-    """The participant jobs for one exact SHA — newest batch per cohort.
+def select_jobs(jobs: list[dict], validation_sha: str, covers=None) -> tuple[list[dict], list[str]]:
+    """The participant jobs whose measurement describes our commit.
+
+    `covers(ours, theirs) -> Attribution` decides whether a job taken at another
+    commit still describes ours; see `coverage.py`. Without it the rule is exact
+    SHA equality, which is correct for a single loop and deadlocks a fleet --
+    the platform dispatches at the branch tip, so a sibling's push buries yours
+    and no measurement is ever addressed to your SHA again.
 
     **Never derive cohort rates from the task record's headline fields.** Those
     carry `agentPassCount/Rate`, `metacodePassCount/Rate` and `avocadoPass*` and
@@ -180,8 +186,16 @@ def select_jobs(jobs: list[dict], validation_sha: str) -> tuple[list[dict], list
             continue
         commit = job_commit(job)
         if validation_sha and commit and commit != validation_sha:
-            notes.append(f"excluded {job.get('id')}: commit {commit[:8]} != {validation_sha[:8]}")
-            continue
+            if covers is None:
+                notes.append(f"excluded {job.get('id')}: commit {commit[:8]} != {validation_sha[:8]}")
+                continue
+            att = covers(validation_sha, commit)
+            if not att.covers:
+                notes.append(f"excluded {job.get('id')}: {att.verdict} — {att.reason}")
+                continue
+            # Recorded, not merely allowed: an audit must be able to see that
+            # this row was admitted by ancestry rather than by an exact match.
+            notes.append(f"admitted {job.get('id')} by {att.verdict}: {att.reason}")
         live.append(job)
 
     if not live:
@@ -743,14 +757,17 @@ def review_manifest(task: dict, jobs: list[dict], active_sha: str, required=REQU
     return rows
 
 
-def build(task: dict, jobs: list[dict], trials_by_job: dict, *, strongest, steps, active_sha, categories=()):
+def build(task: dict, jobs: list[dict], trials_by_job: dict, *, strongest, steps, active_sha,
+          categories=(), covers=None):
     """Assemble a Measurement from platform records.
 
-    Job selection is SHA-scoped and cohort-deduplicated first: the task record's
-    headline pass fields are never a source of rates (see `select_jobs`).
+    Job selection is coverage-scoped and cohort-deduplicated first: the task
+    record's headline pass fields are never a source of rates (see
+    `select_jobs`). `covers` is the attribution predicate; without it the rule
+    is exact SHA equality.
     """
     validation_sha = str(task.get("validationCommitSha") or active_sha or "")
-    chosen, notes = select_jobs(jobs, validation_sha)
+    chosen, notes = select_jobs(jobs, validation_sha, covers=covers)
     plan = build_plan(
         chosen, strongest=strongest, steps=steps, categories=categories, trials_by_job=trials_by_job
     )
