@@ -131,7 +131,15 @@ benchsmith collect --session-id <session>     # per worker, until state is not "
 | `ready_to_publish` | `benchsmith publish --repo REPO --task TASK-NAME --handoff HANDOFF.json --apply` |
 | `blocked` / `needs_human` | record it, move on, report at the end |
 | `no_change` / `failed` | record it, move on |
-| `finished-without-handoff` | the worker did not answer; treat as failed, do not guess |
+| `finished-without-handoff` | check `<repo>/.benchsmith/handoff/<task>.json` before concluding — stdout is not durable. If that is absent too, treat as failed and do not guess |
+| `starting` | the session has not emitted yet; poll again, do not abandon it |
+| `unreadable` | the poll itself failed; that is not the same as no answer |
+
+**Workers run only on this host.** benchsmith is a package installed here, it is not delivered with
+this skill, and it cannot be fetched — the repository is private, so a fresh AgentCloud runtime's
+clone returns HTTP 403. A worker that lands off-host reports `blocked`; that is the finding, not
+something to route around. If AgentCloud gives you a fresh runtime, attach the devserver, or
+dispatch with `--backend codex`, which runs locally against the installed package.
 
 When a worker finishes, dispatch the next queue item into the free slot. Keep going until the queue
 drains or every remaining item needs a human, then report once: what published, what is blocked,

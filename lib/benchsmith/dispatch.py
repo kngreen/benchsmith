@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import socket
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,8 +32,11 @@ DEFAULT_HARNESS = ""
 
 HANDOFF_LIMIT = 4096
 
-# Where a worker gets benchsmith from when it is not already on disk.
-BENCHSMITH_ORIGIN = "https://github.com/kngreen/benchsmith.git"
+# The one host benchsmith is installed on. A worker that lands anywhere else
+# cannot run it: the repository is private, so the "just clone it" fallback
+# returns HTTP 403 from a fresh runtime. Being off-host is a reportable state,
+# not something to work around.
+HOST = socket.gethostname()
 
 # The lowercase proxy vars on a devserver point at a host that is frequently
 # dead; the uppercase ones work. Reaching GitHub needs the working pair, and
@@ -46,6 +50,11 @@ PROXY_PREAMBLE = (
 # holding N full transcripts is the context-exhaustion the fleet audit measured
 # at 550-724K input tokens per call, most of it spent waiting.
 HANDOFF_FIELDS = ("work_item", "state", "base_sha", "commit_sha", "gate_receipt", "next_action", "note")
+
+# Where a worker also writes its answer. Stdout is not durable: a launcher that
+# backgrounds the process, or drops its pipe, loses the handoff and the work
+# with it -- observed once, where a completed local pass reported nothing.
+HANDOFF_DIR = ".benchsmith/handoff"
 HANDOFF_STATES = frozenset({
     "ready_to_publish", "blocked", "needs_human", "no_change", "failed", "in_progress",
 })
@@ -134,17 +143,21 @@ def bootstrap_block(root: str | None = None) -> str:
     """
     root = root or benchsmith_root()
     return (
-        "First, make benchsmith available:\n"
+        f"**This work runs only on `{HOST}`.** benchsmith is a package installed there. It is not "
+        "delivered with this skill and it cannot be fetched: the repository is private, so a "
+        "fresh runtime's clone returns HTTP 403. If you are not on that host, attach it first.\n\n"
         "```bash\n"
         f"{PROXY_PREAMBLE}\n"
         f"export BENCHSMITH_BIN={root}/bin/benchsmith\n"
-        f'test -x "$BENCHSMITH_BIN" || {{ git clone {BENCHSMITH_ORIGIN} /tmp/benchsmith '
-        f'&& export BENCHSMITH_BIN=/tmp/benchsmith/bin/benchsmith; }}\n'
+        'test -x "$BENCHSMITH_BIN" || { echo "NOT ON THE HOST"; exit 1; }\n'
         '"$BENCHSMITH_BIN" preflight --json\n'
-        "```\n"
-        "If the clone fails, stop and report state=blocked. Do not improvise a "
-        "substitute for the gate: an ungated push is the failure this exists to "
-        "prevent.\n\n"
+        "```\n\n"
+        f"If `$BENCHSMITH_BIN` is missing you are not on `{HOST}`. Attach that devserver and retry "
+        "once. If you still cannot reach it, report `state=blocked` saying so and stop -- being "
+        "off-host is the finding, not something to work around, and cloning from GitHub will only "
+        "produce a misleading 403.\n\n"
+        "Never improvise a substitute for the gate: an ungated push is the failure this exists "
+        "to prevent.\n\n"
     )
 
 
@@ -171,8 +184,15 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
         "Route: §3 intake first — run the kill tests and reach GO / DERISK / KILL. "
         "**A KILL is a successful outcome**; report it and stop rather than scaffolding "
         "something the screen rejected. On GO, scaffold from the official skeleton for the "
-        "track (STEP S), then §4.\n\n"
+        "track (STEP S), then author it (§4).\n\n"
+        "**A bare skeleton is not done.** Generating the official tree and stopping leaves an "
+        "uncommitted, ungradeable directory that looks like progress and is not: no instruction, "
+        "no tests, no reference solution, nothing to measure. Finish §4 — author the task, prove "
+        "the oracle passes and the unchanged base fails, commit, and run the gate. If you cannot "
+        "get that far, report `state=blocked` and say where you stopped; do not report a skeleton "
+        "as a result.\n\n"
         "YOU MAY NOT PUSH. Prepare the commit, run the gate, and stop.\n\n"
+        f"Write your handoff to `{repo}/{HANDOFF_DIR}/{slug}.json` AND print it.\n\n"
         "Finish by emitting ONLY this JSON, under 4096 bytes. Use `work_item` for the card "
         "number and `note` for the task name you actually used:\n"
         '{"work_item":"...","state":"ready_to_publish|blocked|needs_human|no_change|failed",'
@@ -204,7 +224,10 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
         "Pushing is owned by the coordinator's single publish lane; a worker that "
         "pushes creates the contention this design exists to remove.\n"
         "\n"
-        "Do not work on any other task, and do not read another task's files.\n"
+        "Do not work on any other task, and do not read another task's files.\n\n"
+        f"Write your handoff to `{repo}/{HANDOFF_DIR}/{task}.json` AND print it. Stdout alone is "
+        "not durable: a launcher that backgrounds you, or loses its pipe, loses the handoff and "
+        "the work with it.\n"
         "Finish by emitting ONLY this JSON, under 4096 bytes:\n"
         '{"work_item":"...","state":"ready_to_publish|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...","note":"<=200 chars"}'
@@ -376,8 +399,14 @@ def poll_session(sid: str, *, limit: int = 400, max_pages: int = 20,
 def collect(sid: str, *, runner=None) -> dict:
     """Everything a supervisor needs from one worker, in one call."""
     events, why = poll_session(sid, runner=runner)
-    if why and not events:
-        return {"session": sid, "state": "unreadable", "reason": why}
+    if not events:
+        # An empty journal moments after create is a session that has not
+        # started emitting yet. Calling that unreadable makes a supervisor
+        # abandon a healthy worker on a race it should simply wait out.
+        return {"session": sid,
+                "state": "unreadable" if why else "starting",
+                "reason": why or "no events yet; the session is still starting — poll again",
+                "retryable": not why}
 
     finished = any(str(e.get("type")) in ("run_finished", "session_archived") for e in events)
     texts: list[str] = []

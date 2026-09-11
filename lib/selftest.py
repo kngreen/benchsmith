@@ -1125,16 +1125,17 @@ check("dispatch is non-publishing by default", _p.publishing, False)
 check("no --skills alias by default", "--skills" not in _p.argv, True)
 check("an explicit alias is still passed",
       "--skills" in dsp.plan("t1", _REPO, skills="benchsmith").argv, True)
-check("agentcloud workers bootstrap themselves",
-      any("git clone" in a for a in _p.argv), True)
-check("bootstrap uses the working proxy pair",
+check("agentcloud workers are told which host they need",
+      any(dsp.HOST in a for a in _p.argv), True)
+check("the preamble uses the working proxy pair",
       any("fwdproxy:8080" in a for a in _p.argv), True)
-check("bootstrap failure is blocked, not improvised",
+check("being off-host is blocked, not improvised",
       any("state=blocked" in a for a in _p.argv), True)
-check("local codex workers do not clone",
-      any("git clone" in a for a in dsp.plan("t1", _REPO, backend="codex").argv), False)
-check("bootstrap is forceable for a local worker",
-      any("git clone" in a for a in dsp.plan("t1", _REPO, backend="codex", bootstrap=True).argv), True)
+check("local codex workers get no host preamble",
+      any("NOT ON THE HOST" in a for a in dsp.plan("t1", _REPO, backend="codex").argv), False)
+check("the host preamble is forceable for a local worker",
+      any("NOT ON THE HOST" in a
+          for a in dsp.plan("t1", _REPO, backend="codex", bootstrap=True).argv), True)
 check("plan is shell-quotable", "benchsmith harden: t1" in _p.shell, True)
 check("task appears in the prompt, not just the title",
       any("t1" in a and "YOU MAY NOT PUSH" in a for a in _p.argv), True)
@@ -2602,6 +2603,40 @@ check("the session title names the mode",
 check("...and differs by mode",
       any(a == "benchsmith repair: real-task"
           for a in dsp.plan("real-task", str(_dr2), mode="repair").argv), True)
+
+
+# --- off-host, lost handoffs, and bare skeletons -----------------------------
+
+_bb = dsp.bootstrap_block()
+# The "just clone it" fallback returns HTTP 403 from a fresh runtime: the repo
+# is private. Offering it wastes the session and produces a misleading error.
+check("the dead GitHub fallback is gone", "git clone" in _bb, False)
+check("...and the reason is stated", "403" in _bb, True)
+check("the required host is named", dsp.HOST in _bb, True)
+check("being off-host is a reportable state", "state=blocked" in _bb, True)
+
+# A session polled moments after create has no events yet. Calling that
+# unreadable makes a supervisor abandon a healthy worker over a startup race.
+_empty = dsp.collect("s", runner=lambda a: (0, "[]\n" + json.dumps({"has_more": "no"}), ""))
+check("an empty journal is 'starting', not 'unreadable'", _empty["state"], "starting")
+check("...and is marked retryable", _empty["retryable"], True)
+_broken = dsp.collect("s", runner=lambda a: (1, "", "no such session"))
+check("a genuinely failed poll is still unreadable", _broken["state"], "unreadable")
+check("...and is not retryable", _broken["retryable"], False)
+
+# A handoff that exists only on stdout dies with the launcher.
+_hp = [a for a in dsp.plan("real-task", str(_dr2)).argv if "handoff" in a][0]
+check("the worker is told to write the handoff to a file",
+      f"{dsp.HANDOFF_DIR}/real-task.json" in _hp, True)
+check("...as well as printing it", "AND print it" in _hp, True)
+
+# The official skeleton with nothing authored looks like progress and is not.
+_sk = [a for a in dsp.plan("newthing", str(_dr2 / "nope"), mode="scaffold",
+                           idea={"gsd": "T1", "title": "x", "track": "t-bench"}).argv
+       if "IDEA CARD" in a][0]
+check("a bare skeleton is called out", "A bare skeleton is not done" in _sk, True)
+check("...and blocked is preferred to reporting one",
+      "do not report a skeleton as a result" in _sk, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
