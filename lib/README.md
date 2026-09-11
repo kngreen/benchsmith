@@ -16,7 +16,7 @@ run from a skill directory on whatever a devserver happens to have.
 | `assay/journal.py` | done | rounds, streaks, excursions, surface hashes, budget |
 | `assay/gate.py` | done | the pre-push gate and hook installation |
 | `assay/cli.py` | done | `bin/assay` |
-| `tests/` | **blocked** | see below |
+| `selftest.py` | done | 112 fixtures, mutation-verified |
 
 Deliberately out of scope: platform-family specialisations (macOS VM / iOS), the mutation probe,
 and repo-level run queuing. Those stay optional accelerators, invoked if present, never required.
