@@ -46,6 +46,18 @@ UNMEASURED = {"infra", "not-measured", "platform-stale"}
 STATUSES = ("running", "converged", "escalated", "abandoned", "blocked-on-platform", "blocked")
 
 DEFAULT_BUDGET = 5
+
+# Repair and harden are different commissions with opposite stop conditions.
+# "Stopping with budget unspent is an unfinished job" is right for a hardening
+# campaign and actively wrong for a five-finding repair: a review handed you the
+# closure list, and open-ended difficulty research on top of it is scope creep
+# that reads as diligence. One field run spent hours on two rejected levers
+# while five findings sat open.
+MODES = ("repair", "harden")
+DEFAULT_MODE = "harden"
+# A speculative lever gets this many local probes before it is abandoned. Field
+# report: "cap speculative levers to 1-2 local probes."
+DEFAULT_PROBE_BUDGET = 2
 INEFFECTIVE_ROUND_CAP = 3
 
 
@@ -143,6 +155,9 @@ class Journal:
                 "hardeningSpent": 0,
                 "hardeningBudgetExhausted": False,
                 "ineffectiveStreak": 0,
+                "mode": DEFAULT_MODE,
+                "findings": {},
+                "probesSpent": 0,
                 "lastGradedHash": None,
                 "gradedHashHistory": [],
                 "lastUpdateLocal": None,
@@ -159,6 +174,51 @@ class Journal:
 
     def budget(self) -> int:
         return int(os.environ.get("BENCHSMITH_HARDENING_BUDGET", DEFAULT_BUDGET))
+
+    def probe_budget(self) -> int:
+        return int(os.environ.get("BENCHSMITH_PROBE_BUDGET", DEFAULT_PROBE_BUDGET))
+
+    @property
+    def mode(self) -> str:
+        return self.data.get("mode") or DEFAULT_MODE
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in MODES:
+            raise ValueError(f"unknown mode {mode!r}; expected one of {', '.join(MODES)}")
+        self.data["mode"] = mode
+
+    # -- closure ledger -----------------------------------------------------
+
+    def open_finding(self, fid: str, symptom: str, acceptance: str) -> dict:
+        """One review finding -> one edit -> one acceptance test.
+
+        The acceptance test is required at open time, not at close time. A
+        finding with no stated way to prove it gone cannot be closed, only
+        asserted closed.
+        """
+        if not acceptance.strip():
+            raise ValueError(f"finding {fid}: an acceptance test is required to open it")
+        row = {"id": fid, "symptom": symptom, "acceptance": acceptance,
+               "state": "open", "closedBy": None, "evidence": None}
+        self.data.setdefault("findings", {})[fid] = row
+        return row
+
+    def close_finding(self, fid: str, sha: str, evidence: str) -> dict:
+        row = (self.data.get("findings") or {}).get(fid)
+        if row is None:
+            raise ValueError(f"unknown finding {fid!r}; open it before closing it")
+        if not evidence.strip():
+            raise ValueError(f"finding {fid}: closing requires evidence, not an assertion")
+        row.update(state="closed", closedBy=sha, evidence=evidence)
+        return row
+
+    def open_findings(self) -> list[str]:
+        return [k for k, v in (self.data.get("findings") or {}).items() if v.get("state") != "closed"]
+
+    def closure_summary(self) -> str:
+        f = self.data.get("findings") or {}
+        closed = [k for k, v in f.items() if v.get("state") == "closed"]
+        return f"{len(closed)}/{len(f)} findings closed" if f else "no findings recorded"
 
     # -- excursions ---------------------------------------------------------
 
@@ -311,6 +371,16 @@ class Journal:
     # -- stopping -----------------------------------------------------------
 
     def stop_reason(self) -> str | None:
+        # Repair terminates on closure, not on an exhausted budget. Continuing to
+        # harden after the last finding closes is a new commission and needs a
+        # new ask.
+        if self.mode == "repair":
+            f = self.data.get("findings") or {}
+            if f and not self.open_findings():
+                return f"repair complete: {self.closure_summary()} — hardening requires a new ask"
+            if self.data.get("probesSpent", 0) >= self.probe_budget():
+                return (f"probe budget of {self.probe_budget()} spent with "
+                        f"{len(self.open_findings())} findings still open")
         """Why the campaign should stop, or None to keep going.
 
         Round count is never a reason. What is bounded is hardening.
@@ -319,7 +389,10 @@ class Journal:
             return "inert: three rounds with no change in sha, status or failing set"
         if self.data["ineffectiveStreak"] >= INEFFECTIVE_ROUND_CAP:
             return f"{INEFFECTIVE_ROUND_CAP} measured rounds moved d(p) less than one trial-equivalent"
-        if self.data["hardeningBudgetExhausted"]:
+        # The hardening budget is a HARDEN-mode stop. In repair mode the findings
+        # decide, and an exhausted hardening budget carried over from an earlier
+        # commission must not close a repair with findings still open.
+        if self.mode != "repair" and self.data["hardeningBudgetExhausted"]:
             return f"hardening budget of {self.budget()} spent"
         last = self.rounds[-1] if self.rounds else None
         if last and last.get("excursion"):

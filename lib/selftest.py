@@ -566,6 +566,64 @@ with tempfile.TemporaryDirectory() as td:
     check("missing recipe tag caught", "benchsmith-v1" in tags, True)
 
 
+# ---------------------------------------------------------- repair mode ----
+section("Repair mode — closure terminates, not budget")
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td); repo = scratch_repo(tmp); task_dir = repo / "mytask"
+    j = Journal.open(repo, "mytask")
+    j.set_mode("repair")
+    check("mode is settable", j.mode, "repair")
+    try:
+        j.set_mode("nonsense"); check("unknown mode refused", False, True)
+    except ValueError: check("unknown mode refused", True, True)
+
+    # An acceptance test is mandatory at OPEN time.
+    try:
+        j.open_finding("F1", "grader pins file identity", "")
+        check("opening without an acceptance test is refused", False, True)
+    except ValueError as e:
+        check("opening without an acceptance test is refused", "acceptance test is required" in str(e), True)
+
+    j.open_finding("F1", "grader pins file identity", "p3 refactor scores 1.0")
+    j.open_finding("F2", "spec ambiguous on ordering", "reviewer confirms wording")
+    check("two findings open", sorted(j.open_findings()), ["F1", "F2"])
+    check("repair does not stop with findings open", j.stop_reason(), None)
+
+    try:
+        j.close_finding("F1", "abc", ""); check("closing without evidence is refused", False, True)
+    except ValueError as e:
+        check("closing without evidence is refused", "requires evidence" in str(e), True)
+    try:
+        j.close_finding("NOPE", "abc", "x"); check("closing an unopened finding is refused", False, True)
+    except ValueError: check("closing an unopened finding is refused", True, True)
+
+    j.close_finding("F1", "abc123", "p3-struct-backfill-result.sh scores 1.0")
+    check("one closed, one open", j.closure_summary(), "1/2 findings closed")
+    check("still not terminal", j.stop_reason(), None)
+
+    j.close_finding("F2", "def456", "reviewer thread resolved")
+    stop = j.stop_reason()
+    check("closure terminates repair", stop is not None and "repair complete" in stop, True)
+    check("and says hardening needs a new ask", "new ask" in (stop or ""), True)
+
+    # Budget-driven stop must NOT fire in repair mode with findings open.
+    k = Journal.open(repo, "other")
+    k.set_mode("repair")
+    k.open_finding("G1", "x", "y")
+    k.data["hardeningBudgetExhausted"] = True
+    check("spent hardening budget does not end a repair", k.stop_reason(), None)
+    k.data["probesSpent"] = 99
+    stop = k.stop_reason()
+    check("probe budget does end it", stop is not None and "probe budget" in stop, True)
+
+    # Harden mode is unchanged.
+    h = Journal.open(repo, "third")
+    check("default mode is harden", h.mode, "harden")
+    h.data["hardeningBudgetExhausted"] = True
+    check("harden still stops on budget", "budget" in (h.stop_reason() or ""), True)
+
+
 # ------------------------------------------------------- smoke layer -------
 section("Smoke — every subcommand reachable from bin/benchsmith is invoked")
 

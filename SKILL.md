@@ -159,6 +159,30 @@ already returned another task's record. If a name lookup is the only surface ava
 the returned `TASK_ID`/`TASK_UUID` against the recorded one before reading a single number off
 it, and treat a mismatch as `not-measured`.
 
+### Pick the mode at intake
+
+`BENCHSMITH_MODE` decides what ends the loop, and the two modes have **opposite** stop
+conditions. Choose before the first round; changing it mid-run is rescoping.
+
+- **`repair`** — a review handed you a closure list. One finding, one edit, one acceptance
+  test. **Terminal when every finding closes**, and hardening afterwards requires a new ask.
+  `benchsmith record --open-finding 'F1=symptom::acceptance test'` refuses a finding with no
+  stated way to prove it gone; `--close-finding 'F1=evidence'` refuses an assertion without
+  evidence. Speculative levers are capped at `BENCHSMITH_PROBE_BUDGET` (default 2) local
+  probes — a lever that has not shown a predicted cohort effect in two probes is abandoned,
+  not investigated.
+- **`harden`** *(default)* — an open difficulty commission. §8's campaign applies and
+  "stopping with budget unspent is an unfinished job" holds.
+
+**Do not run a repair in harden mode.** §8's rule that unspent budget means unfinished work is
+correct for a hardening commission and actively wrong for a five-finding repair: it turns a
+targeted fix into open-ended difficulty research. One field run spent hours on two rejected
+levers while five findings sat open. In repair mode an exhausted hardening budget does **not**
+end the loop — only closure or the probe budget does.
+
+Report the ledger every round: `benchsmith record` emits `mode`, `closure` (`n/m findings
+closed`) and `openFindings` alongside the round.
+
 ### Pick the target profile at intake
 
 `BENCHSMITH_TARGET` selects the terminal mapping in §10, and it is chosen **before** the first

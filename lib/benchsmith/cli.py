@@ -113,10 +113,21 @@ def cmd_record(args) -> int:
         explain=args.explain or "",
         hardening=args.hardening,
     )
+    if args.mode:
+        j.set_mode(args.mode)
+    if args.open_finding:
+        fid, _, rest = args.open_finding.partition("=")
+        symptom, _, acceptance = rest.partition("::")
+        j.open_finding(fid.strip(), symptom.strip(), acceptance.strip())
+    if args.close_finding:
+        fid, _, evidence = args.close_finding.partition("=")
+        j.close_finding(fid.strip(), args.sha or "", evidence.strip())
     if args.status:
         j.set_status(args.status, oracle_passing=not args.oracle_failing)
     j.save()
-    _out({"round": entry, "stop": j.stop_reason(), "status": j.data["status"], "journal": str(j.path)})
+    _out({"round": entry, "stop": j.stop_reason(), "status": j.data["status"],
+          "mode": j.mode, "closure": j.closure_summary(), "openFindings": j.open_findings(),
+          "journal": str(j.path)})
     return 0
 
 
@@ -199,6 +210,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--hardening", action="store_true")
     s.add_argument("--status", default="")
     s.add_argument("--oracle-failing", action="store_true")
+    s.add_argument("--mode", default="", choices=("", "repair", "harden"))
+    s.add_argument("--open-finding", default="",
+                   help="ID=symptom::acceptance-test — acceptance is mandatory")
+    s.add_argument("--close-finding", default="", help="ID=evidence")
     s.set_defaults(fn=cmd_record)
 
     s = common(sub.add_parser("gate", help="run the pre-push gate"))
