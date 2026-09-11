@@ -376,7 +376,7 @@ A confirmation round-trip buys nothing those do not already guarantee.
 | **Create a binary task** | §3 intake → STEP S → §4 | §5 bar + §11 |
 | **Create an open-ended task** | §3 intake → `references/continuous.md` | that file's band + §11 |
 | **Validate / repair an existing task** | STEP 1 → §7 → smallest correct fix | §5 + §11 |
-| **Repair review findings** | the review itself, never the balance row → §7 | both reviews green + §11 |
+| **Repair review findings** | §0a below, then §7 | every finding closed with evidence + §11 |
 | **Run the fleet** | `references/coordinator.md` | the queue drains or every remaining item needs a human |
 | **Local iOS / macOS-VM task** | `references/passatk.md` → §5 bar | §5 + §11 |
 | **Map idea space** | `benchsmith ideas landscape` — coverage and duplicate radar only; the seed remains human | a human seed ready for `task-hardness-screen` |
@@ -391,6 +391,37 @@ tested behaviour stays stated in `instruction.md` or inferable from the contract
 base still fails and the reference still passes; correct alternatives still pass; dummy,
 hard-coded, artifact-spoofing and grader-tampering solutions still fail. Never weaken, delete,
 skip or bypass a legitimate test to get a green.
+
+## 0a. Repairing a revision request
+
+**Read what was asked before changing anything.**
+
+```bash
+benchsmith review --repo REPO --task TASK-NAME
+```
+
+That returns the reviewer's `decisionReason` verbatim, their human comments, and whether the
+journal has anything recorded against them.
+
+**One requested change → one finding → one acceptance test → one closure with evidence.**
+
+```bash
+benchsmith record ... --open-finding ID --symptom "..." --acceptance "..."
+```
+
+The acceptance test is required when the finding is **opened**, not when it is closed. A finding
+with no stated way to prove it gone can only be asserted closed, never shown closed.
+
+Splitting the request into findings is your job, not the tool's. One paragraph can hold three
+requests or one request stated three ways, and a rule that guesses wrong either invents work or
+hides some. Read it and decide.
+
+**The gate blocks the push while any finding is open, and blocks it when the platform says
+`needs_revision` and no finding is recorded at all.** A repair that addressed nothing is not a
+repair, and a loop that cannot name what it changed cannot have verified it.
+
+Closing needs evidence, not a claim — `benchsmith review` reports `N/M findings closed`, and §11
+requires all of them.
 
 ## The round
 

@@ -30,6 +30,7 @@ from . import mutate as mutate_mod
 from . import passatk as passatk_mod
 from . import causal as causal_mod
 from . import remote_lease as rlease_mod
+from . import reviews as reviews_mod
 from . import rerun as rerun_mod
 from . import resolve as resolve_mod
 from . import worktree as wt_mod
@@ -758,6 +759,16 @@ def cmd_rerun(args) -> int:
     return 0
 
 
+def cmd_review(args) -> int:
+    """What the reviewer asked for, and whether it has been written down."""
+    j = Journal.open(Path(args.repo), args.task)
+    req = reviews_mod.requests(args.task)
+    blocked, why = reviews_mod.unaddressed(j.data.get("findings") or {}, req)
+    _out({**req, "findings": j.data.get("findings") or {},
+          "closure": j.closure_summary(), "blocked": blocked, "verdict": why})
+    return 1 if blocked else 0
+
+
 def cmd_causal(args) -> int:
     """Did the last hardening change move the rate, or did the sample?"""
     j = Journal.open(Path(args.repo), args.task)
@@ -1115,6 +1126,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--apply", action="store_true")
     s.add_argument("--force", action="store_true", help="ignore the per-commit rerun budget")
     s.set_defaults(fn=cmd_rerun)
+
+    s = common(sub.add_parser("review", help="what the reviewer asked for, and its closure state"))
+    s.set_defaults(fn=cmd_review)
 
     s = common(sub.add_parser("causal", help="did the last hardening change move the rate?"))
     s.set_defaults(fn=cmd_causal)

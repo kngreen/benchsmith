@@ -3920,5 +3920,55 @@ check("...saying it could not confirm", "could not confirm" in _r9["reason"], Tr
 check("force still works for a human who knows", wtm.release(_wtl, "t", force=True)["removed"], True)
 
 
+# --- a repair must address what the reviewer asked for -----------------------
+#
+# The pieces existed -- a finding carries its acceptance test at open time, and
+# closing one demands evidence -- but nothing read the reviews and nothing
+# checked any findings existed. A repair round could push having addressed
+# nothing at all.
+
+from benchsmith import reviews as rvw  # noqa: E402
+
+_req = {"requests": [{"reviewer": "r", "at": "2026-09-09", "decision": "revision",
+                      "text": "Please update tests/run_script.sh"}]}
+
+_b, _w = rvw.unaddressed({}, _req)
+check("a revision request with no finding blocks", _b, True)
+check("...and says to open one per requested change",
+      "one per requested change" in _w, True)
+
+_open = {"f1": {"state": "open", "symptom": "x", "acceptance": "y"}}
+check("an open finding blocks", rvw.unaddressed(_open, _req)[0], True)
+check("...and names it", "f1" in rvw.unaddressed(_open, _req)[1], True)
+
+_closed = {"f1": {"state": "closed", "evidence": "test passes at abc"}}
+check("a closed finding clears", rvw.unaddressed(_closed, _req)[0], False)
+check("...and reports the count", "1 finding(s) closed" in rvw.unaddressed(_closed, _req)[1], True)
+
+check("no revision request means nothing to address",
+      rvw.unaddressed({}, {"requests": []})[0], False)
+
+# Only decisions that actually request changes count.
+check("a revision decision is recognised", "revision" in rvw.REVISION_DECISIONS, True)
+check("...as is changes_requested", "changes_requested" in rvw.REVISION_DECISIONS, True)
+check("an approval is not a change request", "approved" in rvw.REVISION_DECISIONS, False)
+
+# The journal's half of the contract, which already existed.
+_fj = Journal.open(Path(tempfile.mkdtemp()), "t")
+_fj.open_finding("f1", "run_script.sh does not re-check", "the added assertion fails on base")
+check("a finding needs an acceptance test at open time",
+      bool((_fj.data["findings"]["f1"] or {}).get("acceptance")), True)
+try:
+    _fj.close_finding("f1", "abc", "   ")
+    check("closing without evidence is refused", "closed", "refused")
+except ValueError as e:
+    check("closing without evidence is refused", "not an assertion" in str(e), True)
+_fj.close_finding("f1", "abc", "assertion fails on base, passes on the fix")
+check("closing with evidence works", _fj.open_findings(), [])
+
+check("the findings check blocks a push",
+      "review-findings" in gate_mod.PUSH_REQUIRED, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

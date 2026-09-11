@@ -39,7 +39,9 @@ TIMEOUT = "TIMEOUT"
 # are the ones where NOT_RUN and FAIL have the same consequence: you do not know
 # the thing you would have to know in order to push.
 PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags",
-                 "diff-ratchet", "diff-weakening", "contamination")
+                 "diff-ratchet", "diff-weakening", "contamination",
+                 # A repair that addressed nothing is not a repair.
+                 "review-findings")
 
 
 @dataclass
@@ -507,6 +509,28 @@ def check_fixture_corpus(task_dir: Path, report: Report, runner=None) -> None:
                res["detail"])
 
 
+def check_findings(task_name: str, journal, report: Report, *, binary: str = "codimango") -> None:
+    """A repair round must address what the reviewer asked for.
+
+    The whole point of `needs_revision` is that a person named something wrong.
+    Pushing a repair with no finding recorded means the loop cannot have
+    verified the change it claims to have made -- it never wrote down what the
+    change was, or how it would know it worked.
+    """
+    from .reviews import requests, unaddressed
+
+    try:
+        req = requests(task_name, binary=binary)
+    except Exception as e:  # noqa: BLE001
+        report.add("review-findings", NOT_RUN, f"could not read the reviews: {e}")
+        return
+    if not req.get("requests"):
+        report.add("review-findings", NOT_RUN, "no outstanding revision request", blocking=False)
+        return
+    blocked, why = unaddressed(journal.data.get("findings") or {}, req)
+    report.add("review-findings", FAIL if blocked else PASS, why)
+
+
 def check_task_author(repo_root: Path, task_dir: Path, task_name: str, report: Report) -> None:
     """Is this our task to be changing?
 
@@ -705,6 +729,7 @@ def run(
     check_scope(repo_root, task_name, report)
     check_single_lever(repo_root, task_name, journal.mode, report)
     check_task_author(repo_root, task_dir, task_name, report)
+    check_findings(task_name, journal, report)
     check_controls_roster(repo_root, report)
     check_fixture_corpus(task_dir, report)
     check_contamination(repo_root, report)
