@@ -47,7 +47,9 @@ benchsmith queue --repo . --fetch
 The idea-board flow imports only human-originated T-Bench seeds from Idea Exchange. It does not
 generate task ideas, claim them, or call an unbuilt seed “hard.” GSD cards are deduplicated by
 `aai-idea:<id>` and remain in `Needs hardness screen` until the separate hardness screen records a
-GO, DERISK, or KILL decision. A Codimango summary can nominate a calibration reference for deeper
+GO, DERISK, or KILL decision. By default, records without a MEDIUM/HIGH predicted novelty signal
+are left out; `--include-unassessed` makes that intake broader, but novelty is never treated as
+difficulty evidence. A Codimango summary can nominate a calibration reference for deeper
 audit, but only the full exact-head Benchsmith bar can establish `hard calibrated`.
 
 ## Design commitments

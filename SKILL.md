@@ -843,8 +843,10 @@ benchsmith queue --repo . --fetch                      # includes the configured
 ```
 
 `ideas harvest` preserves the Idea ID and human creator, refuses incomplete or non-T-Bench
-records, deduplicates by `external_identifier`, and never claims an idea. It marks imported cards
-`Needs hardness screen`; a `GO` requires two named independent hard cores. Use
+records, deduplicates by `external_identifier`, and never claims an idea. Its default
+MEDIUM/HIGH predicted-novelty filter is only an intake filter, never difficulty evidence;
+`--include-unassessed` broadens it. Imported cards land in `Needs hardness screen`; a `GO`
+requires two named independent hard cores. Use
 `claim-task-idea` for the later claim/scaffold transaction so Direction credit remains attached to
 the original creator.
 

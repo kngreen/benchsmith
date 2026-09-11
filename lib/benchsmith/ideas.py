@@ -215,10 +215,15 @@ def init_board(repo: Path, *, name: str = DEFAULT_BOARD_NAME, owner: str = "",
                 f"create GSD section {section}",
             )
 
+    url = str(found.get("url") or "")
+    if url.startswith("/"):
+        url = f"https://www.internalfb.com{url}"
+    elif not url and selector.isdigit():
+        url = f"https://www.internalfb.com/intern/gsd/{selector}/"
     config = {
         "name": str(found.get("name") or name),
         "projectId": selector,
-        "url": found.get("url") or f"https://www.internalfb.com/intern/gsd/{selector}/",
+        "url": url,
         "assignee": owner or os.environ.get("USER", ""),
         "sections": SECTION_KINDS,
         "source": "Idea Exchange human-originated T-Bench seeds",

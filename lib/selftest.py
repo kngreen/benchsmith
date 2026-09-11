@@ -1894,21 +1894,24 @@ _bad = hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], use_cache=False, runner=_s
 check("a failing hook fails the gate", _bad["state"], hk.FAIL)
 check("...and reports the tool output", "needs formatting" in _bad["reason"], True)
 
-# Cache: identical bytes must not pay for a second cold start.
+# Cache: identical bytes must not pay for a second cold start. Hermetic cache
+# dir -- the default lives in ~/.cache, so a second suite run would otherwise
+# hit keys written by the first and pass for the wrong reason.
+_hcache = Path(tempfile.mkdtemp())
 _calls.clear()
-hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy())
-_first = len(_calls)
-hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy())
-check("an unchanged tree is a cache hit", len(_calls), _first)
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy(), cache_dir=_hcache)
+check("the first run is a miss", len(_calls), 1)
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy(), cache_dir=_hcache)
+check("an unchanged tree is a cache hit", len(_calls), 1)
 (_hr / "web" / "src" / "a.ts").write_text("const x = 2\n")
-hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy())
-check("changed bytes invalidate the cache", len(_calls), _first + 1)
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy(), cache_dir=_hcache)
+check("changed bytes invalidate the cache", len(_calls), 2)
 
 # A fix must never be served from cache: it is expected to mutate, and skipping
 # it would leave files unwritten while reporting success.
 _calls.clear()
-hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], fix=True, runner=_spy())
-hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], fix=True, runner=_spy())
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], fix=True, runner=_spy(), cache_dir=_hcache)
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], fix=True, runner=_spy(), cache_dir=_hcache)
 check("a fix always runs", len(_calls), 2)
 
 

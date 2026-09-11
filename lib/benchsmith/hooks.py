@@ -132,20 +132,22 @@ def _key(argv: list[str], repo_root: Path, files: list[str]) -> str:
     return h.hexdigest()
 
 
-def _cached(key: str) -> bool:
-    return (CACHE_DIR / key).is_file()
+def _cached(key: str, cache_dir: Path | None = None) -> bool:
+    return ((cache_dir or CACHE_DIR) / key).is_file()
 
 
-def _remember(key: str) -> None:
+def _remember(key: str, cache_dir: Path | None = None) -> None:
     try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (CACHE_DIR / key).write_text(str(time.time()))
+        d = cache_dir or CACHE_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        (d / key).write_text(str(time.time()))
     except OSError:
         pass  # a cache that cannot be written is slow, not wrong
 
 
 def run_one(repo_root: Path, spec: dict, paths: list[str], *, fix: bool = False,
-            budget: int = DEFAULT_BUDGET, use_cache: bool = True, runner=None) -> Result:
+            budget: int = DEFAULT_BUDGET, use_cache: bool = True, runner=None,
+            cache_dir: Path | None = None) -> Result:
     name = str(spec.get("name") or "hook")
     files = matching(paths, list(spec.get("globs") or []))
     if not files:
@@ -165,7 +167,7 @@ def run_one(repo_root: Path, spec: dict, paths: list[str], *, fix: bool = False,
     # Only a *check* may be served from cache. A fix is expected to mutate the
     # tree, and skipping it because an identical tree once passed would leave
     # the files unwritten while reporting success.
-    if use_cache and not fix and _cached(key):
+    if use_cache and not fix and _cached(key, cache_dir):
         return Result(name, PASS, "cached", len(files), 0.0, cached=True)
 
     started = time.time()
@@ -183,14 +185,14 @@ def run_one(repo_root: Path, spec: dict, paths: list[str], *, fix: bool = False,
     took = time.time() - started
     if r.returncode == 0:
         if not fix:
-            _remember(key)
+            _remember(key, cache_dir)
         return Result(name, PASS, "clean" if not fix else "applied", len(files), took)
     return Result(name, FAIL, ((r.stdout or "") + (r.stderr or "")).strip()[:400], len(files), took)
 
 
 def run_all(repo_root: Path, specs: list[dict] | None = None, *, fix: bool = False,
             budget: int = DEFAULT_BUDGET, use_cache: bool = True, paths: list[str] | None = None,
-            runner=None) -> dict:
+            runner=None, cache_dir: Path | None = None) -> dict:
     specs = specs if specs is not None else DEFAULT_HOOKS
     if paths is None:
         paths, why = staged(Path(repo_root))
@@ -207,7 +209,7 @@ def run_all(repo_root: Path, specs: list[dict] | None = None, *, fix: bool = Fal
     with ThreadPoolExecutor(max_workers=max(1, len(wanted))) as pool:
         results = list(pool.map(
             lambda s: run_one(Path(repo_root), s, paths, fix=fix, budget=budget,
-                              use_cache=use_cache, runner=runner),
+                              use_cache=use_cache, runner=runner, cache_dir=cache_dir),
             wanted,
         ))
     failed = [r for r in results if r.state == FAIL]

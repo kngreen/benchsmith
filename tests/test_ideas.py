@@ -111,6 +111,31 @@ Replay every physical operation.""",
         self.assertEqual(result["planned"], [])
         self.assertIn("missing human intake fields", result["skipped"][0]["reason"])
 
+    def test_harvest_skips_unassessed_novelty_by_default(self):
+        row = {
+            "id": "2", "title": "Unassessed", "track": "tbench",
+            "status": "up_for_grabs", "creator": {"username": "human"},
+            "description": """A complete seed.
+## Domain
+Systems
+## Capability under test
+Global reasoning
+## Why SOTA should fail this
+Several distant constraints interact.
+## Difficulty levers (conceptual)
+Multiple coupled states and adversarial cases.
+## Verification intent
+Replay and compare all final states.""",
+        }
+        run = FakeRun([response({"ideas": [row]})])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ideas.BOARD_FILE
+            path.parent.mkdir()
+            path.write_text(json.dumps({"gsd": {"projectId": "123"}}))
+            result = ideas.harvest(Path(tmp), run=run)
+        self.assertEqual(result["planned"], [])
+        self.assertIn("not MEDIUM/HIGH", result["skipped"][0]["reason"])
+
     def test_go_requires_two_independent_cores(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ideas.BOARD_FILE
