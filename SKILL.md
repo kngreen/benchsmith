@@ -17,10 +17,49 @@ journal at `.benchsmith/<task>.json` is written only by `benchsmith record` — 
 hand-written journal produces none of the fields the loop reads back, and stall detection, the
 budget, regression comparison and excursion detection all go blind at once.
 
-## Entry points
+## On invocation — route, do not ask
 
-Seven flows. Each is standalone — start where the task actually is, not at the top. Never run two
-against the same task at once.
+**You were invoked with an argument or without one. That decides everything, and neither case
+involves asking the user what to work on.** "Benchsmith is ready, send me a task" is a failed
+invocation: they already told you, or they meant the backlog.
+
+### With an argument — one task
+
+The argument may be a task name, a numeric id, or a submissions URL pasted from the browser. Do
+not parse it yourself:
+
+```bash
+benchsmith resolve "<whatever they gave you>"
+```
+
+That returns the canonical `task`, the `repo` that holds it, whether you `owned` it, and the `mode`
+to run in — `repair` when the platform says `needs_revision`, `harden` otherwise. Then run **the
+round** below against exactly that task, and nothing else.
+
+Three things it tells you that you must honour:
+
+- **`owned: false`** — stop. Say who owns it. Hardening somebody else's task is not recoverable.
+- **`repo: null`** — no checkout on this host holds it. Say so; do not scaffold a new one.
+- **`otherRepos`** — the task exists in several clones and you are getting the canonical-looking
+  one. If the work is about a specific clone, the user has to say which.
+
+### Without an argument — the backlog
+
+You are the coordinator. The queue answers "what next", so do not ask it.
+
+```bash
+benchsmith fleet --workers 3            # discover, order, and show what it would start
+benchsmith fleet --workers 3 --apply    # actually start them
+```
+
+`fleet` fetches from Codimango and the GSD board, orders by tier — needs-revision, then failing
+drafts, pending, passing, then board cards — resolves each task to the checkout that actually holds
+it, and dispatches one non-publishing worker per task. **Plan first and show it.** Starting three
+agents is worth one round-trip; asking which of thirty-two tasks to work on is not.
+
+Workers prepare and stop. **You hold the publish lane** — see `references/coordinator.md`.
+
+### The flows, once you know which task
 
 | Flow | Route | Done when |
 |---|---|---|
@@ -28,10 +67,9 @@ against the same task at once.
 | **Create an open-ended task** | §3 intake → `references/continuous.md` | that file's band + §11 |
 | **Validate / repair an existing task** | STEP 1 → §7 → smallest correct fix | §5 + §11 |
 | **Repair review findings** | the review itself, never the balance row → §7 | both reviews green + §11 |
-| **Generate ideas** | not this skill — `swebench-idea-triage`, then `task-hardness-screen` | a GO'd idea |
-| **Harvest human T-Bench seeds** | `benchsmith ideas init` → `ideas harvest` → `task-hardness-screen` → `ideas mark` | a GO/DERISK/KILL GSD card |
 | **Run the fleet** | `references/coordinator.md` | the queue drains or every remaining item needs a human |
 | **Local iOS / macOS-VM task** | `references/passatk.md` → §5 bar | §5 + §11 |
+| **Generate ideas** | not this skill — `swebench-idea-triage`, then `task-hardness-screen` | a GO'd idea |
 
 **Repair means the smallest correct fix, not the fastest green.** Preserve original intent; every
 tested behaviour stays stated in `instruction.md` or inferable from the contract; the unchanged

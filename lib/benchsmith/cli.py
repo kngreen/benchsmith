@@ -27,6 +27,7 @@ from . import hooks as hooks_mod
 from . import dispatch as dispatch_mod
 from . import mutate as mutate_mod
 from . import passatk as passatk_mod
+from . import resolve as resolve_mod
 from . import publish as publish_mod
 from . import sources
 from . import stats as stats_mod
@@ -285,6 +286,62 @@ def cmd_mutate(args) -> int:
     # NOT_RUN is not a pass. It exits non-zero so a caller cannot read an
     # unrun probe as a clean one.
     return 0 if res["status"] == "PASS" else 1
+
+
+def cmd_resolve(args) -> int:
+    """Turn a name, id, or submissions URL into a bound task."""
+    try:
+        _out(resolve_mod.resolve(args.ref))
+    except resolve_mod.Unresolved as e:
+        _out({"ok": False, "reason": str(e)})
+        return 2
+    return 0
+
+
+def cmd_fleet(args) -> int:
+    """The whole coordinator in one call: discover, order, dispatch.
+
+    Plans by default. `--apply` is the only thing that starts a worker, so the
+    same command can always be run first to see what it would do.
+    """
+    repo = Path(args.repo).resolve() if args.repo else Path.cwd()
+    cfg = config_mod.load(repo, project_id=args.gsd_project)
+    raw = sources.discover(cfg=cfg, with_gsd=not args.no_gsd)
+    items = build_queue(raw.get("tasks") or [], journals=read_journals(repo),
+                        leases=Leases(repo).active(), ideas=raw.get("ideas") or [])
+    ready = [i for i in items if i.dispatchable][: args.workers]
+
+    plans, started = [], []
+    for item in ready:
+        # Each worker is dispatched against the checkout that actually holds its
+        # task, not against one repo assumed to hold them all.
+        try:
+            info = resolve_mod.resolve(item.task)
+            target, mode = info.get("repo"), info.get("mode", "harden")
+        except resolve_mod.Unresolved:
+            target, mode = None, "harden"
+        if not target:
+            plans.append({"task": item.task, "skipped": "no checkout on this host holds it"})
+            continue
+        try:
+            p = dispatch_mod.plan(item.task, target, mode=mode, target=args.target)
+        except dispatch_mod.DispatchRefused as e:
+            plans.append({"task": item.task, "skipped": str(e)})
+            continue
+        entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
+                 "repo": target, "mode": mode}
+        if args.apply:
+            entry["result"] = dispatch_mod.run(p, apply=True)
+            started.append(item.task)
+        else:
+            entry["shell"] = p.shell
+        plans.append(entry)
+
+    _out({"discovered": len(items), "dispatchable": sum(1 for i in items if i.dispatchable),
+          "workers": args.workers, "applied": bool(args.apply),
+          "started": started, "plans": plans, "notes": raw.get("notes") or [],
+          "hint": None if args.apply else "re-run with --apply to start these"})
+    return 0
 
 
 def cmd_config(args) -> int:
@@ -575,6 +632,19 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--bench", default="codimango")
     s.add_argument("--timeout", type=int, default=3600)
     s.set_defaults(fn=cmd_corpus)
+
+    s = sub.add_parser("resolve", help="task name, id, or submissions URL -> a bound task")
+    s.add_argument("ref")
+    s.set_defaults(fn=cmd_resolve)
+
+    s = sub.add_parser("fleet", help="discover, order, and dispatch down the priority list")
+    s.add_argument("--repo", default="", help="where journals and leases live (default: cwd)")
+    s.add_argument("--workers", type=int, default=3)
+    s.add_argument("--gsd-project", default="")
+    s.add_argument("--no-gsd", action="store_true")
+    s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"))
+    s.add_argument("--apply", action="store_true", help="actually start the workers")
+    s.set_defaults(fn=cmd_fleet)
 
     s = sub.add_parser("config", help="show the resolved configuration")
     s.add_argument("--repo", default=".")

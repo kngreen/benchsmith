@@ -1067,6 +1067,7 @@ with tempfile.TemporaryDirectory() as td:
         (["mutate", "--repo", str(repo), "--task", "mytask"], {0, 1}),
         (["passatk", str(payload)], {0, 1}),
         (["reconcile", "--repo", str(repo)], {0, 1}),
+        (["fleet", "--repo", str(repo), "--workers", "1", "--no-gsd"], {0, 1}),
     ]
     for argv, ok in invocations:
         try:
@@ -2301,6 +2302,39 @@ check("...and names it", "harness-smoke.py" in _cr3.detail, True)
 _rep = gate_mod.Report(); gate_mod.check_controls_roster(_rr2, _rep)
 check("a present control passes", {c.name: c for c in _rep.checks}["controls-roster"].state,
       gate_mod.PASS)
+
+
+# --- invocation routing -------------------------------------------------------
+#
+# "Benchsmith is ready, send me a task" is a failed invocation: the user either
+# named one or meant the backlog. These pin the two routes.
+
+from benchsmith import resolve as rv  # noqa: E402
+
+check("a submissions URL yields its id",
+      rv.URL_ID.search("https://codimango.internalmeta.com/submissions/210976?jobId=9").group(1),
+      "210976")
+check("a bare id is an id", bool(rv.BARE_ID.match("210976")), True)
+check("a task name is not an id", bool(rv.BARE_ID.match("ollo-scholar-paused")), False)
+
+# A task directory exists in every scratch and base-tree clone that ever touched
+# it. Taking the first match dispatches a worker at a throwaway copy.
+_rr = Path(tempfile.mkdtemp())
+for d in ("zz-scratch-copy", "swe-bench-aai-labs-ollo-work", "aa-review-tmp"):
+    (_rr / d / "mytask").mkdir(parents=True)
+    (_rr / d / "mytask" / "task.toml").write_text('authors = [{ name = "x" }]\n')
+_roots = [str(_rr / d) for d in sorted(("zz-scratch-copy", "swe-bench-aai-labs-ollo-work", "aa-review-tmp"))]
+_found = rv.find_repos("mytask", _roots)
+check("a canonical checkout outranks an alphabetically earlier scratch one",
+      Path(_found[0]).name, "swe-bench-aai-labs-ollo-work")
+check("every clone is reported, not just the chosen one", len(_found), 3)
+check("a task in no checkout resolves to nothing", rv.find_repos("nope", _roots), [])
+
+try:
+    rv.resolve("")
+    check("an empty reference is refused", "accepted", "refused")
+except rv.Unresolved:
+    check("an empty reference is refused", True, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
