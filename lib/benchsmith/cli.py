@@ -306,10 +306,39 @@ def cmd_fleet(args) -> int:
     """
     repo = Path(args.repo).resolve() if args.repo else Path.cwd()
     cfg = config_mod.load(repo, project_id=args.gsd_project)
-    raw = sources.discover(cfg=cfg, with_gsd=not args.no_gsd)
-    items = build_queue(raw.get("tasks") or [], journals=read_journals(repo),
-                        leases=Leases(repo).active(), ideas=raw.get("ideas") or [])
-    ready = [i for i in items if i.dispatchable][: args.workers]
+    journals, leases = read_journals(repo), Leases(repo).active()
+
+    # The board is the THIRD source, not a co-equal one. Platform tasks are work
+    # that demonstrably exists; a board card is a claim that some does. So the
+    # board is not even fetched until the platform cannot fill the slots -- which
+    # also means an unconfigured board is invisible on a normal day instead of
+    # being a standing complaint.
+    raw = sources.discover(cfg=cfg, with_gsd=False)
+    items = build_queue(raw.get("tasks") or [], journals=journals, leases=leases)
+    ready = [i for i in items if i.dispatchable]
+    needs_board = None
+
+    if len(ready) < args.workers and not args.no_gsd:
+        if cfg.configured:
+            raw = sources.discover(cfg=cfg, with_gsd=True)
+            items = build_queue(raw.get("tasks") or [], journals=journals, leases=leases,
+                                ideas=raw.get("ideas") or [])
+            ready = [i for i in items if i.dispatchable]
+        else:
+            # Asked for only when it would actually change what happens next,
+            # and asked for concretely -- "configure GSD" is not a question
+            # anyone can answer without going and finding the number.
+            needs_board = {
+                "why": (f"only {len(ready)} platform task(s) are dispatchable and "
+                        f"{args.workers} workers were asked for; the GSD board is the next source "
+                        "and it is not configured"),
+                "ask": ("Which GSD board holds your task cards? Paste the URL or the project id — "
+                        "e.g. https://www.internalfb.com/tasks/project/1722838652333221/list"),
+                "thenRun": "benchsmith fleet --gsd-project <id> --workers "
+                           f"{args.workers} --apply",
+            }
+
+    ready = ready[: args.workers]
 
     plans, started = [], []
     for item in ready:
@@ -346,10 +375,15 @@ def cmd_fleet(args) -> int:
             entry["shell"] = p.shell
         plans.append(entry)
 
-    _out({"discovered": len(items), "dispatchable": sum(1 for i in items if i.dispatchable),
-          "workers": args.workers, "applied": bool(args.apply),
-          "started": started, "plans": plans, "notes": raw.get("notes") or [],
-          "hint": None if args.apply else "re-run with --apply to start these"})
+    payload = {"discovered": len(items), "dispatchable": sum(1 for i in items if i.dispatchable),
+               "workers": args.workers, "applied": bool(args.apply),
+               "selected": [p["task"] for p in plans if "skipped" not in p],
+               "started": started, "plans": plans, "notes": raw.get("notes") or []}
+    if needs_board:
+        payload["needsGsdBoard"] = needs_board
+    if not args.apply:
+        payload["hint"] = "re-run with --apply to start these"
+    _out(payload)
     return 0
 
 

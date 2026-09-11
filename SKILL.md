@@ -56,10 +56,34 @@ You are the coordinator. Start work; do not present a plan and wait.
 benchsmith fleet --workers 3 --apply
 ```
 
-That discovers from Codimango and the GSD board, orders by tier, resolves each task to the checkout
-that holds it, and starts one non-publishing worker per task. It returns a `session` per worker.
+That orders the backlog, resolves each task to the checkout that holds it, and starts one
+non-publishing worker per task, returning a `session` for each.
 
-Then **supervise, in a loop, without being asked**:
+**Announce, then go.** Before the first worker's first round, say plainly which tasks you picked
+and why each is on the list — "I'm going to start iterating on these three: X (needs revision),
+Y (needs revision), Z (draft, validation failing)". That is a statement, not a question. Do not
+wait for a reply.
+
+#### Where the work comes from, in order
+
+1. **Codimango `needs_revision`** — a reviewer is already waiting.
+2. **Codimango drafts** — failing, then pending, then passing.
+3. **The GSD board** — only when 1 and 2 cannot fill the slots.
+
+The board is genuinely third: a platform row is work that demonstrably exists, a board card is a
+claim that some does. `fleet` does not even fetch the board until the platform runs dry, so an
+unconfigured board costs nothing on a normal day.
+
+**When it does run dry and no board is configured, ask for it — directly and once.** `fleet`
+returns `needsGsdBoard` with the exact question. Put it to the user in those terms:
+
+> Which GSD board holds your task cards? Paste the URL or the project id — e.g.
+> `https://www.internalfb.com/tasks/project/1722838652333221/list`
+
+Then re-run with `--gsd-project <id>` and keep going. Do not ask for it pre-emptively, and do not
+silently proceed with fewer workers than asked for.
+
+#### Supervising
 
 ```bash
 benchsmith collect --session-id <session>     # per worker, until state is not "running"

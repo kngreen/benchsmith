@@ -2449,5 +2449,17 @@ check("...and says the surface could not be resolved",
       any("surface" in n or "failed" in n for n in _notes), True)
 
 
+# --- the board is the third source, asked for only when it matters -----------
+
+_skill = Path("/home/kngreen/.claude/skills/benchsmith/SKILL.md").read_text()
+check("the invocation section states the source order",
+      "Codimango `needs_revision`" in _skill and "only when 1 and 2 cannot fill" in _skill, True)
+check("the agent is told to announce the picks", "I'm going to start iterating on these" in _skill, True)
+check("...as a statement, not a question", "That is a statement, not a question" in _skill, True)
+check("the board question is concrete enough to answer",
+      "Paste the URL or the project id" in _skill, True)
+check("pre-emptive asking is ruled out", "Do not ask for it pre-emptively" in _skill, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
