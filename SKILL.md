@@ -358,6 +358,31 @@ Otherwise prove and record the simple case: no candidate-controlled execution po
 every verifier, runner, parser and dependency sits outside candidate-writable storage and is
 invoked by pinned absolute path. Full-closure procedure: `references/gates.md`.
 
+### Over-constrained implementation freedom
+
+The recurring authoring defect, and the hardest to see from inside: a grader that
+looks stricter but is actually refusing valid work. Observed four times on one
+author's tasks — **pinned column names, a numeric margin, an error shape, and file
+identity** — and three of the four were caught by someone else's review machinery
+rather than by the author.
+
+Before every graded-surface push, check the grader cannot reject on:
+
+- **file or symbol identity** — a base test calling the original signature forces
+  every candidate that refactors it to edit that file, or the language will not
+  compile. Drive graded ids through the held-out file instead.
+- **exact names** — column, field, helper or test names the spec never fixed.
+- **numeric margin or tolerance** the spec does not state.
+- **error shape** — exact message, type or wrapping, where the spec asks only that
+  it fail.
+
+The tell is in the trials, not the tree: **a trial rejected before the grader ran is
+`Kind.D`, not a failure.** It invalidates the measurement rather than counting as
+difficulty, because a denominator containing pre-grade rejections is not a
+denominator. A cohort at 0/5 is the loudest version of this signal — audit those
+trajectories before hardening or easing anything, since on a task with this history
+a fifth constraint is more likely than genuine difficulty.
+
 ### The honest gap
 
 the optional mutation probe covers **Go and Python only**, caps the battery at 12, and reports

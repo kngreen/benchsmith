@@ -36,6 +36,19 @@ NON_PARTICIPANT = (
     "collector",
 )
 
+# A trial rejected BEFORE the grader ran is not a failure -- it is a graded
+# surface refusing a candidate on something other than behaviour. Measured on a
+# live task: 9 of 15 trials never reached the grader because the base test
+# pinned a function signature, so any candidate refactoring it could not compile.
+# Reported rate 4/15 = 26.7% "in band"; true rate 4/6 = 66.7%, above band. Wrong,
+# and flattering -- these inflate the denominator and depress the rate.
+_PRE_GRADE = re.compile(
+    r"\b(compile|compilation|build fail|does not compile|cannot find|undefined:|"
+    r"digest|checksum|manifest mismatch|pinned|pin reject|refus(ed|ing) submitted|"
+    r"pre-?grade|never reached the (grader|verifier))\b",
+    re.I,
+)
+
 _ERRORED = re.compile(
     r"\b(error|errored|infra|timeout|timed.?out|cancell?ed|worker|harness|rate.?limit|"
     r"unavailable|outage|preempt)\b",
@@ -240,6 +253,11 @@ def classify(trial: dict, *, graded_ok: bool) -> tuple[Kind, str]:
         return (Kind.E, "spec ambiguity or defect")
     if trial.get("validAlternative") or trial.get("graderFalseNegative"):
         return (Kind.D, "valid alternative rejected")
+    if trial.get("preGradeRejected") or _PRE_GRADE.search(reason):
+        # The grader refused the candidate on something other than behaviour.
+        # D, not A: it invalidates the measurement rather than counting as
+        # difficulty, because the denominator it sits in is not a denominator.
+        return (Kind.D, f"rejected before grading: {reason[:100]}")
     if _ERRORED.search(status) or _ERRORED.search(reason):
         return (Kind.F, f"infrastructure: {status or reason}"[:120])
     if graded_ok:

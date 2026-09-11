@@ -196,9 +196,33 @@ def evaluate(m: Measurement, target: str = "hard-preferred") -> dict:
         mrate = mp / mn
         if not (MIXED[0] <= mrate <= MIXED[1]):
             state = "saturated" if mrate > MIXED[1] else "starved"
-            findings.append(
-                Finding("strongest-not-mixed", f"{member[0]}@{member[1]} {mp}/{mn} = {mrate:.4f} ({state})")
-            )
+            edge = MIXED[1] if mrate > MIXED[1] else MIXED[0]
+            lo, hi = wilson(mp, mn)
+            # The allowance is ONE-SIDED, and the asymmetry is the point.
+            #
+            # SATURATED near the edge (codex 4/5) is thin evidence for rejecting
+            # a task that may be fine: one trial moves the rate 20 points, so 4/5
+            # is not distinguishable from 3/5. Advisory.
+            #
+            # STARVED (a cohort at 0/5) stays BLOCKING, however close to the
+            # floor. A cohort that never passed is the signature of a grader
+            # over-constraining implementation freedom -- pinned file identity,
+            # exact column names, a numeric margin, an error shape -- and waving
+            # it through is how a broken grader reads as difficulty. A live run
+            # reported exactly this shape and correctly treated it as a failure.
+            if state == "saturated" and mn < 10 and abs(mrate - edge) <= (1.0 / mn) + 1e-9:
+                findings.append(
+                    Finding(
+                        "strongest-boundary",
+                        f"{member[0]}@{member[1]} {mp}/{mn} = {mrate:.4f} ({state}) is ONE TRIAL from "
+                        f"{edge:.2f}, Wilson [{lo:.2f}, {hi:.2f}] — advisory at k={mn}. "
+                        f"Resample at k>=10 before rejecting on this alone",
+                    )
+                )
+            else:
+                findings.append(
+                    Finding("strongest-not-mixed", f"{member[0]}@{member[1]} {mp}/{mn} = {mrate:.4f} ({state})")
+                )
 
     fams = {
         r.slot.family for r in _live(m) if r.counts and r.kind.is_hardness_evidence
@@ -259,7 +283,9 @@ def evaluate(m: Measurement, target: str = "hard-preferred") -> dict:
                 )
             )
 
-    verdict = _verdict(findings, p, m, target)
+    # `strongest-boundary` is advisory: reported, never decisive on its own.
+    decisive = [f for f in findings if f.code != "strongest-boundary"]
+    verdict = _verdict(decisive, p, m, target)
     return {
         "verdict": verdict,
         "rate": {"passes": passes, "slots": n, "p": round(p, 4)},
