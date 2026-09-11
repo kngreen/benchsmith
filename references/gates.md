@@ -18,6 +18,23 @@ not a pass.
 What must hold regardless of surface: the read is uncached, it is addressed by `TASK_ID`/
 `TASK_UUID` rather than basename (§1), and every number it returns is attributed to `ACTIVE_SHA`.
 
+## Never read cohort rates from the task record
+
+The headline fields on `tasks show` — `agentPassCount/Rate`, `metacodePassCount/Rate`,
+`avocadoPass*` — are **not** the cohort set. There is no codex field among them, so a task where
+codex ran and saturated reads as though that cohort never existed.
+
+Measured on `ollo-behavior-log-anonymization @ 2e4a9850`: the headline fields give
+2/5 + 0/5 = **20% pooled**; the SHA-scoped jobs give **7/15 = 46%**, because codex went 5/5. The
+first reads as comfortably in band; the second is a saturated strongest cohort and a reject. Two
+further tasks showed the same distortion (50% -> 60%, and one more).
+
+Rates come from the job list, scoped and deduplicated: `status == "completed"`, job commit equal
+to the validation commit, the one-attempt `reviewIdentity.stage == "agentic-review"` job excluded,
+and the newest batch kept per `config.agentName`. `assay bar` does this in `select_jobs` and keeps
+an auditable note for every job it drops — a silently dropped cohort is indistinguishable from one
+that never ran.
+
 ## Read fresh, always
 
 **Every Codimango read carries `--no-cache`.** A cached read after a push is how one commit's

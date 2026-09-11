@@ -305,6 +305,80 @@ check("frequency leader is not topFailure", ev["topFailure"], "sole")
 check("frequency table still available", ev["failureFrequency"]["freq"], 2)
 
 
+# ------------------------------------------------------- job selection -----
+section("Job selection — the headline fields lie by omission")
+
+from assay.snapshot import agent_name, job_stage, select_jobs  # noqa: E402
+
+check("agentName is the cohort identity", agent_name({"config": {"agentName": "codex"}}), "codex")
+check("reviewIdentity.stage is the stage", job_stage({"reviewIdentity": {"stage": "agentic-review"}}), "agentic-review")
+check(
+    "agentic-review excluded via reviewIdentity",
+    is_participant({"reviewIdentity": {"stage": "agentic-review"}, "config": {"agentName": "x"}})[0],
+    False,
+)
+
+# The measured case: ollo-behavior-log-anonymization @ 2e4a9850. Headline fields
+# expose claude-code 2/5 and metacode 0/5 and have NO codex field, reading 20%
+# pooled. Three cohorts actually ran; codex went 5/5, so the true SHA-scoped rate
+# is 7/15 = 46% — in-band by the headline, saturated-cohort reject in truth.
+SHA = "2e4a9850"
+jobs = [
+    {"id": "j-agent", "status": "completed", "config": {"agentName": "claude-code", "commitSha": SHA},
+     "createdAt": "2026-09-08T01:00:00Z", "attempts": 5},
+    {"id": "j-meta", "status": "completed", "config": {"agentName": "metacode", "commitSha": SHA},
+     "createdAt": "2026-09-08T01:00:00Z", "attempts": 5},
+    {"id": "j-codex", "status": "completed", "config": {"agentName": "codex", "commitSha": SHA},
+     "createdAt": "2026-09-08T01:00:00Z", "attempts": 5},
+    {"id": "j-review", "status": "completed", "reviewIdentity": {"stage": "agentic-review"},
+     "config": {"agentName": "reviewer", "commitSha": SHA}, "createdAt": "2026-09-08T02:00:00Z", "attempts": 1},
+    {"id": "j-stale", "status": "completed", "config": {"agentName": "codex", "commitSha": "0ldc0mm1"},
+     "createdAt": "2026-09-07T01:00:00Z", "attempts": 5},
+    {"id": "j-running", "status": "running", "config": {"agentName": "codex", "commitSha": SHA},
+     "createdAt": "2026-09-08T03:00:00Z", "attempts": 5},
+]
+chosen, notes = select_jobs(jobs, SHA)
+check("three participant cohorts selected", sorted(agent_name(j) for j in chosen), ["claude-code", "codex", "metacode"])
+check("codex cohort is not lost", "codex" in {agent_name(j) for j in chosen}, True)
+check("agentic-review dropped", "j-review" not in {j["id"] for j in chosen}, True)
+check("off-SHA job dropped", any("0ldc0mm1" in n for n in notes), True)
+check("non-completed job dropped", any("'running'" in n for n in notes), True)
+check("every exclusion is explained", len(notes), 3)
+
+# Newest batch per cohort: an earlier batch at the same SHA is superseded, not extra trials.
+rerun = jobs[:3] + [
+    {"id": "j-codex-2", "status": "completed", "config": {"agentName": "codex", "commitSha": SHA},
+     "createdAt": "2026-09-08T09:00:00Z", "attempts": 5}
+]
+chosen2, notes2 = select_jobs(rerun, SHA)
+check("one job per cohort after a rerun", len(chosen2), 3)
+check("newest batch wins", "j-codex-2" in {j["id"] for j in chosen2}, True)
+check("older batch named as dropped", any("older batch" in n for n in notes2), True)
+
+# End to end: the omitted cohort must reach the denominator.
+trials = {
+    "j-agent": [{"reward": 1.0 if i < 2 else 0.0, "reachedVerifier": True} for i in range(5)],
+    "j-meta": [{"reward": 0.0, "reachedVerifier": True} for _ in range(5)],
+    "j-codex": [{"reward": 1.0} for _ in range(5)],
+}
+from assay.snapshot import build as build_measurement  # noqa: E402
+
+m = build_measurement(
+    {"validationCommitSha": SHA},
+    jobs,
+    trials,
+    strongest=[("codex", "codex"), ("claude-code", "claude-code")],
+    steps=("1",),
+    active_sha=SHA,
+)
+check("denominator is 15, not 10", len(m.plan.slots), 15)
+res = evaluate(m)
+check("pooled rate counts codex", res["rate"], {"passes": 7, "slots": 15, "p": 0.4667})
+check("saturated codex cohort is caught", "strongest-not-mixed" in {f["code"] for f in res["findings"]}, True)
+check("verdict is not hard", res["verdict"], "NOT HARD")
+check("selection trail retained", len(m.selection_notes), 3)
+
+
 # ---------------------------------------------------------- replacement ----
 section("Replacement — one wave, F only, superseded by slot key")
 

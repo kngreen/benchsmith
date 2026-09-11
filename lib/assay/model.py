@@ -143,3 +143,6 @@ class Measurement:
     rows: list[Row] = field(default_factory=list)
     active_sha: str = ""
     reviews: list[Review] = field(default_factory=list)
+    # Why each job was kept or dropped during SHA scoping — an auditable trail,
+    # because a silently dropped cohort is indistinguishable from one that never ran.
+    selection_notes: list[str] = field(default_factory=list)

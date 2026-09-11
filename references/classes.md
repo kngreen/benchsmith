@@ -41,6 +41,21 @@ Numbers from another tree read as this one's and are worse than no numbers.
 with no rate is rewritten to `not-measured`, so it spends no hardening budget. Four consecutive
 rounds once spent four of five budget units this way and the task was still too easy at the end.
 
+## A uniform N-1 gate ratio is a single-gate signature
+
+A task whose per-step gate ratios are all the same `N-1` value reads as clean, well-spread
+hardness. It is equally the signature of **one test failing in almost every trial**: if eleven of
+fifteen trials fail the same assertion, every ratio lands at 8/9 and nothing in the summary says
+why.
+
+Compute single-gate coverage before believing a uniform ratio. Two of four accepted exemplars
+measured this way came in over the 0.80 ceiling — 6/7 (86%) on one diagnostic-emission rule, and
+5/6 (83%) on stale-plan drift. Both had looked evenly hard.
+
+Related: at n=15 a pooled Wilson interval is roughly 38-43 points wide, so a point estimate
+inside the band routinely carries an upper bound above 0.50. Report the interval; do not let a
+central estimate stand in for precision the sample does not have.
+
 ## Known-stale platform gates
 
 The platform's answer is not always a fact about the task. Where a gate is known stale, its
