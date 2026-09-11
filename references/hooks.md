@@ -126,7 +126,7 @@ same enforcement whether or not its clone wired anything up.
 ```bash
 benchsmith hooks --repo . --time      # what the repo ships, what we run, what it costs
 benchsmith fmt --repo .               # apply formatters to staged files, then re-stage
-benchsmith gate --repo . --task <t>   # includes a check-only `formatting` step
+benchsmith gate --repo . --task TASK-NAME   # includes a check-only `formatting` step
 ```
 
 ### Check and fix are different commands

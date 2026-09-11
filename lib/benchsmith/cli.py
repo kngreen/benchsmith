@@ -365,7 +365,7 @@ def cmd_fleet(args) -> int:
             continue
         # An idea is dispatched under its PROPOSED SLUG, not the card number: the
         # worker is creating that directory, and a card number is not a name.
-        name = info.get("suggestedSlug") or item.task if mode == "scaffold" else item.task
+        name = (info.get("suggestedSlug") or item.task) if mode == "scaffold" else item.task
         try:
             p = dispatch_mod.plan(name, target, mode=mode, target=args.target, idea=info)
         except dispatch_mod.DispatchRefused as e:

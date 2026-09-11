@@ -1100,14 +1100,20 @@ with tempfile.TemporaryDirectory() as td:
 
 from benchsmith import dispatch as dsp  # noqa: E402
 
-_p = dsp.plan("t1", "/repo")
+_DR = Path(tempfile.mkdtemp()) / "dispatch-repo"
+for _t in ("t1", "t", "real-task"):
+    (_DR / _t).mkdir(parents=True)
+    (_DR / _t / "task.toml").write_text('authors = [{ name = "x" }]\n')
+_REPO = str(_DR)
+
+_p = dsp.plan("t1", _REPO)
 check("default backend is agentcloud", _p.backend, "agentcloud")
 # `--harness codex` passes --dry-run (enum validation only) and is then rejected
 # with HTTP 400 at create time on this tenant. The default must be one that
 # demonstrably starts, not one that merely validates.
 check("no harness is forced by default", "--harness" not in _p.argv, True)
 check("an explicit legal harness is still passed",
-      "--harness" in dsp.plan("t1", "/r", harness="native").argv, True)
+      "--harness" in dsp.plan("t1", _REPO, harness="native").argv, True)
 # An agentcloud session runs on the same devserver under a DIFFERENT HOME, so a
 # tilde path resolves where the installation is not and the worker re-clones.
 check("the bootstrap names an absolute benchsmith path",
@@ -1118,7 +1124,7 @@ check("dispatch is non-publishing by default", _p.publishing, False)
 # the skill is silently absent, and the worker improvises without a gate.
 check("no --skills alias by default", "--skills" not in _p.argv, True)
 check("an explicit alias is still passed",
-      "--skills" in dsp.plan("t1", "/r", skills="benchsmith").argv, True)
+      "--skills" in dsp.plan("t1", _REPO, skills="benchsmith").argv, True)
 check("agentcloud workers bootstrap themselves",
       any("git clone" in a for a in _p.argv), True)
 check("bootstrap uses the working proxy pair",
@@ -1126,10 +1132,10 @@ check("bootstrap uses the working proxy pair",
 check("bootstrap failure is blocked, not improvised",
       any("state=blocked" in a for a in _p.argv), True)
 check("local codex workers do not clone",
-      any("git clone" in a for a in dsp.plan("t1", "/r", backend="codex").argv), False)
+      any("git clone" in a for a in dsp.plan("t1", _REPO, backend="codex").argv), False)
 check("bootstrap is forceable for a local worker",
-      any("git clone" in a for a in dsp.plan("t1", "/r", backend="codex", bootstrap=True).argv), True)
-check("plan is shell-quotable", "benchsmith: t1" in _p.shell, True)
+      any("git clone" in a for a in dsp.plan("t1", _REPO, backend="codex", bootstrap=True).argv), True)
+check("plan is shell-quotable", "benchsmith harden: t1" in _p.shell, True)
 check("task appears in the prompt, not just the title",
       any("t1" in a and "YOU MAY NOT PUSH" in a for a in _p.argv), True)
 # "Use the benchsmith skill" sends the agent hunting for a Skillbook alias that
@@ -1144,19 +1150,19 @@ check("...and does not say 'use the benchsmith skill'",
 # rejection here means the skill fails loudly rather than the API failing late.
 for bad in ("claude", "metacode"):
     try:
-        dsp.plan("t1", "/repo", harness=bad)
+        dsp.plan("t1", _REPO, harness=bad)
         check(f"agentcloud refuses harness={bad}", "accepted", "refused")
     except dsp.DispatchRefused as e:
         check(f"agentcloud refuses harness={bad}", "metacode and claude" in str(e) or "valid:" in str(e), True)
 
 check("native is a legal agentcloud harness",
-      dsp.plan("t1", "/repo", harness="native").backend, "agentcloud")
+      dsp.plan("t1", _REPO, harness="native").backend, "agentcloud")
 check("codex backend does not go through agentcloud",
-      dsp.plan("t1", "/repo", backend="codex").argv[:2], ["codex", "exec"])
+      dsp.plan("t1", _REPO, backend="codex").argv[:2], ["codex", "exec"])
 check("metacode is reachable as the 1P hop only",
-      "1P delegation only -- not a task worker" in dsp.plan("t1", "/repo", backend="metacode").notes, True)
+      "1P delegation only -- not a task worker" in dsp.plan("t1", _REPO, backend="metacode").notes, True)
 try:
-    dsp.plan("t1", "/repo", backend="nope")
+    dsp.plan("t1", _REPO, backend="nope")
     check("unknown backend refused", "accepted", "refused")
 except dsp.DispatchRefused:
     check("unknown backend refused", True, True)
@@ -1168,7 +1174,7 @@ try:
 except dsp.DispatchRefused:
     check("run without apply refuses", True, True)
 
-_pub = dsp.plan("t1", "/repo"); _pub.publishing = True
+_pub = dsp.plan("t1", _REPO); _pub.publishing = True
 try:
     dsp.run(_pub, apply=True)
     check("run refuses a publishing plan", "ran", "refused")
@@ -1225,13 +1231,13 @@ def _survives(old, new) -> bool:
     try:
         m = _il.reload(dsp)
         probes = [
-            lambda: m.plan("t", "/r", harness="claude"),
-            lambda: m.run(m.plan("t", "/r")),
+            lambda: m.plan("t1", _REPO, harness="claude"),
+            lambda: m.run(m.plan("t1", _REPO)),
             lambda: m.parse_handoff('{"state":"ready_to_publish"}'),
             lambda: m.parse_handoff('{"state":"kinda_done"}'),
             lambda: m.parse_handoff(_oversized()),
         ]
-        _pl = m.plan("t", "/r"); _pl.publishing = True
+        _pl = m.plan("t1", _REPO); _pl.publishing = True
         probes.append(lambda: m.run(_pl, apply=True))
         for probe in probes:
             try:
@@ -2532,12 +2538,12 @@ try:
 except dsp.DispatchRefused as e:
     check("scaffold refuses without a repo", "wrong repo" in str(e), True)
 try:
-    dsp.plan("some-slug", "/r", mode="scaffold")
+    dsp.plan("some-slug", _REPO, mode="scaffold")
     check("scaffold refuses without the card", "accepted", "refused")
 except dsp.DispatchRefused as e:
     check("scaffold refuses without the card", "empty checkout" in str(e), True)
 
-_sp = dsp.plan("some-slug", "/r", mode="scaffold", idea=_idea)
+_sp = dsp.plan("some-slug", _REPO, mode="scaffold", idea=_idea)
 _txt = [a for a in _sp.argv if "IDEA CARD" in a][0]
 check("the brief says it is not a task", "not an existing task" in _txt, True)
 check("...and forbids the repair loop", "Do NOT run the repair or hardening loop" in _txt, True)
@@ -2547,6 +2553,55 @@ check("...and routes through intake", "§3 intake first" in _txt, True)
 check("...and treats KILL as a success", "A KILL is a successful outcome" in _txt, True)
 check("...and marks the name as a proposal", "This name is a PROPOSAL" in _txt, True)
 check("...and still forbids pushing", "YOU MAY NOT PUSH" in _txt, True)
+
+
+# --- a placeholder is not a task ---------------------------------------------
+#
+# Twelve sessions were started as `benchsmith: t`, from a `--task <t>` in the
+# skill text that an agent substituted literally. Prose can always be miscopied,
+# so the refusal is in code.
+
+for _bad in ("t", "f", "task", "TASK", "<task>", "$TASK", "", "   "):
+    try:
+        dsp.plan(_bad, _REPO)
+        check(f"placeholder refused: {_bad!r}", "accepted", "refused")
+    except dsp.DispatchRefused:
+        check(f"placeholder refused: {_bad!r}", True, True)
+
+# The skill text must not contain the shape that caused it.
+for _f in ["SKILL.md"] + [f"references/{n}" for n in
+                          ("coordinator.md", "attribution.md", "hooks.md", "passatk.md")]:
+    _txt = Path("/home/kngreen/.claude/skills/benchsmith", _f).read_text()
+    import re as _re2
+    check(f"no single-letter placeholder in {_f}",
+          _re2.findall(r"--(?:task|handoff|repo)\s+<[a-z]>", _txt), [])
+
+# A worker sent at a directory that is not there burns a session to discover
+# what one stat call already knows.
+_dr2 = Path(tempfile.mkdtemp())
+(_dr2 / "real-task").mkdir()
+(_dr2 / "real-task" / "task.toml").write_text('authors = [{ name = "x" }]\n')
+try:
+    dsp.plan("not-a-task", str(_dr2))
+    check("dispatch refuses a task that is not in the checkout", "accepted", "refused")
+except dsp.DispatchRefused as e:
+    check("dispatch refuses a task that is not in the checkout", "does not exist" in str(e), True)
+check("a real task dispatches", dsp.plan("real-task", str(_dr2)).backend, "agentcloud")
+
+# The mirror mistake: scaffolding over something that already exists.
+try:
+    dsp.plan("real-task", str(_dr2), mode="scaffold",
+             idea={"gsd": "T1", "title": "x", "track": "t-bench"})
+    check("scaffold refuses to overwrite a real task", "accepted", "refused")
+except dsp.DispatchRefused as e:
+    check("scaffold refuses to overwrite a real task", "already exists" in str(e), True)
+
+# Twelve identically-titled sessions are unreadable in a fleet view.
+check("the session title names the mode",
+      any(a == "benchsmith harden: real-task" for a in dsp.plan("real-task", str(_dr2)).argv), True)
+check("...and differs by mode",
+      any(a == "benchsmith repair: real-task"
+          for a in dsp.plan("real-task", str(_dr2), mode="repair").argv), True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

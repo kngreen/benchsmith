@@ -51,6 +51,15 @@ HANDOFF_STATES = frozenset({
 })
 
 
+# Names that are almost certainly an unsubstituted placeholder rather than a
+# task. Twelve sessions were once started as `benchsmith: t`, from a `--task <t>`
+# in the skill text that an agent copied literally.
+PLACEHOLDERS = frozenset({
+    "t", "f", "n", "x", "task", "name", "taskname", "task-name", "task_name",
+    "repo", "handoff", "session", "id", "foo", "bar", "example", "todo",
+})
+
+
 class DispatchRefused(Exception):
     """The dispatch is not safe or not possible. The message is the reason."""
 
@@ -202,6 +211,23 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
     )
 
 
+def _placeholder(task: str) -> str:
+    """Refuse a name that is a placeholder rather than a task."""
+    name = (task or "").strip()
+    if not name:
+        return "no task name given"
+    if name.startswith("<") or name.endswith(">") or name.startswith("$"):
+        return f"task name {name!r} looks like an unsubstituted placeholder"
+    if name.lower() in PLACEHOLDERS:
+        return (f"task name {name!r} is a placeholder, not a task. Resolve the reference first: "
+                "`benchsmith resolve <what the user gave you>`")
+    return ""
+
+
+def _exists(repo: str, task: str) -> bool:
+    return (Path(repo).expanduser() / task / "task.toml").is_file()
+
+
 def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DEFAULT_HARNESS,
          skills: str | None = None, mode: str = "harden", target: str = "hard-preferred",
          bootstrap: bool | None = None, idea: dict | None = None) -> Plan:
@@ -215,6 +241,9 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
     if bootstrap is None:
         # A local worker already has the files. A remote one does not.
         bootstrap = backend == "agentcloud"
+    bad = _placeholder(task)
+    if bad:
+        raise DispatchRefused(bad)
     if mode == "scaffold":
         if not isinstance(idea, dict) or not idea:
             raise DispatchRefused(
@@ -226,9 +255,22 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
                 f"no checkout for track {idea.get('track') or 'unknown'}; scaffolding into the "
                 "wrong repo is not visible until validation"
             )
+        if _exists(repo, task):
+            raise DispatchRefused(
+                f"{repo}/{task} already exists; scaffolding over a real task would overwrite it. "
+                "Choose a different name, or dispatch it as a task rather than an idea"
+            )
         prompt = ((bootstrap_block() if bootstrap else "")
                   + scaffold_prompt(idea, repo, task))
     else:
+        # A worker sent at a directory that is not there burns a session to
+        # discover what one `is_file()` call already knows.
+        if repo and not _exists(repo, task):
+            raise DispatchRefused(
+                f"{repo}/{task}/task.toml does not exist, so {task!r} is not a task in that "
+                "checkout. If it is an idea, dispatch it with mode=scaffold; if the name is "
+                "wrong, resolve the reference first"
+            )
         prompt = worker_prompt(task, repo, mode=mode, target=target, bootstrap=bootstrap)
     notes: list[str] = []
     if bootstrap:
@@ -240,8 +282,11 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
                 f"agentcloud rejects harness {harness!r}; valid: {sorted(AGENTCLOUD_HARNESSES)}. "
                 "metacode and claude are not agentcloud harnesses -- run those locally."
             )
+        # Twelve identically-named sessions are unreadable in a fleet view, so
+        # the title carries what tells them apart: the task and what is being
+        # done to it.
         argv = ["meta", "agentcloud.session", "create",
-                "--title", f"benchsmith: {task}", "--message", prompt, "--output", "json"]
+                "--title", f"benchsmith {mode}: {task}", "--message", prompt, "--output", "json"]
         if harness:
             argv[3:3] = ["--harness", harness]
         if skills:

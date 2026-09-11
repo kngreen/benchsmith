@@ -128,7 +128,7 @@ benchsmith collect --session-id <session>     # per worker, until state is not "
 
 | Handoff state | What you do |
 |---|---|
-| `ready_to_publish` | `benchsmith publish --repo <repo> --task <t> --handoff <f> --apply` |
+| `ready_to_publish` | `benchsmith publish --repo REPO --task TASK-NAME --handoff HANDOFF.json --apply` |
 | `blocked` / `needs_human` | record it, move on, report at the end |
 | `no_change` / `failed` | record it, move on |
 | `finished-without-handoff` | the worker did not answer; treat as failed, do not guess |
