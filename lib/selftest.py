@@ -1101,7 +1101,17 @@ from benchsmith import dispatch as dsp  # noqa: E402
 
 _p = dsp.plan("t1", "/repo")
 check("default backend is agentcloud", _p.backend, "agentcloud")
-check("default harness is codex", "codex" in _p.argv, True)
+# `--harness codex` passes --dry-run (enum validation only) and is then rejected
+# with HTTP 400 at create time on this tenant. The default must be one that
+# demonstrably starts, not one that merely validates.
+check("no harness is forced by default", "--harness" not in _p.argv, True)
+check("an explicit legal harness is still passed",
+      "--harness" in dsp.plan("t1", "/r", harness="native").argv, True)
+# An agentcloud session runs on the same devserver under a DIFFERENT HOME, so a
+# tilde path resolves where the installation is not and the worker re-clones.
+check("the bootstrap names an absolute benchsmith path",
+      dsp.benchsmith_root().startswith("/"), True)
+check("...and no tilde reaches the prompt", "~/" in dsp.bootstrap_block(), False)
 check("dispatch is non-publishing by default", _p.publishing, False)
 # An alias that resolves to nothing is worse than no alias: the session starts,
 # the skill is silently absent, and the worker improvises without a gate.
@@ -1191,7 +1201,7 @@ for label, bad in [
 import importlib as _il  # noqa: E402
 _src = Path(dsp.__file__).read_text()
 _MUTANTS = [
-    ("harness allowlist", 'if harness not in AGENTCLOUD_HARNESSES:', 'if False:'),
+    ("harness allowlist", 'if harness and harness not in AGENTCLOUD_HARNESSES:', 'if False:'),
     ("apply guard", 'if not apply:', 'if False:'),
     ("publishing guard", 'if p.publishing:', 'if False:'),
     ("commit_sha requirement", 'if state == "ready_to_publish" and not doc.get("commit_sha"):', 'if False:'),

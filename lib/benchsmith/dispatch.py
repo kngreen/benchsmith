@@ -23,11 +23,11 @@ from pathlib import Path
 # So the 1P delegation hop cannot be an agentcloud session -- it runs locally.
 AGENTCLOUD_HARNESSES = frozenset({"codex", "native"})
 
-# Codex is the default worker on policy, not preference: it needs exactly one
-# delegation hop (instruction.md), where Claude needs two, and Muse -- which
-# needs none -- is denied by the aai-long-horizon guard because it strips
-# META_3PAI_AGENT_PLATFORM in plugin hook environments (T287337880).
-DEFAULT_HARNESS = "codex"
+# Empty means "whatever the tenant defaults to". `--harness codex` passes
+# `--dry-run` -- which only validates the enum -- and is then REJECTED with
+# HTTP 400 at create time on this tenant. Validating a value is not the same as
+# being able to use it, so the default is the one that demonstrably starts.
+DEFAULT_HARNESS = ""
 
 HANDOFF_LIMIT = 4096
 
@@ -103,7 +103,17 @@ def resume_block(repo: str, task: str) -> str:
     )
 
 
-def bootstrap_block(root: str = "~/.claude/skills/benchsmith") -> str:
+def benchsmith_root() -> str:
+    """The absolute path of the running installation.
+
+    Not `~`: an agentcloud session runs on the same devserver but under a
+    different HOME (`/var/localhome/devenvuser...`), so a tilde resolves
+    somewhere the installation is not and the worker silently re-clones.
+    """
+    return str(Path(__file__).resolve().parents[2])
+
+
+def bootstrap_block(root: str | None = None) -> str:
     """Put benchsmith on the worker's disk.
 
     A remote worker cannot be handed benchsmith through `--skills`. SkillsService
@@ -113,12 +123,15 @@ def bootstrap_block(root: str = "~/.claude/skills/benchsmith") -> str:
     body-only delivery yields a worker that has the judgement and none of the
     commands. It has to arrive as files.
     """
+    root = root or benchsmith_root()
     return (
         "First, make benchsmith available:\n"
         "```bash\n"
         f"{PROXY_PREAMBLE}\n"
-        f"test -x {root}/bin/benchsmith || git clone {BENCHSMITH_ORIGIN} {root}\n"
-        f"{root}/bin/benchsmith preflight --json\n"
+        f"export BENCHSMITH_BIN={root}/bin/benchsmith\n"
+        f'test -x "$BENCHSMITH_BIN" || {{ git clone {BENCHSMITH_ORIGIN} /tmp/benchsmith '
+        f'&& export BENCHSMITH_BIN=/tmp/benchsmith/bin/benchsmith; }}\n'
+        '"$BENCHSMITH_BIN" preflight --json\n'
         "```\n"
         "If the clone fails, stop and report state=blocked. Do not improvise a "
         "substitute for the gate: an ungated push is the failure this exists to "
@@ -167,13 +180,15 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
         notes.append("worker clones benchsmith itself; --skills cannot deliver a package")
 
     if backend == "agentcloud":
-        if harness not in AGENTCLOUD_HARNESSES:
+        if harness and harness not in AGENTCLOUD_HARNESSES:
             raise DispatchRefused(
                 f"agentcloud rejects harness {harness!r}; valid: {sorted(AGENTCLOUD_HARNESSES)}. "
                 "metacode and claude are not agentcloud harnesses -- run those locally."
             )
-        argv = ["meta", "agentcloud.session", "create", "--harness", harness,
+        argv = ["meta", "agentcloud.session", "create",
                 "--title", f"benchsmith: {task}", "--message", prompt, "--output", "json"]
+        if harness:
+            argv[3:3] = ["--harness", harness]
         if skills:
             argv += ["--skills", skills]
         notes.append("poll with `meta agentcloud.session poll --session-id <id>`")
