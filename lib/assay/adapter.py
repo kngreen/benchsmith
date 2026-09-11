@@ -96,26 +96,37 @@ def discover(binary: str | None = None, site: str | None = None) -> Surface:
     else:
         surface.notes.append("no --site flag; using the CLI's configured default")
 
-    # Data surface: `api tasks|jobs|trials` on legacy, bare `task|job|trial` on
-    # the replacement. Probe both rather than assuming either.
-    if "api" in root:
-        api = _help(binary, "api")
-        if "tasks" in api:
+    # Data surface: `api tasks|jobs|trials` on the legacy CLI, bare
+    # `task|job|trial` on the replacement. Probe both; assume neither.
+    #
+    # Match against the parsed command list, never a substring of the whole help
+    # text: "task" appears in the *description* of unrelated commands ("the large
+    # task assets a trial downloads"), so `"task" in root` is satisfied by a CLI
+    # that has no `task` command at all, and the mismatch only surfaces at call
+    # time. That is exactly the substitution this module exists to refuse.
+    commands = _commands(root)
+
+    if "api" in commands:
+        api = _commands(_help(binary, "api"))
+        if {"tasks", "jobs", "trials"} <= api:
             surface.task_show = ("api", "tasks", "show")
             surface.jobs_list = ("api", "jobs", "list")
             surface.trials_list = ("api", "trials", "list")
             surface.trials_artifacts = ("api", "trials", "artifacts")
+        elif "tasks" in api:
+            surface.notes.append(f"`api` present but incomplete: {sorted(api & {'tasks', 'jobs', 'trials'})}")
+
     if not surface.task_show:
-        for singular, plural in (("task", "tasks"), ("job", "jobs"), ("trial", "trials")):
-            if singular not in root and plural not in root:
-                continue
-        if "task" in root:
-            surface.task_show = ("task", "show")
-            surface.jobs_list = ("job", "list")
-            surface.trials_list = ("trial", "list")
-            surface.trials_artifacts = ("trial", "artifacts")
-    if not surface.task_show:
-        raise Unresolved("could not resolve a task-read subcommand from --help output")
+        missing = {"task", "job", "trial"} - commands
+        if missing:
+            raise Unresolved(
+                f"no usable read surface: `api` absent or incomplete, and the bare form is "
+                f"missing {sorted(missing)}. Commands seen: {sorted(commands)}"
+            )
+        surface.task_show = ("task", "show")
+        surface.jobs_list = ("job", "list")
+        surface.trials_list = ("trial", "list")
+        surface.trials_artifacts = ("trial", "artifacts")
 
     show_help = _help(binary, *surface.task_show)
     surface.supports_no_cache = "--no-cache" in show_help

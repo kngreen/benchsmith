@@ -133,7 +133,22 @@ def classify(trial: dict, *, graded_ok: bool) -> tuple[Kind, str]:
 
     status = str(trial.get("status") or "").lower()
     reward = trial.get("reward")
-    reason = str(trial.get("failureReason") or trial.get("error") or "")
+    # Live trials carry `exceptionInfo` at top level and the detail under
+    # `harborResultSummary`. Reading only failureReason/error meant _ERRORED
+    # never matched and every infra abort classified as a semantic failure --
+    # precisely the failed-vs-never-ran collapse this module opens by warning of.
+    hrs = trial.get("harborResultSummary") or {}
+    reason = " ".join(
+        str(x)
+        for x in (
+            trial.get("exceptionInfo"),
+            hrs.get("exceptionType"),
+            hrs.get("exceptionMessage"),
+            trial.get("failureReason"),
+            trial.get("error"),
+        )
+        if x
+    )
 
     if trial.get("specDefect") or trial.get("ambiguity"):
         return (Kind.E, "spec ambiguity or defect")
@@ -143,7 +158,7 @@ def classify(trial: dict, *, graded_ok: bool) -> tuple[Kind, str]:
         return (Kind.F, f"infrastructure: {status or reason}"[:120])
     if graded_ok:
         return (Kind.PASS, "every graded assertion passed")
-    if trial.get("reachedVerifier") or reward is not None:
+    if trial.get("reachedVerifier") or reward is not None or trial.get("ctrfResults"):
         return (Kind.A, "verifier ran and reported wrong behaviour")
     if status in {"failed", "fail", "error"} and not reason:
         return (Kind.G, "no attribution available")
@@ -152,10 +167,34 @@ def classify(trial: dict, *, graded_ok: bool) -> tuple[Kind, str]:
     return (Kind.G, "no status")
 
 
+def failing_tests(trial: dict) -> list[str] | None:
+    """Named failures for one trial, or None when they are unknowable.
+
+    Live shape is `ctrfResults.tests[]`; the downloaded artifact is
+    `verifier/output.json` with UPPERCASE statuses and no summary key. None means
+    the trial reported failures but named none -- never an empty list.
+    """
+    ctrf = trial.get("ctrfResults") or {}
+    tests = ctrf.get("tests") or trial.get("tests")
+    if not tests:
+        return None
+    out = []
+    for entry in tests:
+        name = entry.get("name") or entry.get("id")
+        status = str(entry.get("status") or "").upper()
+        if name and status in {"FAIL", "FAILED", "ERROR"}:
+            out.append(str(name))
+    return out
+
+
 def graded_pass(trial: dict) -> bool:
     """PASS means every element of the graded set passed. Partial credit is not a pass."""
     if trial.get("gradedPass") is not None:
         return bool(trial["gradedPass"])
+    ctrf = trial.get("ctrfResults") or {}
+    summary = ctrf.get("summary") or {}
+    if summary:
+        return bool(summary.get("tests")) and not (summary.get("failed") or 0)
     reward = trial.get("reward")
     if isinstance(reward, dict):
         return bool(reward) and all(float(v) >= 1.0 for v in reward.values())
@@ -191,12 +230,15 @@ def build_plan(jobs: list[dict], *, strongest, steps, categories=()) -> Plan:
         ok, _ = is_participant(job)
         if not ok:
             continue
+        cfg = job.get("config") or {}
+        # `config.nAttempts` is the live field. Everything else here is a
+        # fallback for other surfaces; probing the wrong name made build_plan
+        # raise on every real job.
         attempts = (
-            job.get("plannedAttempts")
+            cfg.get("nAttempts")
+            or job.get("plannedAttempts")
             or job.get("attempts")
-            or job.get("numAttempts")
-            or (job.get("config") or {}).get("numAttempts")
-            or (job.get("config") or {}).get("attempts")
+            or cfg.get("numAttempts")
             or job.get("k")
         )
         if not attempts:
@@ -271,6 +313,8 @@ def evidence(trials: list[dict]) -> dict:
             scored += 1
             continue
         names = t.get("failingTests")
+        if names is None:
+            names = failing_tests(t)
         if names is None:
             complete = False
             continue

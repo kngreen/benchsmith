@@ -125,7 +125,13 @@ def single_gate_share(m: Measurement) -> float:
     for r in trials:
         for d in set(r.decisions):
             counts[d] += 1
-    return (max(counts.values()) / len(trials)) if counts else 0.0
+    if not counts:
+        # No decision IDs means the kill CANNOT be evaluated. Returning 0.0 here
+        # reads as "well spread" and lets the check pass -- failing open, in a
+        # module whose contract is that every predicate is false on missing
+        # evidence. The caller must treat None as unverifiable, not as clean.
+        return None
+    return max(counts.values()) / len(trials)
 
 
 def categories_covered(m: Measurement) -> set[str]:
@@ -200,11 +206,32 @@ def evaluate(m: Measurement, target: str = "hard-preferred") -> dict:
         findings.append(Finding("one-family", f"semantic failures in {len(fams)} family/families"))
 
     cats = categories_covered(m)
-    if len(cats) < MIN_CATEGORIES:
+    labelled = any(r.category for r in _live(m) if r.counts and r.kind.is_hardness_evidence)
+    if not labelled:
+        # Distinguish "measured, and it is all one category" from "nothing was
+        # ever categorised". The second is unverified, and saying `one-category`
+        # would blame the task for a gap in our own evidence.
+        findings.append(
+            Finding(
+                "attribution-unavailable",
+                "no behaviour category on any semantic failure: two-category coverage cannot be "
+                "evaluated",
+            )
+        )
+    elif len(cats) < MIN_CATEGORIES:
         findings.append(Finding("one-category", f"hardness in {len(cats)} category/categories: {sorted(cats)}"))
 
     share = single_gate_share(m)
-    if share >= SINGLE_GATE_KILL:
+    if share is None:
+        findings.append(
+            Finding(
+                "attribution-unavailable",
+                "no decision IDs on any strongest-member semantic failure: the single-gate kill "
+                "cannot be evaluated. Supply attribution (trajectory read or reviewer input) or "
+                "the hardness claim is unverified, not clean",
+            )
+        )
+    elif share >= SINGLE_GATE_KILL:
         findings.append(Finding("single-gate", f"one decision explains {share:.0%} of strongest failures"))
 
     for step in m.plan.steps:
@@ -239,7 +266,7 @@ def evaluate(m: Measurement, target: str = "hard-preferred") -> dict:
         "distanceToBand": round(distance_to_band(p), 4),
         "boundaryAdjacent": 0 < distance_to_band(p) < 1 / n,
         "categories": sorted(cats),
-        "singleGateShare": round(share, 4),
+        "singleGateShare": None if share is None else round(share, 4),
         "findings": [f.__dict__ for f in findings],
         "runsIncomplete": [],
     }
@@ -264,6 +291,7 @@ def _verdict(findings: list[Finding], p: float, m: Measurement, target: str) -> 
     blocking = {
         "invalidated",
         "incomplete",
+        "attribution-unavailable",
         "review",
         "single-gate",
         "unrelated-nonpass",
