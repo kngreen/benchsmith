@@ -343,6 +343,8 @@ jobs = [
 ]
 chosen, notes = select_jobs(jobs, SHA)
 check("three participant cohorts selected", sorted(agent_name(j) for j in chosen), ["claude-code", "codex", "metacode"])
+from assay.snapshot import family_of  # noqa: E402
+check("harness names normalise to model families", sorted(family_of(j) for j in chosen), ["avocado", "gpt", "opus"])
 check("codex cohort is not lost", "codex" in {agent_name(j) for j in chosen}, True)
 check("agentic-review dropped", "j-review" not in {j["id"] for j in chosen}, True)
 check("off-SHA job dropped", any("0ldc0mm1" in n for n in notes), True)
@@ -371,7 +373,9 @@ m = build_measurement(
     {"validationCommitSha": SHA},
     jobs,
     trials,
-    strongest=[("codex", "codex"), ("claude-code", "claude-code")],
+    # Strongest set is written in model families, which is what family_of yields:
+    # agentName "codex" is the harness, family "gpt" is what §5 talks about.
+    strongest=[("gpt", "codex"), ("opus", "claude-code")],
     steps=("1",),
     active_sha=SHA,
 )

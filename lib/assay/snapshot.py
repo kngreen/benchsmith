@@ -43,6 +43,22 @@ _ERRORED = re.compile(
 )
 
 
+# `config.agentName` names the HARNESS ("codex", "claude-code", "metacode"), not
+# the model family a strongest set is written in terms of ("GPT/Codex",
+# "Opus/Claude"). Without this map a frozen strongest set matches nothing.
+FAMILY_ALIASES = {
+    "codex": "gpt",
+    "claude-code": "opus",
+    "metacode": "avocado",
+    "agent": "opus",
+}
+
+
+def family_of(job: dict) -> str:
+    raw = agent_name(job).split("/")[0]
+    return FAMILY_ALIASES.get(raw, raw) or "unknown"
+
+
 def agent_name(job: dict) -> str:
     """The cohort identity. `config.agentName` is the observed field."""
     cfg = job.get("config") or {}
@@ -206,7 +222,20 @@ def graded_pass(trial: dict) -> bool:
         return False
 
 
-def model_build(job: dict) -> str:
+def model_build(job: dict, trial: dict | None = None) -> str:
+    """The exact build. Prefer the TRIAL's modelName over the job's.
+
+    They differ on point releases: a job declaring `meta/avocado-code-flex` runs
+    trials of `meta/avocado-code-flex-5.16`. §5 freezes exact builds and pooling
+    requires identical ones, so taking the job's value collapses two releases
+    into one slot key.
+    """
+    if trial and trial.get("modelName"):
+        return str(trial["modelName"])
+    return _job_build(job)
+
+
+def _job_build(job: dict) -> str:
     """The exact build. `config.modelName` is the live field.
 
     agentName and modelName differ -- agentName 'metacode' runs modelName
@@ -230,17 +259,16 @@ def generation_of(job: dict) -> int:
 
 
 def slot_of(job: dict, trial: dict, ordinal: int) -> SlotKey:
-    name = agent_name(job)
     return SlotKey(
         stage=job_stage(job) or "agent",
-        family=name.split("/")[0] or "unknown",
-        build=model_build(job),
+        family=family_of(job),
+        build=model_build(job, trial),
         step=str(trial.get("step") or trial.get("stepId") or "1"),
         ordinal=ordinal,
     )
 
 
-def build_plan(jobs: list[dict], *, strongest, steps, categories=()) -> Plan:
+def build_plan(jobs: list[dict], *, strongest, steps, categories=(), trials_by_job=None) -> Plan:
     """Derive the planned slot set from job configuration, not from results.
 
     `attempts` comes from the job's own configuration. When the platform will
@@ -257,9 +285,10 @@ def build_plan(jobs: list[dict], *, strongest, steps, categories=()) -> Plan:
         # `config.nAttempts` is the live field. Everything else here is a
         # fallback for other surfaces; probing the wrong name made build_plan
         # raise on every real job.
-        # `plannedNAttempts` first: the doctrine is planned-vs-observed, and
-        # `nAttempts` is what the job ran. They differ (one real job has
-        # nAttempts=1 with plannedNAttempts null), so both are needed.
+        # `plannedNAttempts` first: the doctrine is planned-vs-observed and
+        # `nAttempts` is what the job ran. Both are needed -- observed on a real
+        # swe-bench-pro task, completed participant jobs carry both (5/5), while
+        # the agentic-review job has nAttempts=1 and plannedNAttempts null.
         attempts = (
             cfg.get("plannedNAttempts")
             or cfg.get("nAttempts")
@@ -273,13 +302,18 @@ def build_plan(jobs: list[dict], *, strongest, steps, categories=()) -> Plan:
                 f"job {job.get('id')} does not declare its planned attempt count; "
                 "cannot freeze a slot plan from it"
             )
+        # Resolve the build label the same way rows will, or the plan and the
+        # rows key on different strings and every slot reads as unobserved. The
+        # COUNT still comes from config -- only the label comes from a trial.
+        sample = (trials_by_job or {}).get(str(job.get("id")), [])
+        build_label = model_build(job, sample[0] if sample else None)
         for step in steps or ("1",):
             for i in range(int(attempts)):
                 slots.append(
                     SlotKey(
                         stage=job_stage(job) or "agent",
-                        family=agent_name(job).split("/")[0] or "unknown",
-                        build=model_build(job),
+                        family=family_of(job),
+                        build=build_label,
                         step=str(step),
                         ordinal=i,
                     )
@@ -520,7 +554,9 @@ def build(task: dict, jobs: list[dict], trials_by_job: dict, *, strongest, steps
     """
     validation_sha = str(task.get("validationCommitSha") or active_sha or "")
     chosen, notes = select_jobs(jobs, validation_sha)
-    plan = build_plan(chosen, strongest=strongest, steps=steps, categories=categories)
+    plan = build_plan(
+        chosen, strongest=strongest, steps=steps, categories=categories, trials_by_job=trials_by_job
+    )
     rows = build_rows(chosen, trials_by_job, plan)
     m = Measurement(
         plan=plan,

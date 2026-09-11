@@ -117,7 +117,11 @@ def single_gate_share(m: Measurement) -> float:
         if r.counts and r.kind.is_hardness_evidence and (r.slot.family, r.slot.build) in strongest
     ]
     if not trials:
-        return 0.0
+        # Zero strongest-member semantic failures -- both cohorts saturated, say.
+        # Returning 0.0 reads as "well spread" and passes the box with nothing
+        # behind it. Same fail-open bug as the no-decisions branch below; the
+        # sibling was fixed and this one was missed.
+        return None
     counts: Counter[str] = Counter()
     for r in trials:
         for d in set(r.decisions):
