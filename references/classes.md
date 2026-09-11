@@ -64,7 +64,7 @@ other as a pass.
 
 | Gate | State | What to do |
 |---|---|---|
-| Provenance against a non-1P-authored `instruction.md` | **not stale — a real finding since 2026-09-08** | Re-author the spec through a 1P model. The write log keeps the old flag even after the text is replaced |
+| Provenance against a non-1P-authored `instruction.md` | **not stale — a real finding for anything authored from 2026-09-09** | Re-author the spec through an approved model. The write log keeps the old flag even after the text is replaced. **Not retroactive**: an authoring event dated before the rule had nothing to violate, so a recorded platform exception on an older task is consistent with the timeline, not in tension with it |
 | Contamination | pipeline paused; nothing recent evaluated | Show the box **unchecked**, never green. Do not wait for it |
 
 A known-stale gate neither escalates nor clears. Say which gate left the box unchecked. Re-check

@@ -516,7 +516,7 @@ medium while a fair lever remains.
 ## 9. Authorship
 
 **The per-driver table governs** — it is newer than the 2026-08-17 policy post (the rule
-changed 2026-09-08) and it is keyed on the driving model, not the file:
+changed 2026-09-09) and it is keyed on the driving model, not the file:
 
 **Every column below is a *task* artifact.** None of this authorises writing tooling, libraries
 or product code — see the training-data-only condition beneath the table.
