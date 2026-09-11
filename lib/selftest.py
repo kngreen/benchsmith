@@ -616,6 +616,43 @@ with tempfile.TemporaryDirectory() as td:
     check("journal still parses after 6 concurrent writers", ok_parse, True)
     check("and is not empty", bool(parsed and parsed.get("task")), True)
 
+    # The six-writer test above does NOT discriminate: the race window on a small
+    # file is too narrow to hit, and a non-atomic write survives it. Force the
+    # window open -- a large journal, and a reader parsing in a tight loop while
+    # writers save. truncate-then-write is then observable as a parse failure.
+    big = Journal.open(repo, "race")
+    big.data["rounds"] = [{"n": i, "pad": "x" * 400} for i in range(400)]
+    big.save()
+    race_path = repo / ".benchsmith" / "race.json"
+    reader = (
+        "import json,sys,time\n"
+        "from pathlib import Path\n"
+        "p = Path(%r)\n"
+        "bad = 0\n"
+        "end = time.time() + 3.0\n"
+        "while time.time() < end:\n"
+        "    try:\n"
+        "        json.loads(p.read_text())\n"
+        "    except Exception:\n"
+        "        bad += 1\n"
+        "sys.exit(1 if bad else 0)\n"
+    ) % str(race_path)
+    rd = _sp.Popen([_sys.executable, "-c", reader])
+    wr_src = (
+        "import sys, time; sys.path.insert(0, %r)\n"
+        "from pathlib import Path\n"
+        "from benchsmith.journal import Journal\n"
+        "end = time.time() + 2.5\n"
+        "while time.time() < end:\n"
+        "    j = Journal.open(Path(%r), 'race')\n"
+        "    j.data['rounds'] = [{'n': i, 'pad': 'y' * 400} for i in range(400)]\n"
+        "    j.save()\n"
+    ) % (str(Path("lib").resolve()), str(repo))
+    ws = [_sp.Popen([_sys.executable, "-c", wr_src]) for _ in range(3)]
+    for w in ws: w.wait()
+    rd.wait()
+    check("a concurrent reader never sees a torn journal", rd.returncode, 0)
+
     # Durable waves: a restarted worker must see the wave it already spent.
     k = Journal.open(repo, "waves")
     check("no prior wave initially", k.prior_wave("shaX"), None)
