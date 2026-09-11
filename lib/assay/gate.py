@@ -10,9 +10,12 @@ rule the loop can break by forgetting is not a gate.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import tomllib
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -299,6 +302,110 @@ def run(
     h = surface_hashes(task_dir)
     report.add("graded-hash", PASS, f"{h['gradedHash']} ({h['gradedFiles']} files)", blocking=False)
     return report
+
+
+# --- receipts ---------------------------------------------------------------
+#
+# A gate that passed is only evidence if it can be shown to have passed on *this*
+# tree. Prefer a receipt the repository's own canonical hook emits; when the repo
+# publishes no such contract, write this native fallback rather than inventing a
+# schema the repo does not have.
+
+
+def _git(repo_root: Path, *args: str) -> str:
+    r = subprocess.run(
+        ["git", "-C", str(repo_root), *args], capture_output=True, text=True, check=True
+    )
+    return r.stdout.strip()
+
+
+def receipt_path(repo_root: Path, task_name: str) -> Path:
+    """Receipts live OUTSIDE the worktree.
+
+    Written into the repo they dirty the tree, and a dirty tree invalidates the
+    very receipt just written -- the check would fail on its own side effect.
+    Keyed by repo path so two checkouts of the same repo cannot share one.
+    """
+    key = hashlib.sha256(str(Path(repo_root).resolve()).encode()).hexdigest()[:12]
+    base = Path(os.environ.get("ASSAY_RECEIPT_DIR", Path.home() / ".cache" / "assay" / "receipts"))
+    return base / key / f"{task_name}.receipt.json"
+
+
+def canonical_receipt(repo_root: Path) -> Path | None:
+    """A receipt the repository itself declares, if it has one.
+
+    Never fabricate one: a repo with no receipt contract gets the native fallback
+    below, and the difference is recorded rather than smoothed over.
+    """
+    for candidate in (".gate/receipt.json", ".ci/gate-receipt.json", "tools/gate/receipt.json"):
+        p = Path(repo_root) / candidate
+        if p.is_file():
+            return p
+    return None
+
+
+def write_receipt(repo_root: Path, task_name: str, report: Report) -> dict:
+    """Bind a passing gate run to an exact clean HEAD."""
+    repo_root = Path(repo_root)
+    try:
+        head = _git(repo_root, "rev-parse", "HEAD")
+        tree = _git(repo_root, "rev-parse", "HEAD^{tree}")
+        dirty = bool(_git(repo_root, "status", "--porcelain"))
+    except (subprocess.CalledProcessError, OSError) as e:
+        return {"state": "not_run", "reason": f"git unavailable: {e}"}
+
+    # A dirty tree cannot be bound to a receipt: the thing that passed is not the
+    # thing that would be pushed. Decline to write rather than emit a receipt that
+    # records its own invalidity -- a misleading artifact is worse than none.
+    if dirty:
+        return {"state": "not_written", "reason": "worktree is dirty; commit before gating"}
+    if not report.ok:
+        return {"state": "not_written", "reason": "gate did not pass"}
+
+    body = {
+        "task": task_name,
+        "head": head,
+        "tree": tree,
+        "clean": True,
+        "ok": True,
+        "checks": {c.name: c.state for c in report.checks},
+        "notRun": [c.name for c in report.checks if c.state == NOT_RUN],
+        "source": "canonical" if canonical_receipt(repo_root) else "assay-native-fallback",
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    body["digest"] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
+
+    out = receipt_path(repo_root, task_name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(body, indent=2) + "\n")
+    return body
+
+
+def verify_receipt(repo_root: Path, task_name: str) -> tuple[bool, str]:
+    """A receipt is only valid for the exact clean HEAD it was written against.
+
+    Reused, stale or dirty-tree evidence is not a pass. Nothing may supply
+    receipt content except a fresh gate run -- never an environment variable,
+    never a copy.
+    """
+    repo_root = Path(repo_root)
+    p = receipt_path(repo_root, task_name)
+    if not p.is_file():
+        return (False, "no receipt; run the gate on this exact tree")
+    try:
+        body = json.loads(p.read_text())
+        head = _git(repo_root, "rev-parse", "HEAD")
+        dirty = bool(_git(repo_root, "status", "--porcelain"))
+    except (OSError, json.JSONDecodeError, subprocess.CalledProcessError) as e:
+        return (False, f"unreadable receipt or git failure: {e}")
+
+    if not body.get("ok"):
+        return (False, "receipt records a failing gate")
+    if body.get("head") != head:
+        return (False, f"receipt is for {str(body.get('head'))[:8]}, HEAD is {head[:8]}")
+    if dirty:
+        return (False, "worktree is dirty; the receipt describes a tree that is no longer here")
+    return (True, f"{body['source']} receipt {body['digest']} for {head[:8]}")
 
 
 # --- hook installation ------------------------------------------------------

@@ -111,6 +111,10 @@ def cmd_record(args) -> int:
 
 def cmd_gate(args) -> int:
     repo = Path(args.repo).resolve()
+    if args.verify_receipt:
+        ok, why = gate_mod.verify_receipt(repo, args.task)
+        _out({"ok": ok, "reason": why})
+        return 0 if ok else 1
     report = gate_mod.run(
         repo_root=repo,
         task_dir=repo / args.task,
@@ -118,10 +122,13 @@ def cmd_gate(args) -> int:
         measured=args.measured,
         oracle_cmd=args.oracle.split() if args.oracle else None,
     )
+    receipt = gate_mod.write_receipt(repo, args.task, report) if report.ok else None
     if args.json:
-        _out(report.as_dict())
+        _out({**report.as_dict(), "receipt": receipt})
     else:
         print(report.render())
+        if receipt and receipt.get("digest"):
+            print(f"  receipt {receipt['digest']} ({receipt['source']}) for {receipt['head'][:8]}")
     return 0 if report.ok else 1
 
 
@@ -181,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--measured", default=None)
     s.add_argument("--oracle", default=os.environ.get("ASSAY_ORACLE", ""))
     s.add_argument("--json", action="store_true")
+    s.add_argument("--verify-receipt", action="store_true",
+                   help="check an existing receipt against the exact clean HEAD")
     s.set_defaults(fn=cmd_gate)
 
     s = common(sub.add_parser("hash", help="graded and visible surface hashes"))
