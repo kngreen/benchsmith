@@ -201,7 +201,8 @@ def cmd_dispatch(args) -> int:
     """Plan (default) or start one non-publishing worker."""
     try:
         p = dispatch_mod.plan(args.task, args.repo, backend=args.backend, harness=args.harness,
-                              skills=args.skills, mode=args.mode, target=args.target)
+                              skills=args.skills, mode=args.mode, target=args.target,
+                              bootstrap=args.bootstrap)
     except dispatch_mod.DispatchRefused as e:
         _out({"ok": False, "reason": str(e)})
         return 2
@@ -299,7 +300,11 @@ def main(argv: list[str] | None = None) -> int:
     s = common(sub.add_parser("dispatch", help="plan or start one non-publishing worker"))
     s.add_argument("--backend", default="agentcloud", choices=("agentcloud", "codex", "metacode"))
     s.add_argument("--harness", default=dispatch_mod.DEFAULT_HARNESS)
-    s.add_argument("--skills", default="benchsmith")
+    s.add_argument("--skills", default=None,
+                   help="Skillbook aliases; off by default -- benchsmith is not registered")
+    s.add_argument("--bootstrap", dest="bootstrap", action="store_true", default=None,
+                   help="force the clone preamble (default: on for agentcloud)")
+    s.add_argument("--no-bootstrap", dest="bootstrap", action="store_false")
     s.add_argument("--mode", default="harden", choices=("harden", "repair"))
     s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"))
     s.add_argument("--apply", action="store_true", help="actually start the worker")

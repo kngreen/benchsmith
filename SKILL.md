@@ -847,14 +847,22 @@ of them.**
 
 Three backends, and the choice is a capability question, not a preference:
 
-- `agentcloud` (default) — `meta agentcloud.session create --harness codex --skills benchsmith`.
-  Fleet-visible, pollable by session id, and the only backend a second person can watch.
+- `agentcloud` (default) — `meta agentcloud.session create --harness codex`. Fleet-visible,
+  pollable by session id, and the only backend a second person can watch.
 - `codex` — `codex exec`. Local, no session record, blocks until the worker finishes.
 - `metacode` — the 1P delegation hop **only**. Never a task worker.
 
 `--harness` accepts `codex` and `native`; it rejects `claude` and `metacode`. So the 1P hop cannot
 be an agentcloud session, and benchsmith refuses that combination when the plan is built rather
 than letting the API fail after a fan-out has already started.
+
+**`--skills` cannot deliver benchsmith, and is off by default.** SkillsService serves a skill's
+`SKILL.md` body only; nested files are withheld from remote nodes unless `--skill-materialization`
+is on, and it is off by default and not exposed on the session CLI. benchsmith is a package, so a
+body-only delivery produces a worker with the judgement and none of the commands. Remote workers
+therefore **clone benchsmith themselves** as the first step of their prompt. Passing an alias that
+resolves to nothing would be worse than passing none: the session starts, the skill is silently
+absent, and the worker improvises without a gate.
 
 ### Handoff
 

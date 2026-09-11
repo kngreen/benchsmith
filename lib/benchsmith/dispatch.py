@@ -30,6 +30,17 @@ DEFAULT_HARNESS = "codex"
 
 HANDOFF_LIMIT = 4096
 
+# Where a worker gets benchsmith from when it is not already on disk.
+BENCHSMITH_ORIGIN = "https://github.com/kngreen/benchsmith.git"
+
+# The lowercase proxy vars on a devserver point at a host that is frequently
+# dead; the uppercase ones work. Reaching GitHub needs the working pair, and
+# codimango's API needs .internalmeta.com excluded from proxying.
+PROXY_PREAMBLE = (
+    "export https_proxy=http://fwdproxy:8080 http_proxy=http://fwdproxy:8080\n"
+    'export no_proxy="$no_proxy,.internalmeta.com"'
+)
+
 # A worker returns this and nothing else. The cap is the point: a supervisor
 # holding N full transcripts is the context-exhaustion the fleet audit measured
 # at 550-724K input tokens per call, most of it spent waiting.
@@ -60,9 +71,35 @@ class Plan:
                 "argv": self.argv, "shell": self.shell, "notes": self.notes}
 
 
-def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "hard-preferred") -> str:
+def bootstrap_block(root: str = "~/.claude/skills/benchsmith") -> str:
+    """Put benchsmith on the worker's disk.
+
+    A remote worker cannot be handed benchsmith through `--skills`. SkillsService
+    serves the SKILL.md body only -- nested files are withheld from remote nodes
+    unless --skill-materialization is on, and it is off by default and not
+    exposed on the session CLI. benchsmith is a package, not prose, so a
+    body-only delivery yields a worker that has the judgement and none of the
+    commands. It has to arrive as files.
+    """
+    return (
+        "First, make benchsmith available:\n"
+        "```bash\n"
+        f"{PROXY_PREAMBLE}\n"
+        f"test -x {root}/bin/benchsmith || git clone {BENCHSMITH_ORIGIN} {root}\n"
+        f"{root}/bin/benchsmith preflight --json\n"
+        "```\n"
+        "If the clone fails, stop and report state=blocked. Do not improvise a "
+        "substitute for the gate: an ungated push is the failure this exists to "
+        "prevent.\n\n"
+    )
+
+
+def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "hard-preferred",
+                  bootstrap: bool = False) -> str:
     """The instruction a stage-3 worker gets. Deliberately narrow."""
     return (
+        (bootstrap_block() if bootstrap else "")
+        +
         f"Use the benchsmith skill on exactly one task: {task}, in {repo}.\n"
         f"Run `benchsmith preflight` first and honour what it says degrades.\n"
         f"BENCHSMITH_MODE={mode}. BENCHSMITH_TARGET={target}.\n"
@@ -79,10 +116,22 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
 
 
 def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DEFAULT_HARNESS,
-         skills: str = "benchsmith", mode: str = "harden", target: str = "hard-preferred") -> Plan:
-    """Build the exact command. Runs nothing, writes nothing."""
-    prompt = worker_prompt(task, repo, mode=mode, target=target)
+         skills: str | None = None, mode: str = "harden", target: str = "hard-preferred",
+         bootstrap: bool | None = None) -> Plan:
+    """Build the exact command. Runs nothing, writes nothing.
+
+    `skills` is off by default and stays that way until benchsmith is actually
+    registered with SkillsService. Passing an alias that resolves to nothing is
+    worse than passing none: the session starts, the skill is silently absent,
+    and the worker improvises.
+    """
+    if bootstrap is None:
+        # A local worker already has the files. A remote one does not.
+        bootstrap = backend == "agentcloud"
+    prompt = worker_prompt(task, repo, mode=mode, target=target, bootstrap=bootstrap)
     notes: list[str] = []
+    if bootstrap:
+        notes.append("worker clones benchsmith itself; --skills cannot deliver a package")
 
     if backend == "agentcloud":
         if harness not in AGENTCLOUD_HARNESSES:

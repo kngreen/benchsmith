@@ -1097,7 +1097,21 @@ _p = dsp.plan("t1", "/repo")
 check("default backend is agentcloud", _p.backend, "agentcloud")
 check("default harness is codex", "codex" in _p.argv, True)
 check("dispatch is non-publishing by default", _p.publishing, False)
-check("skills alias is passed", "--skills" in _p.argv and "benchsmith" in _p.argv, True)
+# An alias that resolves to nothing is worse than no alias: the session starts,
+# the skill is silently absent, and the worker improvises without a gate.
+check("no --skills alias by default", "--skills" not in _p.argv, True)
+check("an explicit alias is still passed",
+      "--skills" in dsp.plan("t1", "/r", skills="benchsmith").argv, True)
+check("agentcloud workers bootstrap themselves",
+      any("git clone" in a for a in _p.argv), True)
+check("bootstrap uses the working proxy pair",
+      any("fwdproxy:8080" in a for a in _p.argv), True)
+check("bootstrap failure is blocked, not improvised",
+      any("state=blocked" in a for a in _p.argv), True)
+check("local codex workers do not clone",
+      any("git clone" in a for a in dsp.plan("t1", "/r", backend="codex").argv), False)
+check("bootstrap is forceable for a local worker",
+      any("git clone" in a for a in dsp.plan("t1", "/r", backend="codex", bootstrap=True).argv), True)
 check("plan is shell-quotable", "benchsmith: t1" in _p.shell, True)
 check("task appears in the prompt, not just the title",
       any("t1" in a and "YOU MAY NOT PUSH" in a for a in _p.argv), True)
