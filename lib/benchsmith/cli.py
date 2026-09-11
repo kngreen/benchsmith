@@ -11,14 +11,17 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
 from . import gate as gate_mod
+from . import ideas as ideas_mod
 from . import preflight as preflight_mod
 from . import backoff as backoff_mod
 from . import config as config_mod
 from . import coverage
+from . import hooks as hooks_mod
 from . import dispatch as dispatch_mod
 from . import mutate as mutate_mod
 from . import passatk as passatk_mod
@@ -162,6 +165,7 @@ def cmd_gate(args) -> int:
         task_name=args.task,
         measured=args.measured,
         oracle_cmd=args.oracle.split() if args.oracle else None,
+        hook_specs=config_mod.load_hooks(repo),
         require=(gate_mod.PUSH_REQUIRED if args.require_push_set
                  else tuple(x for x in (args.require or "").split(",") if x)),
     )
@@ -207,6 +211,37 @@ def cmd_queue(args) -> int:
             note = i.skip or (f"claimed by {i.claimed_by}" if i.claimed_by else i.reason)
             print(f"{mark}{i.tier:>3} {i.tierName if hasattr(i,'tierName') else '':<0}{i.task:<52} {note}")
         print(f"\n  {len(ready)} dispatchable of {len(items)}; next {min(args.workers, len(ready))}")
+    return 0
+
+
+def cmd_ideas_init(args) -> int:
+    _out(ideas_mod.init_board(
+        Path(args.repo), name=args.name, owner=args.owner,
+        project=args.project, apply=args.apply,
+    ))
+    return 0
+
+
+def cmd_ideas_harvest(args) -> int:
+    _out(ideas_mod.harvest(
+        Path(args.repo), project=args.project, owner=args.owner,
+        limit=args.limit, max_cards=args.max_cards, idea_ids=args.idea_id,
+        include_unassessed=args.include_unassessed, apply=args.apply,
+    ))
+    return 0
+
+
+def cmd_ideas_mark(args) -> int:
+    _out(ideas_mod.mark(
+        Path(args.repo), args.gsd_task, args.verdict, evidence=args.evidence,
+        core_one=args.core_one, core_two=args.core_two,
+        project=args.project, apply=args.apply,
+    ))
+    return 0
+
+
+def cmd_ideas_references(args) -> int:
+    _out(ideas_mod.inspect_reference(args.task_id, binary=args.codimango))
     return 0
 
 
@@ -267,6 +302,35 @@ def cmd_config(args) -> int:
         if not cfg.configured:
             print()
             print(config_mod.HOWTO)
+    return 0
+
+
+def cmd_fmt(args) -> int:
+    """Apply the repo's formatters to staged files. Mutating; run before commit."""
+    repo = Path(args.repo).resolve()
+    res = hooks_mod.run_all(repo, config_mod.load_hooks(repo), fix=True, budget=args.budget)
+    # Re-stage what the formatters rewrote -- the repo hook's last step, and the
+    # reason it was worth having.
+    if res["ok"] and res["results"] and args.restage:
+        paths, _ = hooks_mod.staged(repo)
+        if paths:
+            subprocess.run(["git", "-C", str(repo), "add", "--"] + paths,
+                           capture_output=True, text=True)
+            res["restaged"] = len(paths)
+    _out(res)
+    return 0 if res["ok"] else 1
+
+
+def cmd_hooks(args) -> int:
+    """What the repo ships, what benchsmith would run, and how long it takes."""
+    repo = Path(args.repo).resolve()
+    specs = config_mod.load_hooks(repo)
+    payload = {"repo": hooks_mod.detect(repo),
+               "benchsmith": [{"name": s.get("name"), "globs": s.get("globs")} for s in specs]}
+    if args.time:
+        payload["check"] = hooks_mod.run_all(repo, specs, use_cache=False)
+        payload["checkCached"] = hooks_mod.run_all(repo, specs)
+    _out(payload)
     return 0
 
 
@@ -411,6 +475,47 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_queue)
 
+    s = sub.add_parser("ideas", help="manage a personal GSD board of human T-Bench seeds")
+    idea_sub = s.add_subparsers(dest="ideas_cmd", required=True)
+
+    i = idea_sub.add_parser("init", help="plan or create the standalone GSD board")
+    i.add_argument("--repo", default=".")
+    i.add_argument("--name", default=ideas_mod.DEFAULT_BOARD_NAME)
+    i.add_argument("--owner", default="", help="owner unixname (default: authenticated user)")
+    i.add_argument("--project", default="", help="connect an existing GSD project")
+    i.add_argument("--apply", action="store_true", help="create remote objects and save config")
+    i.set_defaults(fn=cmd_ideas_init)
+
+    i = idea_sub.add_parser("harvest", help="copy screen-ready human seeds from Idea Exchange")
+    i.add_argument("--repo", default=".")
+    i.add_argument("--project", default="", help="override the configured GSD project")
+    i.add_argument("--owner", default="", help="owner for created cards")
+    i.add_argument("--limit", type=int, default=25, help="bounded Idea Exchange read (1-100)")
+    i.add_argument("--max-cards", type=int, default=10)
+    i.add_argument("--idea-id", action="append", default=[],
+                   help="harvest this exact Idea ID; repeatable")
+    i.add_argument("--include-unassessed", action="store_true",
+                   help="include seeds without a MEDIUM/HIGH predicted novelty signal")
+    i.add_argument("--apply", action="store_true", help="create the planned GSD cards")
+    i.set_defaults(fn=cmd_ideas_harvest)
+
+    i = idea_sub.add_parser("mark", help="record a completed pre-build hardness screen")
+    i.add_argument("--repo", default=".")
+    i.add_argument("--project", default="", help="override the configured GSD project")
+    i.add_argument("--gsd-task", required=True)
+    i.add_argument("--verdict", required=True, choices=("GO", "DERISK", "KILL"))
+    i.add_argument("--evidence", required=True)
+    i.add_argument("--core-one", default="")
+    i.add_argument("--core-two", default="")
+    i.add_argument("--apply", action="store_true", help="update the GSD card")
+    i.set_defaults(fn=cmd_ideas_mark)
+
+    i = idea_sub.add_parser(
+        "references", help="fail-closed calibration precheck for Codimango examples")
+    i.add_argument("task_id", nargs="+")
+    i.add_argument("--codimango", default="/usr/local/bin/codimango")
+    i.set_defaults(fn=cmd_ideas_references)
+
     s = common(sub.add_parser("claim", help="take an exclusive lease on a task"))
     s.set_defaults(fn=cmd_claim)
 
@@ -434,6 +539,17 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--target", action="append", help="file to mutate; repeatable")
     s.add_argument("--test-cmd", default="", help="command that runs the suite")
     s.set_defaults(fn=cmd_mutate)
+
+    s = sub.add_parser("fmt", help="apply the repo's formatters to staged files")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--budget", type=int, default=hooks_mod.DEFAULT_BUDGET)
+    s.add_argument("--no-restage", dest="restage", action="store_false", default=True)
+    s.set_defaults(fn=cmd_fmt)
+
+    s = sub.add_parser("hooks", help="repo hooks vs benchsmith's, and their cost")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--time", action="store_true", help="measure a real run")
+    s.set_defaults(fn=cmd_hooks)
 
     s = sub.add_parser("config", help="show the resolved configuration")
     s.add_argument("--repo", default=".")

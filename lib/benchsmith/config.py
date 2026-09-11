@@ -20,13 +20,25 @@ from pathlib import Path
 USER_CONFIG = Path.home() / ".config" / "benchsmith" / "config.json"
 REPO_CONFIG = ".benchsmith/config.json"
 
-# GSD section names -> queue kind. These are the fleet blueprint's column names;
-# a board that spells them differently supplies its own map.
+# GSD section names -> queue kind, verified against project 1722838652333221.
+# `skip` means the column exists and is deliberately not work: queueing an
+# archived or accepted card is the same defect as queueing an oncall ticket.
+SKIP = "skip"
 DEFAULT_SECTIONS = {
     "Task needs review": "gsd_review",
     "Task is ready to scaffold": "gsd_scaffold",
     "Task ideas (auto-generated)": "idea",
+    "Task in progress": SKIP,          # someone already has it
+    "Task accepted": SKIP,             # done
+    "Archived (duplicated, poor task idea, etc.)": SKIP,
+    "(No Section)": SKIP,              # not triaged onto a column yet
 }
+
+
+@dataclass
+class Config:
+    gsd: "GsdConfig"
+    hooks: list = field(default_factory=list)
 
 
 @dataclass
@@ -70,6 +82,21 @@ def load(repo_root: Path | None = None, *, project_id: str = "", assignee: str =
     cfg.assignee = (assignee or os.environ.get("BENCHSMITH_GSD_ASSIGNEE", "")
                     or cfg.assignee or os.environ.get("USER", ""))
     return cfg
+
+
+def load_hooks(repo_root: Path | None = None) -> list:
+    """Hook specs, or the built-in default that mirrors the repos' pre-commit.
+
+    An explicit empty list in config means "no hooks" and is honoured; a missing
+    key means "use the default". Conflating them would make opting out
+    impossible.
+    """
+    from .hooks import DEFAULT_HOOKS
+
+    for layer in ([_read(Path(repo_root) / REPO_CONFIG)] if repo_root else []) + [_read(USER_CONFIG)]:
+        if "hooks" in layer and isinstance(layer["hooks"], list):
+            return layer["hooks"]
+    return list(DEFAULT_HOOKS)
 
 
 HOWTO = """No GSD board is configured, so no board cards are queued.

@@ -115,6 +115,25 @@ def _tokens(text: str) -> set[str]:
     return {w for w in _SLUG.sub(" ", (text or "").lower()).split() if len(w) > 3}
 
 
+def check_assignee_scope(rows: list[dict], assignee: str) -> list[str]:
+    """Did the server-side assignee filter actually take?
+
+    `--assignee=kngreen` filters correctly, but the rows come back carrying a
+    DISPLAY name ("Kristin Green"). Comparing that to a unixname is a category
+    error, not a check -- it would reject every row. What can be checked is
+    whether the filter narrowed to one person: if several assignees come back
+    from a filtered query, the filter was ignored and the scope is not what was
+    asked for.
+    """
+    if not assignee:
+        return []
+    who = {str(r.get("assignee") or r.get("owner") or "") for r in rows if r.get("assignee") or r.get("owner")}
+    if len(who) > 1:
+        return [f"--assignee={assignee} returned {len(who)} distinct assignees "
+                f"({', '.join(sorted(who)[:4])}); the filter did not take — treat this scope as wrong"]
+    return []
+
+
 def normalise_gsd(rows: list[dict], columns: dict[str, str] | None = None,
                   known_tasks: list[str] | None = None,
                   assignee: str = "") -> tuple[list[dict], list[str]]:
@@ -126,31 +145,31 @@ def normalise_gsd(rows: list[dict], columns: dict[str, str] | None = None,
     merely suspect is a duplicate loses real work silently, while keeping a
     flagged one costs an idea-tier slot -- the cheapest slot there is.
     """
-    from .config import DEFAULT_SECTIONS
+    from .config import DEFAULT_SECTIONS, SKIP
 
     columns = columns or DEFAULT_SECTIONS
     lowered = {k.lower(): v for k, v in columns.items()}
     known = {t.lower(): _tokens(t) for t in (known_tasks or [])}
-    out, notes = [], []
+    out, notes = [], check_assignee_scope(rows, assignee)
     for r in rows:
         title = str(r.get("title") or "")
         number = str(r.get("number") or r.get("id") or "")
-        who = str(r.get("assignee") or r.get("owner") or "")
-        if assignee and who and who != assignee:
-            # The server filter should have handled this; verifying it anyway is
-            # the difference between trusting a flag and checking a field.
-            notes.append(f"{number}: assigned to {who}, not {assignee}; not queued")
-            continue
-        section = str(r.get("section") or "").strip().lower()
+        section_raw = str(r.get("section") or "").strip()
+        section = section_raw.lower()
         kind = lowered.get(section)
+        if kind == SKIP:
+            continue  # the column exists and is deliberately not work
         if kind is None:
-            # An unmapped section is an idea: lowest priority, so a mis-mapping
-            # costs the least it can. Name it, so the map can be corrected.
+            # Unmapped: queued at the cheapest tier but NOT dispatchable, and
+            # named so the map can be corrected. Auto-working an unknown column
+            # is how an "Archived" card becomes an idea to go build.
             kind = "idea"
-            if section:
-                notes.append(f"section {r.get('section')!r} is not in the section map; "
-                             "queued as an idea")
+            unmapped = section_raw or "(none)"
+            notes.append(f"section {unmapped!r} is not in the section map; "
+                         "queued as an idea but held for confirmation")
         item = {"name": number or title[:60], "title": title, "kind": kind}
+        if lowered.get(section) is None:
+            item["unmappedSection"] = section_raw or "(none)"
         tok = _tokens(title)
         for name, ntok in known.items():
             if name in title.lower() or (tok and ntok and len(tok & ntok) >= 3):

@@ -1763,13 +1763,40 @@ check("ownership can be waived explicitly",
 check("a row with no ownership field is kept",
       len(src.normalise_codimango([{"name": "x", "status": "draft"}])[0]), 1)
 
-# GSD rows are assignee-filtered server-side; verifying the field too is the
-# difference between trusting a flag and checking an answer.
-_mixed = [{"number": "T1", "title": "a", "section": "Task ideas", "assignee": "kngreen"},
-          {"number": "T2", "title": "b", "section": "Task ideas", "assignee": "someone"}]
-_ga, _gan = src.normalise_gsd(_mixed, assignee="kngreen")
-check("a card assigned to someone else is not queued", [i["name"] for i in _ga], ["T1"])
-check("...and says who has it", any("assigned to someone" in n for n in _gan), True)
+# `--assignee=kngreen` filters correctly server-side, but rows come back with a
+# DISPLAY name ("Kristin Green"). Comparing that to a unixname is a category
+# error that would reject every real row -- verified against project
+# 1722838652333221, where all 30 of the caller's cards carry the display form.
+# What IS checkable is whether the filter narrowed to one person.
+_real = [{"number": "T1", "title": "a", "section": "Task ideas (auto-generated)",
+          "assignee": "Kristin Green"}] * 3
+check("a display-name assignee does not reject the caller's own cards",
+      len(src.normalise_gsd(_real, assignee="kngreen")[0]), 3)
+_leaky = [{"number": "T1", "title": "a", "section": "Task ideas (auto-generated)", "assignee": "Kristin Green"},
+          {"number": "T2", "title": "b", "section": "Task ideas (auto-generated)", "assignee": "Someone Else"}]
+check("several assignees from a filtered query means the filter did not take",
+      any("did not take" in n for n in src.normalise_gsd(_leaky, assignee="kngreen")[1]), True)
+check("no assignee configured means no scope claim",
+      src.check_assignee_scope(_leaky, ""), [])
+
+# Verified section names from the live board. `skip` columns are not work:
+# queueing an archived or accepted card is the 94-oncall-tickets defect again.
+_secs = [{"number": f"T{i}", "title": "x", "section": s} for i, s in enumerate(
+    ["Task needs review", "Task is ready to scaffold", "Task ideas (auto-generated)",
+     "Task in progress", "Task accepted", "Archived (duplicated, poor task idea, etc.)",
+     "(No Section)"])]
+_sk, _skn = src.normalise_gsd(_secs)
+check("only the three work columns are queued", [i["kind"] for i in _sk],
+      ["gsd_review", "gsd_scaffold", "idea"])
+check("archived and accepted are not queued as ideas", len(_sk), 3)
+
+# An unmapped column is queued at the cheapest tier but held: auto-working an
+# unknown column is how an "Archived" card becomes something to go build.
+_un, _unn = src.normalise_gsd([{"number": "T1", "title": "x", "section": "Brand New Column"}])
+check("an unmapped section is held, not worked", _un[0].get("unmappedSection"), "Brand New Column")
+check("...and named", any("Brand New Column" in n for n in _unn), True)
+check("...and is not dispatchable",
+      build_queue([], ideas=[dict(_un[0], name="T1")])[0].dispatchable, False)
 
 # --- configuration ---
 from benchsmith import config as cfgmod  # noqa: E402
@@ -1799,6 +1826,125 @@ if _prev is None:
     del os.environ["BENCHSMITH_GSD_PROJECT"]
 else:
     os.environ["BENCHSMITH_GSD_PROJECT"] = _prev
+
+
+# --- repo pre-commit hooks, absorbed --------------------------------------
+
+from benchsmith import hooks as hk  # noqa: E402
+
+# fnmatch conflates `*` and `**`; these paths are exactly where that bites.
+check("** spans directories", bool(hk.glob_to_re("web/src/**/*.ts").match("web/src/a/b/c.ts")), True)
+check("** also matches zero directories",
+      bool(hk.glob_to_re("web/src/**/*.ts").match("web/src/c.ts")), True)
+check("* does not span directories",
+      bool(hk.glob_to_re("web/src/*.ts").match("web/src/a/b.ts")), False)
+check("a non-matching extension is not selected",
+      hk.matching(["web/src/a.py"], ["web/src/**/*.ts"]), [])
+check("the task tree does not match a web glob",
+      hk.matching(["mytask/tests/t.py", "mytask/instruction.md"], ["web/src/**/*.ts"]), [])
+
+_hr = Path(tempfile.mkdtemp()) / "hookrepo"
+(_hr / "web" / "src").mkdir(parents=True)
+
+
+def _hgit(*a):
+    return subprocess.run(["git", "-C", str(_hr), *a], capture_output=True, text=True)
+
+
+_hgit("init", "-q", "-b", "main")
+_hgit("config", "user.email", "t@t"); _hgit("config", "user.name", "t")
+(_hr / "web" / "src" / "a.ts").write_text("const x = 1\n")
+(_hr / "mytask").mkdir()
+(_hr / "mytask" / "instruction.md").write_text("do it\n")
+
+_calls = []
+
+
+def _spy(ok=True):
+    def run(argv, cwd):
+        _calls.append(list(argv))
+
+        class R:
+            returncode = 0 if ok else 1
+            stdout = "" if ok else "1 file needs formatting"
+            stderr = ""
+        return R()
+    return run
+
+
+_SPEC = [{"name": "prettier", "globs": ["web/src/**/*.ts"], "cwd": "web", "strip": "web/",
+          "check": ["fake-prettier", "--check"], "fix": ["fake-prettier", "--write"]}]
+
+# The fast path is the whole performance story: a round that touches only the
+# task tree must not start a single subprocess.
+_calls.clear()
+_fast = hk.run_all(_hr, _SPEC, paths=["mytask/instruction.md", "mytask/tests/t.py"], runner=_spy())
+check("a task-only change starts no subprocess", _calls, [])
+check("...and is reported as skipped, not passed", _fast["state"], hk.SKIPPED)
+check("...but does not block", _fast["ok"], True)
+
+_calls.clear()
+_hit = hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], use_cache=False, runner=_spy())
+check("a matching change runs the hook", len(_calls), 1)
+check("...with the path prefix stripped for the tool's cwd", _calls[0][-1], "src/a.ts")
+check("...and passes", _hit["state"], hk.PASS)
+
+_calls.clear()
+_bad = hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], use_cache=False, runner=_spy(ok=False))
+check("a failing hook fails the gate", _bad["state"], hk.FAIL)
+check("...and reports the tool output", "needs formatting" in _bad["reason"], True)
+
+# Cache: identical bytes must not pay for a second cold start.
+_calls.clear()
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy())
+_first = len(_calls)
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy())
+check("an unchanged tree is a cache hit", len(_calls), _first)
+(_hr / "web" / "src" / "a.ts").write_text("const x = 2\n")
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], runner=_spy())
+check("changed bytes invalidate the cache", len(_calls), _first + 1)
+
+# A fix must never be served from cache: it is expected to mutate, and skipping
+# it would leave files unwritten while reporting success.
+_calls.clear()
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], fix=True, runner=_spy())
+hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], fix=True, runner=_spy())
+check("a fix always runs", len(_calls), 2)
+
+
+def _boom(argv, cwd):
+    raise OSError("npx: command not found")
+
+
+# "node is not installed" and "the code is formatted" are different findings.
+check("a missing toolchain is NOT_RUN, not a pass",
+      hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], use_cache=False, runner=_boom)["state"],
+      hk.NOT_RUN)
+
+
+def _hang(argv, cwd):
+    raise subprocess.TimeoutExpired(argv, 1)
+
+
+check("a hanging formatter is NOT_RUN, not a hang",
+      hk.run_all(_hr, _SPEC, paths=["web/src/a.ts"], use_cache=False, runner=_hang)["state"],
+      hk.NOT_RUN)
+
+# A hook file is not a hook.
+_d = hk.detect(_hr)
+check("an unwired .githooks is reported inert", _d["active"], [])
+check("...in so many words", "inert" in _d["verdict"], True)
+(_hr / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+(_hr / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+check("a hook git would run is reported active", hk.detect(_hr)["active"], [".git/hooks/pre-commit"])
+
+# An explicit empty list means "no hooks"; a missing key means "use the default".
+_hc = Path(tempfile.mkdtemp())
+(_hc / ".benchsmith").mkdir()
+(_hc / ".benchsmith" / "config.json").write_text(json.dumps({"hooks": []}))
+check("an explicit empty hooks list is honoured", cfgmod.load_hooks(_hc), [])
+check("a missing hooks key uses the default",
+      len(cfgmod.load_hooks(Path(tempfile.mkdtemp()))) > 0, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

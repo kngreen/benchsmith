@@ -29,6 +29,7 @@ against the same task at once.
 | **Validate / repair an existing task** | STEP 1 → §7 → smallest correct fix | §5 + §11 |
 | **Repair review findings** | the review itself, never the balance row → §7 | both reviews green + §11 |
 | **Generate ideas** | not this skill — `swebench-idea-triage`, then `task-hardness-screen` | a GO'd idea |
+| **Harvest human T-Bench seeds** | `benchsmith ideas init` → `ideas harvest` → `task-hardness-screen` → `ideas mark` | a GO/DERISK/KILL GSD card |
 | **Run the fleet** | §12 coordinator | the queue drains or every remaining item needs a human |
 | **Local iOS / macOS-VM task** | §14 → §5 bar | §5 + §11 |
 
@@ -825,6 +826,33 @@ evidence pack, which is a real and respectable ending.
 
 ## 12. Coordinator — one supervisor, many workers
 
+### Personal GSD idea foundry
+
+The coordinator may source T-Bench work from a standalone personal GSD board. This is an intake
+and state-tracking surface, not an idea generator: every seed must already exist as a
+human-originated Idea Exchange record.
+
+```bash
+benchsmith ideas init --repo .                         # plan only
+benchsmith ideas init --repo . --apply                 # create/connect board + search sections
+benchsmith ideas harvest --repo .                      # preview screen-ready seeds
+benchsmith ideas harvest --repo . --idea-id 252 --apply
+benchsmith ideas mark --gsd-task T123 --verdict GO \
+  --core-one "..." --core-two "..." --evidence "..." --apply
+benchsmith queue --repo . --fetch                      # includes the configured board
+```
+
+`ideas harvest` preserves the Idea ID and human creator, refuses incomplete or non-T-Bench
+records, deduplicates by `external_identifier`, and never claims an idea. It marks imported cards
+`Needs hardness screen`; a `GO` requires two named independent hard cores. Use
+`claim-task-idea` for the later claim/scaffold transaction so Direction credit remains attached to
+the original creator.
+
+`benchsmith ideas references <task-id>...` is a fail-closed precheck for examples. It can select a
+task for deeper pattern mining, but always reports `hardCalibrated: false`: task summaries cannot
+prove semantic failure attribution, the frozen strongest set, or the independent critic. Only the
+full §5 + §11 loop can promote a built task to the board's `Hard calibrated` section.
+
 Everything above is one task. This section is the other axis: many tasks, limited attention. Use
 it when the ask is "work the backlog", not "loop this task".
 
@@ -1081,3 +1109,70 @@ saturation block as the hosted tracks.
 **Not yet exercised against live iOS infrastructure.** The normalisation and the blocks are
 fixture-tested; the `run.sh` integration is not. Treat a first real run as a probe of this code,
 not only of the task.
+
+## 15. The repo's pre-commit hooks, absorbed
+
+The AAI Labs task repos ship `.githooks/pre-commit`: prettier and eslint over staged files under a
+path prefix, then re-stage. Benchsmith reproduces it, so the repo copy can be deleted and every
+worker gets the same enforcement whether or not its clone wired anything up.
+
+```bash
+benchsmith hooks --repo . --time      # what the repo ships, what we run, what it costs
+benchsmith fmt --repo .               # apply formatters to staged files, then re-stage
+benchsmith gate --repo . --task <t>   # includes a check-only `formatting` step
+```
+
+### Check and fix are different commands
+
+`benchsmith fmt` writes. The gate only checks. **The gate may not rewrite files** — its surface
+hashes and its receipt are computed against the tree as read, so a formatter running inside it
+would attest to a tree that no longer exists.
+
+### Why this does not slow the loop down
+
+| Situation | Cost |
+|---|---|
+| Staged files match no hook glob | **~18 ms, zero subprocesses** — measured |
+| Match, unchanged bytes since last pass | cache hit, no `npx` start |
+| Match, changed | hooks run **concurrently**; wall clock is the slowest, not the sum |
+| A formatter hangs | `NOT_RUN` at the budget, never a hung loop |
+
+The fast path is the one that matters: a benchsmith round touches `tests/`, `instruction.md` or
+`solution/`, none of which match a `web/src` glob, so the whole step is one `git diff --cached` and
+no process spawns. The cache is keyed on the tool's argv plus the **exact bytes** of the files it
+saw, so re-gating an unchanged tree never pays a second cold start — and changed bytes always
+invalidate it.
+
+A missing toolchain is **`NOT_RUN`, not a pass**: "node is not installed" and "the code is
+formatted" are different findings. `formatting` is deliberately **not** in the push-required set,
+so a devserver without node is not locked out of pushing.
+
+### Before you delete the repo copy
+
+```bash
+benchsmith hooks --repo .
+```
+
+**A hook file is not a hook.** `.githooks/pre-commit` only runs if it sits in the directory git
+actually uses. In every AAI Labs clone checked here, `core.hooksPath` was unset and `.git/hooks/`
+was empty — so the shipped hook had **never run**, and one copy was broken anyway (`$STAGED` was
+never assigned, so it invoked prettier with no files). `benchsmith hooks` reports `active` versus
+inert, which is what makes sunsetting a decision rather than a guess.
+
+### Configuring them
+
+Hooks live under `hooks` in the same config file as the board. The default mirrors the repos'
+prettier/eslint setup; an **explicit empty list** means "no hooks", while a **missing key** means
+"use the default" — conflating those would make opting out impossible.
+
+```json
+{"hooks": [
+  {"name": "prettier", "globs": ["web/src/**/*.ts", "web/src/**/*.tsx", "web/src/**/*.css"],
+   "cwd": "web", "strip": "web/",
+   "check": ["npx", "prettier", "--check", "--log-level", "warn"],
+   "fix": ["npx", "prettier", "--write", "--log-level", "warn"]}
+]}
+```
+
+`**/` spans directories and `*` does not — `fnmatch` conflates them, which is why the matcher is
+hand-written.

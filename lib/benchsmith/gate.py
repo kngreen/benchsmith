@@ -434,6 +434,25 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
         report.add("single-lever", PASS, f"one lever: {hit.pop()}")
 
 
+def check_formatting(repo_root: Path, report: Report, specs=None) -> None:
+    """The repos' pre-commit hook, as a check.
+
+    Check-only by design. The gate may not rewrite files: its surface hashes and
+    its receipt are computed against the tree as read, and a formatter running
+    inside it would attest to a tree that no longer exists. `benchsmith fmt`
+    does the writing, before the commit.
+    """
+    from . import hooks as hooks_mod
+
+    res = hooks_mod.run_all(Path(repo_root), specs)
+    state = {hooks_mod.PASS: PASS, hooks_mod.FAIL: FAIL,
+             hooks_mod.SKIPPED: PASS, hooks_mod.NOT_RUN: NOT_RUN}[res["state"]]
+    detail = res["reason"]
+    if res["results"]:
+        detail += f" ({res['seconds']}s)"
+    report.add("formatting", state, detail)
+
+
 def check_hygiene(task_dir: Path, report: Report) -> None:
     junk = [str(p.relative_to(task_dir)) for p in Path(task_dir).rglob("*") if p.suffix == ".pyc"]
     junk += [str(p.relative_to(task_dir)) for p in Path(task_dir).rglob("__pycache__")]
@@ -465,6 +484,7 @@ def run(
     measured: str | None = None,
     oracle_cmd: list[str] | None = None,
     require: tuple[str, ...] | None = None,
+    hook_specs: list | None = None,
 ) -> Report:
     report = Report()
     journal = Journal.open(Path(repo_root), task_name)
@@ -479,6 +499,7 @@ def run(
     check_budget(journal, report)
     check_scope(repo_root, task_name, report)
     check_single_lever(repo_root, task_name, journal.mode, report)
+    check_formatting(repo_root, report, hook_specs)
     check_hygiene(task_dir, report)
     check_oracle(oracle_cmd, report)
     h = surface_hashes(task_dir)

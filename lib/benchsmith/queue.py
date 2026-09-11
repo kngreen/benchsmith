@@ -147,6 +147,8 @@ def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
         name = str(idea.get("name") or idea.get("id") or "")
         if not name:
             continue
+        if str(idea.get("kind") or "idea") == "done":
+            continue
         if any(i.task == name for i in items) or name in journals:
             continue
         tier = GSD_TIERS.get(str(idea.get("kind") or "idea"), TIER_IDEA)
@@ -158,6 +160,9 @@ def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
         # guess -- and a wrong guess that deletes loses real work silently.
         if idea.get("duplicateOf"):
             item.skip = f"probably duplicates {idea['duplicateOf']}; confirm before dispatch"
+        elif idea.get("unmappedSection"):
+            item.skip = (f"section {idea['unmappedSection']!r} is not in the section map; "
+                         "confirm it is work before dispatch")
         items.append(item)
 
     # Stable and total: tier, then name. Never insertion order -- a coordinator

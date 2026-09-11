@@ -32,10 +32,23 @@ benchsmith read --task <name> --task-id <id>       # fresh, identity-checked
 benchsmith bar payload.json --target hard-only     # the difficulty verdict
 benchsmith gate --repo . --task <name>             # before every push
 benchsmith record --repo . --task <name> --sha <sha> --class in-band --fix "..."
+
+# Personal T-Bench idea board (all mutations require --apply)
+benchsmith ideas init --repo .
+benchsmith ideas init --repo . --apply
+benchsmith ideas harvest --repo . --limit 25
+benchsmith ideas harvest --repo . --idea-id 252 --apply
+benchsmith queue --repo . --fetch
 ```
 
 `benchsmith --help` lists everything. `BENCHSMITH_TARGET`, `BENCHSMITH_HARDENING_BUDGET`, `BENCHSMITH_TASK_ID`,
 `BENCHSMITH_SOURCE_REPO` and `BENCHSMITH_ORACLE` are read from the environment when the flags are omitted.
+
+The idea-board flow imports only human-originated T-Bench seeds from Idea Exchange. It does not
+generate task ideas, claim them, or call an unbuilt seed “hard.” GSD cards are deduplicated by
+`aai-idea:<id>` and remain in `Needs hardness screen` until the separate hardness screen records a
+GO, DERISK, or KILL decision. A Codimango summary can nominate a calibration reference for deeper
+audit, but only the full exact-head Benchsmith bar can establish `hard calibrated`.
 
 ## Design commitments
 
