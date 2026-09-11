@@ -237,11 +237,17 @@ the ordinary descriptive ones: language, task type, framework. A complete Labs l
 
 ```toml
 tags = ["swe-bench-pro", "SWEBench-External", "private_repos_1p", "aai-labs", "aai-labs-ollo",
-        "semi-synthetic", "assay-v1", "assay-v1"]
+        "semi-synthetic", "assay-v1"]
 ```
 
-**Only `aai-labs` is enforced.** the gate blocks a push missing `assay-v1` or `aai-labs` (via
-`assay gate`) and knows nothing about the rest.
+**All six are gate-enforced.** `assay gate` fails the push when any of `assay-v1`, `aai-labs`,
+`semi-synthetic` or `private_repos_1p` is absent, and separately when no `aai-labs-<project>`
+team tag is present — see `REQUIRED_TAGS` and `TEAM_TAG_PREFIX` in `lib/assay/gate.py`. The
+`long-horizon` scope tag is conditional and is not gated.
+
+**These gates apply to tasks assay builds or modifies.** They are not a review rubric: a task
+authored before assay existed, carrying an earlier recipe tag, is not a finding, and the tag set
+is never applied retroactively to someone else's task.
 
 **Gate the full set before the first push, not at the terminal check.** A task that reaches its
 first cloud round untagged is already mis-attributed, and the §5 checklist catches it far too
@@ -512,7 +518,10 @@ medium while a fair lever remains.
 **The per-driver table governs** — it is newer than the 2026-08-17 policy post (the rule
 changed 2026-09-08) and it is keyed on the driving model, not the file:
 
-| Author | `instruction.md` | `tests/`, rubrics | harness, config, oracle |
+**Every column below is a *task* artifact.** None of this authorises writing tooling, libraries
+or product code — see the training-data-only condition beneath the table.
+
+| Author | task `instruction.md` | task `tests/`, rubrics | task harness, config, oracle |
 |---|---|---|---|
 | Muse Spark 1.3 / Avocado (1P) | yes | yes | yes |
 | Kimi K3, GLM 5.3-Flash, Qwen 3.8 27B | yes | yes | yes |
