@@ -421,6 +421,32 @@ wrong thing.
 **The repository is read-only and the review is never submitted.** A worker drafts every field;
 submitting stays a human decision, exactly as publishing does.
 
+### Gathering the drafts back
+
+```bash
+benchsmith review-status --repo REPO
+```
+
+Isolation is what keeps one task's findings out of another's review, and the cost is drafts
+scattered across as many worktrees as there were reviewers. This reads them back into one list:
+
+```
+Reviews drafted — 4, of which 3 are complete and ready for you to submit.
+Nothing has been submitted.
+
+✓ ollo-generation-request-validation   **Request changes**  (612w)
+✓ ollo-parent-revision-round-trip      **Accept**           (488w)
+· cloud-infra-ollo-health-gate         **no decision**      (240w)  — missing: Human Checks, TBR…
+```
+
+A draft counts as **submittable** only when all eight canonical sections are present, a decision is
+recorded, and it is under the 700-word cap. A `Decision` field still holding the template's
+`Accept / Request changes / Reject` menu is **not** a decision — the reviewer left it untouched,
+and treating it as one would put an unmade decision in front of an author.
+
+**This is where your green light belongs.** Nothing above it needs you; nothing below it happens
+without you.
+
 ## 0a. Repairing a revision request
 
 **Read what was asked before changing anything.**

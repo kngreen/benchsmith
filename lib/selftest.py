@@ -4121,5 +4121,60 @@ check("...and the worktree is persisted in the run file",
       Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text(), True)
 
 
+# --- gathering the drafts back ------------------------------------------------
+#
+# Workers draft reviews in isolation, which keeps one task's findings out of
+# another's context. The cost is drafts scattered across as many worktrees as
+# there were reviewers, and "eleven reviews were written somewhere" is not
+# something a person can act on.
+
+from benchsmith import reviewreport as rrp  # noqa: E402
+
+_full = "\n".join(f"### {s}" for s in rrp.REQUIRED_SECTIONS)
+_ok_md = _full + "\n- **Decision:** Request changes\n- **Confidence:** 4\n"
+
+_d = rrp.parse("t", Path("/tmp/x.md"), _ok_md)
+check("a complete form is submittable", _d.submittable, True)
+check("...and its decision is read", _d.decision, "Request changes")
+check("...and its confidence", _d.confidence, "4")
+
+# The template ships the menu as the value; a reviewer who left it there has
+# not decided anything.
+_menu = rrp.parse("t", Path("/tmp/x.md"),
+                  "### Decision\n- **Decision:** Accept / Request changes / Reject\n")
+check("the template's menu is not a decision", _menu.decision, "")
+check("...so it is not submittable", _menu.submittable, False)
+
+_short = rrp.parse("t", Path("/tmp/x.md"), "### Decision\n- **Decision:** Accept\n")
+check("a form missing sections is not submittable", _short.submittable, False)
+check("...and the missing ones are named", len(_short.missing), 7)
+
+_long = rrp.parse("t", Path("/tmp/x.md"), _ok_md + ("word " * rrp.WORD_CAP))
+check("a form over the word cap is not submittable", _long.submittable, False)
+
+check("the Agentic section is conditional, not required",
+      rrp.CONDITIONAL in rrp.REQUIRED_SECTIONS, False)
+check("...but is reported when present",
+      rrp.parse("t", Path("/tmp/x.md"), _ok_md + f"\n### {rrp.CONDITIONAL}\n").has_agentic, True)
+
+# The draft lives in the worker's worktree, not the canonical checkout.
+_rrroot = Path(tempfile.mkdtemp())
+_wtd = _rrroot / "wt"
+(_wtd / ".benchsmith" / "handoff").mkdir(parents=True)
+(_wtd / ".benchsmith" / "handoff" / "review-mytask.md").write_text(_ok_md)
+check("the draft is found in the worktree",
+      rrp.find("mytask", str(_wtd), str(_rrroot)) is not None, True)
+check("...and its absence is reported, not guessed",
+      rrp.find("nope", str(_wtd))is None, True)
+
+_res = rrp.collect([{"task": "mytask", "worktree": str(_wtd), "repo": str(_rrroot)},
+                    {"task": "missing", "worktree": str(_rrroot)}])
+check("collect reports one drafted", _res["drafted"], 1)
+check("...one submittable", _res["submittable"], 1)
+check("...and names the one with no draft", _res["absent"][0]["task"], "missing")
+check("the rendering says nothing was submitted",
+      "Nothing has been submitted" in rrp.render(_res), True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
