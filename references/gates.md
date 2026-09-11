@@ -126,6 +126,23 @@ Checks a task format does not have are not applicable — record that, never fab
 Embedding dedup is informational unless project policy makes it blocking; **contamination is
 not** — `NOT EVALUATED` leaves the box unchecked rather than green.
 
+## Per-test names are not in `trial list`
+
+`trial list`'s `ctrfResults` is a **projection**: the `summary` counts are real, the
+per-test statuses are not. Observed live — `summary {tests: 11, passed: 10,
+failed: 1}` with not a single `FAILED` entry in `tests[]`.
+
+So a reader that trusts `tests[]` concludes nothing failed, on a trial that failed.
+`failing_tests()` returns `None` when the summary declares failures and none are
+named — unknowable, never empty. Real names come from the artifact:
+
+```
+codimango ... trials artifacts <TRIAL_ID> --key verifier/ctrf.json
+```
+
+which carries `{"results": {"summary": {...}, "tests": [{"name", "status"}]}}` with
+UPPERCASE `PASSED|FAILED|ERROR`.
+
 ## The review manifest
 
 A prose claim that "reviews passed" is not auditable and has been wrong. Emit one row per review

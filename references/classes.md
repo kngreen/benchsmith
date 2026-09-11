@@ -41,6 +41,22 @@ Numbers from another tree read as this one's and are worse than no numbers.
 with no rate is rewritten to `not-measured`, so it spends no hardening budget. Four consecutive
 rounds once spent four of five budget units this way and the task was still too easy at the end.
 
+## A cohort that always misses by one assertion is blocked, not beaten
+
+`benchsmith bar` reports `evidence.blocker`. When `uniformShape` is set and
+`nearMissShare` is 1.0, **every failing trial in the cohort died on the same small
+number of assertions** — classify `dominant-blocker`, not `too-easy` or `in-band`,
+and do not harden.
+
+Measured on a live task: five gpt trials, each `11 tests, 10 passed, 1 failed`,
+51–66 tool calls apiece, zero exceptions — while avocado passed 5/5 on the same
+graded surface. Binary reward turns 10-of-11 into 0, so the cohort reads 0/5 and
+looks like a capability wall. It is one assertion.
+
+The tell is available from ctrf **summaries** alone, so it survives the projection
+that hides per-test names. `avocado 5/5` beside `gpt 0/5` on one graded surface is
+never a difficulty gradient — audit that cohort before touching a lever.
+
 ## A uniform N-1 gate ratio is a single-gate signature
 
 A task whose per-step gate ratios are all the same `N-1` value reads as clean, well-spread

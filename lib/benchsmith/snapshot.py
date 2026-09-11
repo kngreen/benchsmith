@@ -283,6 +283,8 @@ def failing_tests(trial: dict) -> list[str] | None:
     """
     ctrf = trial.get("ctrfResults") or {}
     tests = ctrf.get("tests") or trial.get("tests")
+    summary = ctrf.get("summary") or {}
+    declared = summary.get("failed")
     if not tests:
         return None
     out = []
@@ -291,7 +293,48 @@ def failing_tests(trial: dict) -> list[str] | None:
         status = str(entry.get("status") or "").upper()
         if name and status in {"FAIL", "FAILED", "ERROR"}:
             out.append(str(name))
+    # `trial list`'s ctrfResults is a PROJECTION: the summary counts are real but
+    # every per-test status can come back "skipped". Observed live -- summary
+    # {tests:11, passed:10, failed:1} with not one FAILED entry in tests[].
+    # Returning [] there would publish "no test failed" as a fact, which is the
+    # empty-vs-unknown rule this module opens with, violated in its own code.
+    # The names live in the artifact: trial artifacts <id> --key verifier/ctrf.json.
+    if declared and not out:
+        return None
     return out
+
+
+def blocker_concentration(trials: list[dict]) -> dict:
+    """Do the failing trials all die on the same small number of assertions?
+
+    Computable from ctrf SUMMARIES alone, so it works even when the projection
+    hides per-test names. A cohort where every failure is `N-1 of N` is the
+    signature of one assertion gating the cohort -- not of a capability gap.
+    Observed live: five gpt trials, each 10 of 11, binary reward zero for all
+    five, while avocado passed 5/5 on the same graded surface.
+    """
+    shapes, near_miss, failing = [], 0, 0
+    for t in trials:
+        summary = ((t.get("ctrfResults") or {}).get("summary")) or {}
+        total, failed = summary.get("tests"), summary.get("failed")
+        if not total or not failed:
+            continue
+        failing += 1
+        shapes.append((int(failed), int(total)))
+        if int(failed) <= max(1, int(total) // 10):
+            near_miss += 1
+    if not failing:
+        return {"failingTrials": 0, "uniformShape": None, "nearMissShare": 0.0, "concentrated": False}
+    uniform = shapes[0] if len(set(shapes)) == 1 else None
+    share = near_miss / failing
+    return {
+        "failingTrials": failing,
+        "uniformShape": (f"{uniform[0]}/{uniform[1]} failed" if uniform else None),
+        "nearMissShare": round(share, 4),
+        # Every failing trial missing by a hair, all with the same shape, is a
+        # blocker signal rather than a difficulty signal.
+        "concentrated": bool(uniform) and share == 1.0,
+    }
 
 
 def graded_pass(trial: dict) -> bool:
@@ -484,6 +527,7 @@ def evidence(trials: list[dict]) -> dict:
             "topFailure": None,
             "topFailureSoleBlockerShare": 0.0,
             "concentrated": False,
+            "blocker": blocker_concentration(trials),
             "failureFrequency": {},
         }
 
@@ -503,6 +547,7 @@ def evidence(trials: list[dict]) -> dict:
     return {
         "evidenceComplete": True,
         "scored": scored,
+        "blocker": blocker_concentration(trials),
         "trialsFound": len(trials),
         "sharedFailures": sorted(shared),
         "discriminatorSet": sorted(union - shared),
