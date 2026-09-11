@@ -101,6 +101,10 @@ def load_hooks(repo_root: Path | None = None) -> list:
 
 HOWTO = """No GSD board is configured, so no board cards are queued.
 
+For a personal T-Bench idea board, preview or create the standard layout:
+    benchsmith ideas init --repo .
+    benchsmith ideas init --repo . --apply
+
 Find your project id:
     meta tasks.gsd.project list --owner-is-me --output=json
     meta tasks.gsd.project list --name-contains='<part of the name>' --output=json

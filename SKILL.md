@@ -1112,11 +1112,50 @@ saturation block as the hosted tracks.
 fixture-tested; the `run.sh` integration is not. Treat a first real run as a probe of this code,
 not only of the task.
 
-## 15. The repo's pre-commit hooks, absorbed
+## 15. The repos' hooks, absorbed
 
-The AAI Labs task repos ship `.githooks/pre-commit`: prettier and eslint over staged files under a
-path prefix, then re-stage. Benchsmith reproduces it, so the repo copy can be deleted and every
-worker gets the same enforcement whether or not its clone wired anything up.
+The task repos wire hooks with `core.hooksPath` — `scripts/hooks` in the swe-bench repos,
+`.githooks` in t-bench. Two different things live there, and only one is a formatter.
+
+### 15a. The diff-shaped checks (the ones that catch things)
+
+**Is this change worse than the last one?** Every other control here asks whether the current tree
+is bad. None asked that, which is why coverage shrinking, fixture-arm removal and assertion
+weakening were invisible to them.
+
+These compare the **staged index against HEAD**, which is cheaply available only at commit time.
+`check_test_ratchet` is *not* a substitute: it compares against the last round benchsmith
+**recorded**, so anything committed between rounds is invisible to it.
+
+| Check | Catches |
+|---|---|
+| `diff-ratchet` | a graded test deleted; a test removed with no recorded reason; assertion count falling with no test removed |
+| `diff-weakening` | `or True`, `\|\| true`, `pytest.skip`, `# noqa`; an assertion broadened with a **new** `or`; a widened numeric tolerance |
+
+Both are **push-required**, because a check that did not run is how these got through before.
+
+A removal is allowed when the *same commit* records why, in `.benchsmith/removals.jsonl`:
+
+```json
+{"test": "test_two", "reason": "duplicated by test_one"}
+```
+
+Only proofs **added or changed by the staged commit** count — a standing allowlist would let one
+old entry authorise every future removal of that name. A record with no `reason` proves nothing.
+
+Two judgements kept deliberately from the original: a graded file that **will not parse is a
+finding, not a skip** (a line-based check would happily "examine" it and report clean — the exact
+silent-inert shape these exist to catch), and **nothing examined is `NOT_RUN`**, reported and never
+printed as a pass.
+
+Cost: pure Python plus a couple of `git show` calls, scoped to graded files. Sub-millisecond when
+the staged diff has no graded Python in it.
+
+### 15b. The formatters
+
+The scratch and base-tree clones also carry a `.githooks/pre-commit` running prettier and eslint
+over `web/src`. Benchsmith reproduces it so the repo copy can be deleted and every worker gets the
+same enforcement whether or not its clone wired anything up.
 
 ```bash
 benchsmith hooks --repo . --time      # what the repo ships, what we run, what it costs
@@ -1155,11 +1194,15 @@ so a devserver without node is not locked out of pushing.
 benchsmith hooks --repo .
 ```
 
-**A hook file is not a hook.** `.githooks/pre-commit` only runs if it sits in the directory git
-actually uses. In every AAI Labs clone checked here, `core.hooksPath` was unset and `.git/hooks/`
-was empty — so the shipped hook had **never run**, and one copy was broken anyway (`$STAGED` was
-never assigned, so it invoked prettier with no files). `benchsmith hooks` reports `active` versus
-inert, which is what makes sunsetting a decision rather than a guess.
+**A hook file is not a hook** — but check which repo you are in before concluding anything. The
+live task repos **do** wire theirs: `core.hooksPath` is `scripts/hooks` (swe-bench) or `.githooks`
+(t-bench), and those hooks have been catching real defects. It is the *scratch, review and
+base-tree* clones where `core.hooksPath` is unset, `.git/hooks/` is empty, and the shipped
+`.githooks/pre-commit` is inert — one such copy is broken outright (`$STAGED` never assigned, so it
+invokes prettier with no files). `benchsmith hooks` reports `active` versus inert per repo, which
+is what makes sunsetting a decision rather than a guess.
+
+Do not delete a repo hook until the equivalent benchsmith check is green on the same commit.
 
 ### Configuring them
 

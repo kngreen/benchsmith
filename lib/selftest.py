@@ -1950,5 +1950,110 @@ check("a missing hooks key uses the default",
       len(cfgmod.load_hooks(Path(tempfile.mkdtemp()))) > 0, True)
 
 
+# --- diff-shaped checks: is this change worse than the last one? -------------
+#
+# Ported from the t-bench repo's pre-commit, which has been catching real
+# defects. Distinct from the journal ratchet: that compares against the last
+# round benchsmith RECORDED, so anything committed between rounds is invisible.
+
+from benchsmith import diffcheck as dc  # noqa: E402
+
+_dr = Path(tempfile.mkdtemp()) / "diffrepo"
+(_dr / "mytask" / "tests").mkdir(parents=True)
+
+
+def _dgit(*a):
+    return subprocess.run(["git", "-C", str(_dr), *a], capture_output=True, text=True)
+
+
+_dgit("init", "-q", "-b", "main")
+_dgit("config", "user.email", "t@t"); _dgit("config", "user.name", "t")
+_TF = _dr / "mytask" / "tests" / "test_a.py"
+_TF.write_text(
+    "def test_one():\n    assert 1 == 1\n    assert 2 == 2\n\n"
+    "def test_two():\n    assert 3 == 3\n")
+_dgit("add", "-A"); _dgit("commit", "-qm", "base")
+
+check("graded test files are recognised", bool(dc.GRADED.search("mytask/tests/test_a.py")), True)
+check("steps/ spelling is recognised", bool(dc.GRADED.search("t/steps/2/tests/test_a.py")), True)
+check("non-test python is not graded", bool(dc.GRADED.search("mytask/solution/fix.py")), False)
+
+# Deleting a test without saying why.
+_TF.write_text("def test_one():\n    assert 1 == 1\n    assert 2 == 2\n")
+_dgit("add", "-A")
+_r = dc.run(_dr)
+check("a removed test fails the ratchet", _r["diff-ratchet"]["state"], "FAIL")
+check("...and names the test", "test_two" in _r["diff-ratchet"]["detail"], True)
+
+# The same removal, justified in the same commit.
+(_dr / ".benchsmith").mkdir(exist_ok=True)
+(_dr / ".benchsmith" / "removals.jsonl").write_text(
+    json.dumps({"test": "test_two", "reason": "duplicated by test_one"}) + "\n")
+_dgit("add", "-A")
+check("a removal recorded in the same commit is allowed", dc.run(_dr)["diff-ratchet"]["state"], "PASS")
+# A reason-less record proves nothing.
+(_dr / ".benchsmith" / "removals.jsonl").write_text(json.dumps({"test": "test_two"}) + "\n")
+_dgit("add", "-A")
+check("a record with no reason does not authorise a removal",
+      dc.run(_dr)["diff-ratchet"]["state"], "FAIL")
+_dgit("reset", "-q", "--hard"); _dgit("clean", "-qfd")
+
+# Assertions quietly disappearing from a test that still exists.
+_TF.write_text("def test_one():\n    assert 1 == 1\n\ndef test_two():\n    assert 3 == 3\n")
+_dgit("add", "-A")
+_r2 = dc.run(_dr)
+check("a dropped assertion fails the ratchet", _r2["diff-ratchet"]["state"], "FAIL")
+check("...and quotes the counts", "3 -> 2" in _r2["diff-ratchet"]["detail"], True)
+_dgit("reset", "-q", "--hard")
+
+# Weakening.
+for label, body, expect in [
+    ("or True", "def test_one():\n    assert 1 == 1 or True\n    assert 2 == 2\n", "or True added"),
+    ("pytest skip", "import pytest\n@pytest.mark.skip\ndef test_one():\n    assert 1 == 1\n    assert 2 == 2\n", "skip added"),
+]:
+    _TF.write_text(body + "\ndef test_two():\n    assert 3 == 3\n")
+    _dgit("add", "-A")
+    _w = dc.run(_dr)
+    check(f"weakening caught: {label}", _w["diff-weakening"]["state"], "FAIL")
+    check(f"...labelled ({label})", expect in _w["diff-weakening"]["detail"], True)
+    _dgit("reset", "-q", "--hard")
+
+_TF.write_text("def test_one():\n    assert abs(x - y) <= 0.5\n    assert 2 == 2\n\n"
+               "def test_two():\n    assert 3 == 3\n")
+_dgit("add", "-A"); _dgit("commit", "-qm", "tol")
+_TF.write_text("def test_one():\n    assert abs(x - y) <= 5.0\n    assert 2 == 2\n\n"
+               "def test_two():\n    assert 3 == 3\n")
+_dgit("add", "-A")
+check("a widened tolerance is caught", "tolerance widened" in dc.run(_dr)["diff-weakening"]["detail"], True)
+_dgit("reset", "-q", "--hard")
+
+# A file that will not parse must be a finding, not a quiet skip -- a line-based
+# check would happily "examine" it and report clean.
+_TF.write_text("def test_one(:\n  oops\n")
+_dgit("add", "-A")
+_bad = dc.run(_dr)
+check("an unparseable graded file fails, not skips", _bad["diff-ratchet"]["state"], "FAIL")
+check("...and says it does not parse", "does not parse" in _bad["diff-ratchet"]["detail"], True)
+_dgit("reset", "-q", "--hard")
+
+# Nothing examined is NOT_RUN, never a pass.
+(_dr / "README.md").write_text("docs\n")
+_dgit("add", "-A")
+check("a docs-only change examines nothing", dc.run(_dr)["diff-ratchet"]["state"], "NOT_RUN")
+check("...and does not claim clean",
+      "no graded python file" in dc.run(_dr)["diff-ratchet"]["detail"], True)
+_dgit("reset", "-q", "--hard"); _dgit("clean", "-qfd")
+
+# Adding coverage must not be mistaken for removing it.
+_TF.write_text("def test_one():\n    assert 1 == 1\n    assert 2 == 2\n\n"
+               "def test_two():\n    assert 3 == 3\n\ndef test_three():\n    assert 4 == 4\n")
+_dgit("add", "-A")
+check("adding a test passes", dc.run(_dr)["diff-ratchet"]["state"], "PASS")
+_dgit("reset", "-q", "--hard")
+
+check("the diff checks are push-required",
+      {"diff-ratchet", "diff-weakening"} <= set(gate_mod.PUSH_REQUIRED), True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

@@ -30,7 +30,8 @@ PASS, FAIL, NOT_RUN = "PASS", "FAIL", "NOT_RUN"
 # Checks whose absence makes a push unsafe rather than merely unmeasured. These
 # are the ones where NOT_RUN and FAIL have the same consequence: you do not know
 # the thing you would have to know in order to push.
-PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags")
+PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags",
+                 "diff-ratchet", "diff-weakening")
 
 
 @dataclass
@@ -434,6 +435,19 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
         report.add("single-lever", PASS, f"one lever: {hit.pop()}")
 
 
+def check_diff(repo_root: Path, report: Report) -> None:
+    """Staged-vs-HEAD checks: is this change worse than the last one?
+
+    Distinct from `check_test_ratchet`, which compares against the last round
+    benchsmith RECORDED. Anything committed between rounds is invisible to that
+    one, and `staged vs HEAD` is cheaply available only here.
+    """
+    from . import diffcheck
+
+    for name, res in diffcheck.run(Path(repo_root)).items():
+        report.add(name, res["state"], res["detail"])
+
+
 def check_formatting(repo_root: Path, report: Report, specs=None) -> None:
     """The repos' pre-commit hook, as a check.
 
@@ -499,6 +513,7 @@ def run(
     check_budget(journal, report)
     check_scope(repo_root, task_name, report)
     check_single_lever(repo_root, task_name, journal.mode, report)
+    check_diff(repo_root, report)
     check_formatting(repo_root, report, hook_specs)
     check_hygiene(task_dir, report)
     check_oracle(oracle_cmd, report)

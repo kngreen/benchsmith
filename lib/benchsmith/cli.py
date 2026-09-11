@@ -199,6 +199,7 @@ def cmd_queue(args) -> int:
     payload = {
         "total": len(items),
         "dispatchable": len(ready),
+        "gsd": raw.get("gsd") if isinstance(raw, dict) else None,
         "notes": raw.get("notes") if isinstance(raw, dict) else [],
         "next": [i.as_dict() for i in ready[: args.workers]],
         "queue": [i.as_dict() for i in items],
