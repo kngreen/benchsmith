@@ -22,10 +22,7 @@ SINGLE_GATE_KILL = 0.80
 MIN_FAMILIES = 2
 MIN_CATEGORIES = 2
 
-REVIEW_PASSING = {
-    "tbr": frozenset({"Accept", "GOOD"}),
-    "agentic-full-task": frozenset({"GOOD"}),
-}
+from .snapshot import REVIEW_PASSING  # noqa: E402  (single source of truth)
 
 
 def wilson(passes: int, n: int) -> tuple[float, float]:

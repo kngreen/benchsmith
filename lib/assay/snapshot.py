@@ -206,12 +206,35 @@ def graded_pass(trial: dict) -> bool:
         return False
 
 
+def model_build(job: dict) -> str:
+    """The exact build. `config.modelName` is the live field.
+
+    agentName and modelName differ -- agentName 'metacode' runs modelName
+    'meta/avocado-code-flex' -- so family comes from the agent and build from the
+    model. Collapsing them merges distinct builds into one slot.
+    """
+    cfg = job.get("config") or {}
+    return str(cfg.get("modelName") or job.get("modelVersion") or agent_name(job) or "unknown")
+
+
+def generation_of(job: dict) -> int:
+    """Which dispatch this row belongs to. Absent as `generation` on live jobs."""
+    cfg = job.get("config") or {}
+    for key in (cfg.get("revalidateRunId"), job.get("supersededMultistepAttempt")):
+        try:
+            if key is not None:
+                return int(key)
+        except (TypeError, ValueError):
+            return 1
+    return 0
+
+
 def slot_of(job: dict, trial: dict, ordinal: int) -> SlotKey:
     name = agent_name(job)
     return SlotKey(
         stage=job_stage(job) or "agent",
         family=name.split("/")[0] or "unknown",
-        build=str(job.get("modelBuild") or job.get("model") or name or "unknown"),
+        build=model_build(job),
         step=str(trial.get("step") or trial.get("stepId") or "1"),
         ordinal=ordinal,
     )
@@ -234,8 +257,12 @@ def build_plan(jobs: list[dict], *, strongest, steps, categories=()) -> Plan:
         # `config.nAttempts` is the live field. Everything else here is a
         # fallback for other surfaces; probing the wrong name made build_plan
         # raise on every real job.
+        # `plannedNAttempts` first: the doctrine is planned-vs-observed, and
+        # `nAttempts` is what the job ran. They differ (one real job has
+        # nAttempts=1 with plannedNAttempts null), so both are needed.
         attempts = (
-            cfg.get("nAttempts")
+            cfg.get("plannedNAttempts")
+            or cfg.get("nAttempts")
             or job.get("plannedAttempts")
             or job.get("attempts")
             or cfg.get("numAttempts")
@@ -252,7 +279,7 @@ def build_plan(jobs: list[dict], *, strongest, steps, categories=()) -> Plan:
                     SlotKey(
                         stage=job_stage(job) or "agent",
                         family=agent_name(job).split("/")[0] or "unknown",
-                        build=str(job.get("modelBuild") or job.get("model") or agent_name(job)),
+                        build=model_build(job),
                         step=str(step),
                         ordinal=i,
                     )
@@ -284,7 +311,7 @@ def build_rows(jobs: list[dict], trials_by_job: dict[str, list[dict]], plan: Pla
                     kind=kind,
                     job_id=str(job.get("id") or ""),
                     trial_id=str(trial.get("id") or ""),
-                    generation=int(job.get("generation") or 0),
+                    generation=generation_of(job),
                     superseded=bool(trial.get("superseded")),
                     decisions=tuple(sorted(trial.get("decisions") or ())),
                     category=str(trial.get("category") or ""),
@@ -383,54 +410,103 @@ def infra_fraction(rows: list[Row]) -> dict:
 
 # --- reviews ----------------------------------------------------------------
 
-REQUIRED_REVIEWS = ("tbr", "agentic-full-task")
+REQUIRED_REVIEWS = ("tbr", "agentic-full-task", "quality")
+
+REVIEW_PASSING = {
+    "tbr": frozenset({"pass"}),
+    "agentic-full-task": frozenset({"GOOD"}),
+    "quality": frozenset({"GOOD", "Accept"}),
+}
 
 
-def review_manifest(task: dict, jobs: list[dict], active_sha: str, required=REQUIRED_REVIEWS) -> list[Review]:
-    """One row per required review. A missing row is a missing pass, not a silence."""
-    rows: list[Review] = []
+def _tbr_row(task: dict, active_sha: str) -> Review:
+    """TBR is `tbdReviewStatus` / `tbdReviewDetails` -- NOT `qualitativeResult`.
 
-    tbr = task.get("qualitativeResult") or {}
-    rows.append(
-        Review(
-            name="tbr",
-            state="completed" if tbr.get("overall") else ("errored" if tbr.get("error") else "absent"),
-            verdict=str(tbr.get("verdict") or tbr.get("overall") or ""),
-            job_id=str(tbr.get("jobId") or ""),
-            reviewed_sha=str(tbr.get("commitSha") or task.get("validationCommitSha") or ""),
-            selection="exact-head"
-            if str(tbr.get("commitSha") or task.get("validationCommitSha") or "") == active_sha
-            else "fallback",
-            stale=str(task.get("headCommitSha") or "") != active_sha,
-        )
+    Reading `qualitativeResult` here produced a false green on real data: a task
+    whose true `tbdReviewStatus` was "fail" reported Accept, because the quality
+    assessment was GOOD. That is worse than a crash, because it is silent.
+    """
+    status = str(task.get("tbdReviewStatus") or "")
+    details = task.get("tbdReviewDetails") or {}
+    # `instance_id` embeds the short SHA, which is the only revision binding this
+    # payload offers. Without it the row cannot claim exact-head.
+    instance = str(details.get("instance_id") or "")
+    bound = bool(active_sha) and active_sha[:7] in instance
+    return Review(
+        name="tbr",
+        state="completed" if status else "absent",
+        verdict=status,
+        reviewed_sha=active_sha if bound else "",
+        selection="exact-head" if bound else "fallback",
+        stale=bool(task.get("tbrNotFinalized")),
     )
 
-    full = None
+
+def _quality_row(task: dict, active_sha: str) -> Review:
+    """The AI quality assessment -- a real gate, but a different one from TBR."""
+    q = task.get("qualitativeResult") or {}
+    sha = str(task.get("validationCommitSha") or "")
+    return Review(
+        name="quality",
+        state="completed" if q.get("overall") else ("errored" if q.get("error") else "absent"),
+        verdict=str(q.get("verdict") or q.get("overall") or ""),
+        reviewed_sha=sha,
+        selection="exact-head" if sha and sha == active_sha else "fallback",
+        stale=False,
+    )
+
+
+def _agentic_row(jobs: list[dict], active_sha: str) -> tuple[Review, list[str]]:
+    """The Agentic Full-Task Review lives at `job.agenticReview` on a job row.
+
+    Not `job.review`, not `job.validation.review` -- both absent on live jobs.
+    Liveness is `job.status`, and the revision is `job.config.commitSha`; reading
+    `job.state` and `job.task.commitSha` made a completed GOOD/exact-head review
+    render as pending/fallback, so the gate could never go green.
+    """
+    found = None
     for job in jobs:
-        env = (job.get("config") or {}).get("env") or {}
-        if str(env.get("__validation_stage") or "").lower() == "agentic-review":
-            full = job
+        if job_stage(job) == "agentic-review":
+            found = job
             break
-    review = ((full or {}).get("validation") or {}).get("review") or (full or {}).get("review") or {}
-    summary = (review.get("rubrics") or {}).get("summary") or {}
+    if found is None:
+        return (Review(name="agentic-full-task", state="absent"), [])
+
+    review = found.get("agenticReview") or {}
+    rubrics = review.get("rubrics") or {}
+    summary = rubrics.get("summary") or {}
     n_pass, n_total = summary.get("nPassed"), summary.get("nTotal")
     verdict = str(review.get("verdict") or "")
-    if verdict == "GOOD" and not (n_pass == n_total and n_total):
+    # A bare GOOD with a failed rubric is not a pass: the one FAIL is often
+    # exactly the difficulty signal §5 cares about.
+    failed = [
+        f"{i.get('id')} ({i.get('focus') or i.get('dimension')})"
+        for i in (rubrics.get("items") or [])
+        if str(i.get("verdict") or "").upper() == "FAIL"
+    ]
+    if verdict == "GOOD" and n_total and n_pass != n_total:
         verdict = f"GOOD but {n_pass}/{n_total}"
-    rows.append(
+    sha = str((found.get("config") or {}).get("commitSha") or "")
+    return (
         Review(
             name="agentic-full-task",
-            state=str((full or {}).get("state") or ("absent" if full is None else "pending")),
+            state=str(found.get("status") or "pending"),
             verdict=verdict,
-            job_id=str((full or {}).get("id") or ""),
-            reviewed_sha=str(((full or {}).get("task") or {}).get("commitSha") or ""),
-            selection="exact-head"
-            if str(((full or {}).get("task") or {}).get("commitSha") or "") == active_sha
-            else "fallback",
+            job_id=str(found.get("id") or ""),
+            reviewed_sha=sha,
+            selection="exact-head" if sha and sha == active_sha else "fallback",
             stale=bool(review.get("stale")),
-        )
+        ),
+        failed,
     )
 
+
+def review_manifest(task: dict, jobs: list[dict], active_sha: str, required=REQUIRED_REVIEWS):
+    """One row per required review. A missing row is a missing pass, not silence."""
+    agentic, failed_rubrics = _agentic_row(jobs, active_sha)
+    rows = [_tbr_row(task, active_sha), agentic, _quality_row(task, active_sha)]
+    if failed_rubrics:
+        agentic.verdict = f"{agentic.verdict} [FAIL: {', '.join(failed_rubrics)}]"
     known = {r.name for r in rows}
     rows.extend(Review(name=n, state="absent") for n in required if n not in known)
     return rows

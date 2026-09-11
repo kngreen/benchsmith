@@ -145,7 +145,7 @@ check(
 )
 
 m = measurement({"gpt": 3, "opus": 4})
-m.reviews = [Review(name="tbr", state="completed", verdict="Reject", reviewed_sha="sha")]
+m.reviews = [Review(name="tbr", state="completed", verdict="fail", reviewed_sha="sha")]
 check("a failing review is never downgraded to medium", evaluate(m)["verdict"], "NOT HARD")
 
 m = measurement({"gpt": 2, "opus": 2})
@@ -199,9 +199,13 @@ check("two steps both covered", st["verdict"], "HARD")
 section("Stale reviews — absence of a verdict is never a weak pass")
 
 base = measurement({"gpt": 2, "opus": 2})
+# The real contract: TBR's passing verdict is the literal "pass" from
+# task.tbdReviewStatus -- NOT "Accept", which belongs to the separate AI quality
+# assessment. Conflating them produced a false green on live data.
 good = [
-    Review(name="tbr", state="completed", verdict="Accept", reviewed_sha="sha"),
+    Review(name="tbr", state="completed", verdict="pass", reviewed_sha="sha"),
     Review(name="agentic-full-task", state="completed", verdict="GOOD", reviewed_sha="sha"),
+    Review(name="quality", state="completed", verdict="Accept", reviewed_sha="sha"),
 ]
 base.reviews = [Review(**r.__dict__) for r in good]
 check("green reviews on the active sha", evaluate(base)["verdict"], "HARD")
