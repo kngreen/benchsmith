@@ -18,6 +18,40 @@ not a pass.
 What must hold regardless of surface: the read is uncached, it is addressed by `TASK_ID`/
 `TASK_UUID` rather than basename (§1), and every number it returns is attributed to `ACTIVE_SHA`.
 
+## The oracle headline is not bound to the commit
+
+`oracleStatus`, `oraclePassRate`, `oraclePassCount` and the `Oracle validation` row in
+`validationDetails` **carry forward across a SHA change**. Measured on one task, two reads
+twenty minutes apart:
+
+| | read 1 | read 2 |
+|---|---|---|
+| `validationCommitSha` | `0012092313ae` | `d66fefbe6487` **changed** |
+| `validationStatus` | `failed` | `pending` |
+| cohort rates | 0.8 / 1.0 | all `null` |
+| **`oracleStatus`** | **`validated`** | **`validated`** — unchanged |
+| **`oraclePassRate`** | **1** | **1** — unchanged |
+
+Every SHA-scoped signal reset. The oracle did not. At that moment the platform UI was showing
+`Reference solution resolves task: 0`, `Fail-to-pass (binary): 0` for the live state, while the
+record still claimed `validated`, `3/3`.
+
+**Eval-GT is a separate stage and it is not in `job list`, `task show` or `tasks errors`.**
+Nothing in those three carries a SHA-bound reference result. It lives in:
+
+```
+codimango ... trials artifacts <TASK> --commit <FULL_SHA> --json
+```
+
+under `.passAtK.stageResults[]` — the row named `evalgt`, whose `rawResult.result.raw_output`
+is a **JSON-encoded string** holding the honest counts: `{resolved, reward, f2p_passed,
+f2p_total, p2p_passed, p2p_total}`. `stageResults[].jobId` is a multimango tracking id in a
+different namespace from cohort job ids; join on `commitSha` + `workflowRunId`, never on jobId.
+
+`benchsmith bar` therefore reports the `oracle` review row as `fallback` unless the caller
+supplies a SHA-bound Eval-GT result. Unbound is an absent verdict, not a weak pass — the same
+rule every other row obeys.
+
 ## Never read cohort rates from the task record
 
 The headline fields on `tasks show` — `agentPassCount/Rate`, `metacodePassCount/Rate`,
@@ -112,8 +146,8 @@ Every item, on one exact commit, from fresh reads:
 
 - `headCommitSha == validationCommitSha`
 - `validationStatus == "passing"`; structural and build checks pass
-- Oracle / reference passes consistently — for binary tasks, `codimango bench run -a oracle -k 3`
-  at 3/3 with reward exactly 1.0 where the format supports it
+- Oracle / reference passes consistently — **and never read `oracleStatus` to establish it**
+  (see below)
 - agent results satisfy the format's difficulty requirement — **and §5's bar**
 - AI Assessment / Quality Review: Accept
 - Contamination LOW *(benchsmith treats this as blocking; see §5 note)*

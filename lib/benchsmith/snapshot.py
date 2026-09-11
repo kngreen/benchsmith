@@ -599,7 +599,7 @@ def infra_fraction(rows: list[Row], jobs: list[dict] | None = None) -> dict:
 
 # --- reviews ----------------------------------------------------------------
 
-REQUIRED_REVIEWS = ("tbr", "agentic-full-task", "quality", "review-critic")
+REQUIRED_REVIEWS = ("tbr", "agentic-full-task", "quality", "review-critic", "oracle")
 
 REVIEW_PASSING = {
     "tbr": frozenset({"pass"}),
@@ -609,6 +609,7 @@ REVIEW_PASSING = {
     # Reject. It is the only required review the platform does not produce, so
     # its row is supplied by the operator rather than parsed from a payload.
     "review-critic": frozenset({"Accept"}),
+    "oracle": frozenset({"validated"}),
 }
 
 
@@ -649,6 +650,39 @@ def _quality_row(task: dict, active_sha: str) -> Review:
         # monorepo that is the REPO branch head, which moves whenever any other
         # task commits. Using it marked nearly every task stale.
         stale=False,
+    )
+
+
+def _oracle_row(task: dict, active_sha: str) -> Review:
+    """The oracle headline is NOT bound to the validation commit.
+
+    Measured directly: two reads of one task twenty minutes apart, across a SHA
+    change from 0012092313ae to d66fefbe6487. `validationStatus` went
+    failed -> pending and every cohort rate reset to null, while
+    `oracleStatus: validated` and `oraclePassRate: 1` carried forward UNCHANGED.
+
+    So a gate reading the headline believes the reference resolves on the current
+    commit when it resolved on an older one -- and the platform UI was
+    simultaneously showing `Reference solution resolves task: 0`, `fail-to-pass:
+    0` for the live state. Nothing in `task show`, `job list` or `tasks errors`
+    carries an Eval-GT result bound to a SHA; the stage lives in
+    `trial artifacts --commit <sha> --json` under `.passAtK.stageResults[]`, whose
+    `rawResult.result.raw_output` is a JSON *string* holding the real
+    f2p/p2p/resolved counts.
+
+    This row is therefore reported `fallback` unless the caller supplies a
+    SHA-bound Eval-GT result. Unbound is an absent verdict, not a weak pass.
+    """
+    status = str(task.get("oracleStatus") or "")
+    bound = task.get("evalGtBoundSha")  # only ever set by a stageResults read
+    ok = bool(bound) and str(bound) == active_sha
+    return Review(
+        name="oracle",
+        state="completed" if status else "absent",
+        verdict=status,
+        reviewed_sha=str(bound or ""),
+        selection="exact-head" if ok else "fallback",
+        stale=not ok,
     )
 
 
@@ -700,7 +734,8 @@ def _agentic_row(jobs: list[dict], active_sha: str) -> tuple[Review, list[str]]:
 def review_manifest(task: dict, jobs: list[dict], active_sha: str, required=REQUIRED_REVIEWS):
     """One row per required review. A missing row is a missing pass, not silence."""
     agentic, failed_rubrics = _agentic_row(jobs, active_sha)
-    rows = [_tbr_row(task, active_sha), agentic, _quality_row(task, active_sha)]
+    rows = [_tbr_row(task, active_sha), agentic, _quality_row(task, active_sha),
+            _oracle_row(task, active_sha)]
     if failed_rubrics:
         agentic.verdict = f"{agentic.verdict} [FAIL: {', '.join(failed_rubrics)}]"
     known = {r.name for r in rows}

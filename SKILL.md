@@ -747,6 +747,10 @@ pending, fallback or malformed evidence — absence of a verdict is never a weak
 
 Three ways this goes wrong, all seen:
 
+- **Reading a signal that is not SHA-bound.** `oracleStatus` survives a commit change while
+  every cohort rate resets — verified across two reads twenty minutes apart. The reference
+  result must come from the `evalgt` row of `trial artifacts --commit`, never the headline
+  (`references/gates.md`).
 - **Claiming green on a stale read.** The head moved, or the review came from an older attempt.
   Compare `.task.commitSha` against `headCommitSha` explicitly; do not assume the API gave you
   the current one.
