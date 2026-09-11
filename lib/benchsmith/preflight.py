@@ -107,6 +107,37 @@ def run(repo_root: Path | None = None, task: str | None = None) -> dict:
     if not ok_proxy:
         blocking.append("no_proxy")
 
+    # Smoke verifies parsing against stubs; this is the only thing that notices
+    # the real CLI moving out from under those stubs.
+    try:
+        from .adapter import verify_surface
+
+        vs = verify_surface()
+        rows.append(
+            {
+                "kind": "cli",
+                "name": "live surface matches offline fixtures",
+                "state": "present" if vs["ok"] else "MISSING",
+                "path": vs.get("matched"),
+                "usedFor": "confidence that the offline suite reflects reality",
+                "degradesTo": None if vs["ok"] else f"{vs['verdict']}: {vs['detail']}",
+            }
+        )
+        if not vs["ok"]:
+            degraded.append("cli-surface-drift")
+    except Exception as e:  # noqa: BLE001 - preflight must never crash the round
+        rows.append(
+            {
+                "kind": "cli",
+                "name": "live surface matches offline fixtures",
+                "state": "MISSING",
+                "path": None,
+                "usedFor": "confidence that the offline suite reflects reality",
+                "degradesTo": f"could not check: {e}",
+            }
+        )
+        degraded.append("cli-surface-drift")
+
     if repo_root and task:
         legacy = Path(repo_root) / ".ripen" / f"{task}.json"
         current = Path(repo_root) / ".benchsmith" / f"{task}.json"

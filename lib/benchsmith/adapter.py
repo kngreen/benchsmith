@@ -164,6 +164,44 @@ def discover(binary: str | None = None, site: str | None = None) -> Surface:
     return surface
 
 
+# What the offline smoke fixtures assume about the CLI. Smoke stubs `_help`, so
+# it verifies PARSING and never REALITY: rename a subcommand upstream and smoke
+# stays green while the first failure is at call time in a live round. This is
+# the contract the stubs encode, checked against the live binary by
+# `verify_surface()` so the drift is detectable rather than silent.
+SMOKE_CONTRACT = {
+    "legacy": {"task_show": ("api", "tasks", "show"), "jobs_list": ("api", "jobs", "list")},
+    "bare": {"task_show": ("task", "show"), "jobs_list": ("job", "list")},
+}
+
+
+def verify_surface(surface: Surface | None = None) -> dict:
+    """Does the live CLI still match a shape the offline fixtures know?
+
+    Network-dependent, so it is deliberately NOT in the offline suite -- it runs
+    from `preflight`, where a degraded answer is already the expected output.
+    """
+    try:
+        surface = surface or discover()
+    except Unresolved as e:
+        return {"ok": False, "verdict": "UNRESOLVED", "detail": str(e), "matched": None}
+    matched = next(
+        (name for name, c in SMOKE_CONTRACT.items() if surface.task_show == c["task_show"]), None
+    )
+    drift = []
+    if matched is None:
+        drift.append(f"task_show={surface.task_show} matches no shape the fixtures cover")
+    elif surface.jobs_list != SMOKE_CONTRACT[matched]["jobs_list"]:
+        drift.append(f"jobs_list={surface.jobs_list} != {SMOKE_CONTRACT[matched]['jobs_list']}")
+    return {
+        "ok": not drift,
+        "verdict": "MATCHES-FIXTURES" if not drift else "DRIFTED",
+        "matched": matched,
+        "detail": "; ".join(drift) or f"live surface matches the {matched} fixture shape",
+        "surface": surface.as_dict(),
+    }
+
+
 @dataclass
 class Identity:
     """What was recorded at intake. The basename is not part of it."""

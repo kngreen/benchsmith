@@ -566,6 +566,40 @@ with tempfile.TemporaryDirectory() as td:
     check("missing recipe tag caught", "benchsmith-v1" in tags, True)
 
 
+# ------------------------------------------------- reading foreign receipts ----
+section("Foreign receipts — a green status is not evidence")
+
+from benchsmith.receipts import predicate_is_permissive, read_job, scan_log  # noqa: E402
+
+# Observed: a deploy log claiming health verification whose own text says it skipped.
+dep = scan_log("pushing image...\nno ALB found — skipping health verification\nrefresh complete")
+check("deploy log skip marker found", dep["skipped"], True)
+check("and the log is UNPROVEN", dep["verdict"], "UNPROVEN")
+check("a clean log has no markers", scan_log("all checks executed")["skipped"], False)
+
+# Observed: an e2e job green via its skip path, every step skipped.
+e2e = {"conclusion": "success", "steps": [{"conclusion": "skipped"} for _ in range(6)]}
+r = read_job(e2e)
+check("all-skipped job is not a pass", r["verdict"], "UNPROVEN")
+check("and says why", "all 6 steps skipped" in r["reason"], True)
+
+real = {"conclusion": "success", "steps": [{"conclusion": "success"}, {"conclusion": "skipped"}]}
+check("a job with real steps passes", read_job(real)["verdict"], "PASS")
+check("a failed job fails", read_job({"conclusion": "failure", "steps": []})["verdict"], "FAIL")
+check("status with no corroboration is unproven",
+      read_job({"conclusion": "success"})["verdict"], "UNPROVEN")
+check("a passing status with a skipping log is unproven",
+      read_job(real, log="no ALB found — skipping health verification")["verdict"], "UNPROVEN")
+
+# Observed: assert_ok accepting everything except 403.
+deny = 'assert_ok() { [ "$code" != 403 ] || fail; }'
+pd = predicate_is_permissive(deny)
+check("denylist positive control detected", pd["permissive"], True)
+check("and named", "accepts every other code" in pd["findings"][0], True)
+allow = 'assert_ok() { [ "$code" == 200 ] || fail; }'
+check("allowlist control is not flagged", predicate_is_permissive(allow)["permissive"], False)
+
+
 # ---------------------------------------------------------- repair mode ----
 section("Repair mode — closure terminates, not budget")
 

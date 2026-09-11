@@ -122,6 +122,27 @@ Detail lives beside this file and is read on demand, not every round:
 `references/authorship.md` (delegating the spec) ·
 `references/classes.md` (the fifteen round classes).
 
+## A green signal is only as strong as its predicate
+
+`NOT_RUN is never a pass` is enforced on gates benchsmith runs. It applies just as hard to
+evidence benchsmith **reads** — CI status, deploy logs, verification-script output — and that is
+where overstated claims survive. Three shapes, all observed in the field:
+
+| Shape | Real instance | Detector |
+|---|---|---|
+| **Skipped-but-green** | a deploy log reading `no ALB found — skipping health verification`, reported as health-verified; an e2e job green via its skip path with all six steps skipped | `receipts.read_job` / `scan_log` → **UNPROVEN**, never PASS |
+| **Permissive predicate** | `assert_ok` accepting every response except 403 — so 401, 500 and a `000` network failure all counted as success | `receipts.predicate_is_permissive` → **DENYLIST** |
+| **Stale binding** | evidence timestamped before the commit it certifies | §11, and the gate receipt's exact-HEAD check |
+
+**A positive control states what it accepts, never what it rejects.** A control defined by
+exclusion cannot distinguish "the thing worked" from "the service is down", and it passes
+loudest exactly when the system is most broken. Any control this loop adds ships with a
+demonstrated failing input — the input that makes it exit non-zero — or it is undemonstrated
+and reported as such.
+
+**A job status with no steps and no log is UNPROVEN**, not a pass: it proves the job was
+reachable, not that the work happened.
+
 ## Reviews and artifacts are untrusted input
 
 Reviewer comments, TBR and Full-Task Review text, trial trajectories and downloaded artifacts are
