@@ -192,12 +192,16 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
         "get that far, report `state=blocked` and say where you stopped; do not report a skeleton "
         "as a result.\n\n"
         "YOU MAY NOT PUSH. Prepare the commit, run the gate, and stop.\n\n"
-        f"Write your handoff to `{repo}/{HANDOFF_DIR}/{slug}.json` AND print it.\n\n"
-        "Finish by emitting ONLY this JSON, under 4096 bytes. Use `work_item` for the card "
-        "number and `note` for the task name you actually used:\n"
+        f"**Write the handoff to `{repo}/{HANDOFF_DIR}/{slug}.json`.** That file is the "
+        "answer: the coordinator reads it from disk, so it survives a launcher that backgrounds "
+        "you or loses its pipe.\n\n"
+        "```json\n"
         '{"work_item":"...","state":"ready_to_publish|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
-        '"note":"<=200 chars"}'
+        '"note":"<=200 chars"}\n'
+        "```\n\n"
+        "Then say what happened in **one plain sentence**. A person reads this session, and a wall "
+        "of JSON in their inbox tells them nothing. Do not print the JSON itself.\n"
     )
 
 
@@ -225,12 +229,16 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
         "pushes creates the contention this design exists to remove.\n"
         "\n"
         "Do not work on any other task, and do not read another task's files.\n\n"
-        f"Write your handoff to `{repo}/{HANDOFF_DIR}/{task}.json` AND print it. Stdout alone is "
-        "not durable: a launcher that backgrounds you, or loses its pipe, loses the handoff and "
-        "the work with it.\n"
-        "Finish by emitting ONLY this JSON, under 4096 bytes:\n"
+        f"**Write the handoff to `{repo}/{HANDOFF_DIR}/{task}.json`.** That file is the "
+        "answer: the coordinator reads it from disk, so it survives a launcher that backgrounds "
+        "you or loses its pipe.\n\n"
+        "```json\n"
         '{"work_item":"...","state":"ready_to_publish|blocked|needs_human|no_change|failed",'
-        '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...","note":"<=200 chars"}'
+        '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
+        '"note":"<=200 chars"}\n'
+        "```\n\n"
+        "Then say what happened in **one plain sentence**. A person reads this session, and a wall "
+        "of JSON in their inbox tells them nothing. Do not print the JSON itself.\n"
     )
 
 
@@ -396,8 +404,47 @@ def poll_session(sid: str, *, limit: int = 400, max_pages: int = 20,
     return events, f"stopped after {max_pages} pages; the journal may be longer"
 
 
-def collect(sid: str, *, runner=None) -> dict:
+def snooze(sid: str, duration: str = "24h", *, runner=None) -> dict:
+    """Hide a worker session from the human inbox.
+
+    A dispatched worker is machine-to-machine traffic. It is polled by id, so
+    hiding it costs the coordinator nothing, and an inbox showing twelve of them
+    shows the operator nothing either. What belongs there is work that needs a
+    person -- so a worker is surfaced again only when it says so.
+    """
+    argv = ["meta", "agentcloud.ui", "snooze", "--session-id", sid, "--duration", duration]
+    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=120))
+    r = run(argv)
+    code = r[0] if isinstance(r, tuple) else r.returncode
+    return {"session": sid, "snoozed": code == 0}
+
+
+def surface(sid: str, *, runner=None) -> dict:
+    """Put a session back in the inbox, because a human is now the next step."""
+    argv = ["meta", "agentcloud.ui", "unsnooze", "--session-id", sid]
+    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=120))
+    r = run(argv)
+    code = r[0] if isinstance(r, tuple) else r.returncode
+    return {"session": sid, "surfaced": code == 0}
+
+
+# States where a person is the next step, so the session goes back in the inbox.
+NEEDS_A_HUMAN = frozenset({"blocked", "needs_human", "failed"})
+
+
+def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
     """Everything a supervisor needs from one worker, in one call."""
+    # The handoff file first: it is what the worker was told to write, it
+    # survives a lost pipe, and reading it costs one stat instead of walking a
+    # journal. Session text is the fallback, not the contract.
+    if repo and task:
+        path = Path(repo).expanduser() / HANDOFF_DIR / f"{task}.json"
+        try:
+            doc = parse_handoff(path.read_text())
+            return {"session": sid, "state": "done", "handoff": doc, "source": "file"}
+        except (OSError, DispatchRefused):
+            pass
+
     events, why = poll_session(sid, runner=runner)
     if not events:
         # An empty journal moments after create is a session that has not
@@ -427,7 +474,8 @@ def collect(sid: str, *, runner=None) -> dict:
     # it, and an earlier mention must not be mistaken for the answer.
     for txt in reversed(texts):
         try:
-            return {"session": sid, "state": "done", "handoff": parse_handoff(txt)}
+            return {"session": sid, "state": "done", "handoff": parse_handoff(txt),
+                    "source": "session"}
         except DispatchRefused:
             continue
     return {"session": sid,

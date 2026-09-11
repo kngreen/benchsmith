@@ -130,8 +130,18 @@ silently proceed with fewer workers than asked for.
 #### Supervising
 
 ```bash
-benchsmith collect --session-id <session>     # per worker, until state is not "running"
+benchsmith collect --session-id SESSION --repo REPO --task TASK-NAME
 ```
+
+**Worker sessions are snoozed the moment they start.** They are machine-to-machine traffic; twelve
+rows of it in the operator's inbox tell them nothing. Polling is by session id, so hiding them
+costs you nothing. A session is put back in the inbox exactly when a person becomes the next step —
+`blocked`, `needs_human`, `failed`, or finished without an answer — and not before. `--no-snooze`
+turns this off.
+
+`collect` reads `<repo>/.benchsmith/handoff/<task>.json` first and falls back to the session
+journal. The file is the contract: it survives a launcher that loses its pipe, and it means the
+worker's visible last word can be a plain sentence instead of a wire format.
 
 | Handoff state | What you do |
 |---|---|

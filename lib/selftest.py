@@ -2628,7 +2628,7 @@ check("...and is not retryable", _broken["retryable"], False)
 _hp = [a for a in dsp.plan("real-task", str(_dr2)).argv if "handoff" in a][0]
 check("the worker is told to write the handoff to a file",
       f"{dsp.HANDOFF_DIR}/real-task.json" in _hp, True)
-check("...as well as printing it", "AND print it" in _hp, True)
+check("...and is told not to print it", "Do not print the JSON itself" in _hp, True)
 
 # The official skeleton with nothing authored looks like progress and is not.
 _sk = [a for a in dsp.plan("newthing", str(_dr2 / "nope"), mode="scaffold",
@@ -2699,6 +2699,57 @@ check("unregistered is stated to be correct, not an error",
       "That is correct, not an error" in _s2, True)
 check("the track still comes from the platform, never a tag",
       "Free-text tags never choose a track" in _s2, True)
+
+
+# --- the inbox is for people, not plumbing -----------------------------------
+
+# The handoff file is the contract; the session journal is the fallback. A
+# worker's last word to a human should be a sentence, not a wire format.
+_hf = Path(tempfile.mkdtemp())
+(_hf / dsp.HANDOFF_DIR).mkdir(parents=True)
+(_hf / dsp.HANDOFF_DIR / "mytask.json").write_text(json.dumps(
+    {"work_item": "mytask", "state": "ready_to_publish", "commit_sha": "abc",
+     "base_sha": "b", "gate_receipt": "r"}))
+
+
+def _never_polled(argv):
+    raise AssertionError("the journal must not be walked when the file is present")
+
+
+_c = dsp.collect("s1", repo=str(_hf), task="mytask", runner=_never_polled)
+check("the handoff is read from disk", _c["source"], "file")
+check("...without walking the journal", _c["handoff"]["commit_sha"], "abc")
+
+_missing = dsp.collect("s1", repo=str(_hf), task="absent",
+                       runner=_pages(([_block("no answer"), {"type": "run_finished"}], False)))
+check("no file falls back to the session", _missing["state"], "finished-without-handoff")
+
+_prompt = [a for a in dsp.plan("real", "/tmp/bsdemo").argv if "handoff" in a][0]
+check("the worker writes the handoff to a file", ".benchsmith/handoff/real.json" in _prompt, True)
+check("...and is told not to print the JSON", "Do not print the JSON itself" in _prompt, True)
+check("...but to say one plain sentence", "one plain sentence" in _prompt, True)
+
+_calls = []
+
+
+def _spy_ui(argv):
+    _calls.append(argv)
+    class R:
+        returncode = 0
+    return R()
+
+
+check("a worker session is snoozed", dsp.snooze("s1", runner=_spy_ui)["snoozed"], True)
+check("...via the ui surface", "agentcloud.ui" in _calls[-1] and "snooze" in _calls[-1], True)
+check("a session can be surfaced again", dsp.surface("s1", runner=_spy_ui)["surfaced"], True)
+check("...by unsnoozing", "unsnooze" in _calls[-1], True)
+
+# Surfacing is the point: hiding everything forever would be worse than showing
+# everything, so the states that need a person are named.
+for _s in ("blocked", "needs_human", "failed"):
+    check(f"{_s} needs a person", _s in dsp.NEEDS_A_HUMAN, True)
+check("ready_to_publish does not", "ready_to_publish" in dsp.NEEDS_A_HUMAN, False)
+check("no_change does not", "no_change" in dsp.NEEDS_A_HUMAN, False)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

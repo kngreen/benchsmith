@@ -396,6 +396,11 @@ def cmd_fleet(args) -> int:
             sid = dispatch_mod.session_id(res.get("stdout") or "")
             entry["ok"] = res.get("ok")
             entry["session"] = sid
+            # Out of the human inbox the moment it starts. It is polled by id,
+            # so this costs the coordinator nothing, and twelve rows of
+            # machine-to-machine traffic tell the operator nothing.
+            if sid and not args.no_snooze:
+                entry["snoozed"] = dispatch_mod.snooze(sid)["snoozed"]
             if not sid:
                 entry["warning"] = "started but returned no session id; it cannot be followed"
             entry["error"] = res.get("error") or (res.get("stderr") or "")[:200] or None
@@ -474,8 +479,13 @@ def cmd_scaffold(args) -> int:
 
 
 def cmd_collect(args) -> int:
-    """Read one worker's session and return its handoff, if it produced one."""
-    res = dispatch_mod.collect(args.session_id)
+    """Read one worker's handoff — from disk first, then the session journal."""
+    res = dispatch_mod.collect(args.session_id, repo=args.repo, task=args.task)
+    state = str((res.get("handoff") or {}).get("state") or "")
+    # Back into the inbox exactly when a person is the next step, and not before.
+    if state in dispatch_mod.NEEDS_A_HUMAN or res.get("state") == "finished-without-handoff":
+        res["surfaced"] = dispatch_mod.surface(args.session_id)["surfaced"]
+        res["why_surfaced"] = f"state={state or res.get('state')} needs a person"
     _out(res)
     return 0 if res.get("state") == "done" else 1
 
@@ -783,6 +793,8 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("collect", help="read a worker session and return its handoff")
     s.add_argument("--session-id", required=True)
+    s.add_argument("--repo", default="", help="read the handoff file from here first")
+    s.add_argument("--task", default="")
     s.set_defaults(fn=cmd_collect)
 
     s = sub.add_parser("resolve", help="task name, id, or submissions URL -> a bound task")
@@ -797,6 +809,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--no-gsd", action="store_true")
     s.add_argument("--target", default=os.environ.get("BENCHSMITH_TARGET", "hard-preferred"))
     s.add_argument("--apply", action="store_true", help="actually start the workers")
+    s.add_argument("--no-snooze", action="store_true",
+                   help="leave worker sessions in the AgentCloud inbox")
     s.set_defaults(fn=cmd_fleet)
 
     s = sub.add_parser("config", help="show the resolved configuration")
