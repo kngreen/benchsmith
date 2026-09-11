@@ -462,9 +462,11 @@ a fifth constraint is more likely than genuine difficulty.
 
 ### The honest gap
 
-the optional mutation probe covers **Go and Python only**, caps the battery at 12, and reports
-`NOT_RUN` elsewhere — so a Swift or TypeScript task has no mutation coverage at all. Report that
-as uncovered. Do not report it as clean.
+**benchsmith has no mutation probe.** Nothing here builds a battery of plausible wrong answers and
+checks which ones the tests fail to catch, and `codimango bench` exposes no such command. So on
+every task, in every language, the question "would these tests catch a near-miss?" is
+**unanswered** — not answered cleanly. Say so in the verdict. A test suite that passes the
+reference and fails the base has not thereby been shown to discriminate.
 
 ---
 
