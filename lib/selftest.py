@@ -566,5 +566,219 @@ with tempfile.TemporaryDirectory() as td:
     check("missing recipe tag caught", "benchsmith-v1" in tags, True)
 
 
+# ------------------------------------------------------- smoke layer -------
+section("Smoke — every subcommand reachable from bin/benchsmith is invoked")
+
+# Why this exists, separately from the fixtures above: three defects shipped in
+# one day that the fixtures could not see, because a fixture that supplies a
+# field cannot notice code reading a different one. Fail-open single_gate_share,
+# the plan/row build-label mismatch, and a NameError in discover() that made
+# `probe` and `read` crash outright. All three were reachable from the CLI and
+# none was reachable from a unit fixture. This layer calls every subcommand with
+# the external boundary stubbed, so a path that cannot execute at all fails here.
+
+import subprocess as _sp  # noqa: E402
+from benchsmith import adapter as _ad  # noqa: E402
+from benchsmith import cli as _cli  # noqa: E402
+
+_LEGACY_ROOT = """Usage: codimango [OPTIONS] COMMAND [ARGS]...
+
+Options:
+  --site [vanilla|nest]  Which site.
+  --help                 Show this message and exit.
+
+Commands:
+  api       Codimango API commands (setup, tasks, jobs, trials, keys).
+  assets    Upload and manage the large task assets a trial downloads.
+  bench     Benchmarking commands.
+  task      Task scaffolding commands.
+"""
+_LEGACY_API = """Usage: codimango api [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  tasks   Task endpoints.
+  jobs    Job endpoints.
+  trials  Trial endpoints.
+"""
+_NEW_ROOT = """Usage: codimango [OPTIONS] COMMAND [ARGS]...
+
+Commands:
+  task    Task commands.
+  job     Job commands.
+  trial   Trial commands.
+  bench   Benchmarking commands.
+"""
+_SHOW_HELP = "Options:\n  --json\n  --no-cache\n"
+_JOBS_HELP = "Options:\n  --json\n  --limit <N>\n  --include-agentic-review [latest|all|none]\n"
+
+
+def _stub_cli(root, api="", show=_SHOW_HELP, jobs=_JOBS_HELP):
+    """Pretend a codimango binary exists and answers --help a given way."""
+    calls = []
+
+    def fake_help(binary, *words):
+        calls.append(words)
+        if not words:
+            return root
+        if words == ("api",):
+            return api
+        if words and words[-1] == "show":
+            return show
+        if words and words[-1] == "list":
+            return jobs
+        return ""
+
+    return fake_help, calls
+
+
+_real_help, _real_which = _ad._help, __import__("shutil").which
+try:
+    __import__("shutil").which = lambda b: f"/usr/bin/{b}"
+
+    # legacy surface -- the shape this box actually has
+    _ad._help, _ = _stub_cli(_LEGACY_ROOT, _LEGACY_API)
+    s = _ad.discover(binary="codimango")
+    check("discover resolves the legacy api surface", s.task_show, ("api", "tasks", "show"))
+    check("legacy detects --no-cache", s.supports_no_cache, True)
+    check("legacy detects agentic-review", s.supports_agentic_review, True)
+    check("legacy has no --offset", s.supports_offset, False)
+
+    # replacement surface -- bare subcommands, no api
+    _ad._help, _ = _stub_cli(_NEW_ROOT, "")
+    s = _ad.discover(binary="codimango")
+    check("discover resolves the bare surface", s.task_show, ("task", "show"))
+
+    # the substring trap: "task" appears only in a DESCRIPTION
+    _ad._help, _ = _stub_cli(
+        "Usage: x\n\nCommands:\n  assets  Manage the large task assets a trial downloads.\n", ""
+    )
+    try:
+        _ad.discover(binary="codimango")
+        check("a description mentioning 'task' does not resolve a command", False, True)
+    except _ad.Unresolved:
+        check("a description mentioning 'task' does not resolve a command", True, True)
+finally:
+    _ad._help, __import__("shutil").which = _real_help, _real_which
+
+# A partial `api` surface must not resolve: `api tasks` without jobs/trials
+# would bind three subcommands, two of which fail only at call time.
+_real_help2, _real_which2 = _ad._help, __import__("shutil").which
+try:
+    __import__("shutil").which = lambda b: f"/usr/bin/{b}"
+    _ad._help, _ = _stub_cli(_LEGACY_ROOT, "Commands:\n  tasks   Task endpoints.\n")
+    try:
+        s = _ad.discover(binary="codimango")
+        check("partial api surface does not resolve to api", s.task_show, ("task", "show"))
+    except _ad.Unresolved:
+        check("partial api surface refuses rather than half-binding", True, True)
+finally:
+    _ad._help, __import__("shutil").which = _real_help2, _real_which2
+
+# Pagination: a second page must actually be requested, not refetched.
+class _FakePlatform(_ad.Platform):
+    def __init__(self, surface, identity, pages):
+        super().__init__(surface, identity)
+        self.pages, self.seen = pages, []
+
+    def _json(self, argv):
+        self.seen.append(argv)
+        return self.pages[min(len(self.seen) - 1, len(self.pages) - 1)]
+
+
+_ident = _ad.Identity(task_name="t", task_id="1", task_uuid="u")
+_surf = _ad.Surface(binary="c", jobs_list=("job", "list"), supports_offset=True)
+fp = _FakePlatform(_surf, _ident, [
+    {"jobs": [{"id": "a"}], "total": 2, "hasMore": True, "readTruncated": False},
+    {"jobs": [{"id": "b"}], "total": 2, "hasMore": False, "readTruncated": False},
+])
+got = fp.jobs(page_size=1)
+check("pagination collects both pages", [j["id"] for j in got], ["a", "b"])
+check("second call carries --offset", any("--offset" in a for a in fp.seen[1]), True)
+
+# Without an --offset flag it must refuse, not silently refetch page one.
+_surf_no = _ad.Surface(binary="c", jobs_list=("job", "list"), supports_offset=False)
+fp2 = _FakePlatform(_surf_no, _ident, [
+    {"jobs": [{"id": "a"}], "total": 9, "hasMore": True, "readTruncated": False},
+])
+try:
+    fp2.jobs(page_size=1)
+    check("no --offset flag refuses to page", False, True)
+except _ad.Unresolved as e:
+    check("no --offset flag refuses to page", "no --offset" in str(e), True)
+
+# Every subcommand actually executes.
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    repo = scratch_repo(tmp)
+    payload = tmp / "payload.json"
+    # Shaped from verified live payloads: config.agentName / config.commitSha /
+    # config.nAttempts, reviewIdentity.stage, ctrfResults.summary. A degenerate
+    # empty payload exercises none of the parsing and hides whether it works.
+    SMOKE_SHA = "0012092313ae180a663829e037869a2bbd6e16b1"
+    payload.write_text(json.dumps({
+        "task": {"validationCommitSha": SMOKE_SHA, "oracleStatus": "validated",
+                 "tbdReviewStatus": "pass", "qualitativeResult": {"overall": "GOOD", "verdict": "Accept"}},
+        "jobs": [
+            {"id": "1", "status": "completed", "createdAt": "2026-09-10T01:00:00Z",
+             "config": {"agentName": "codex", "commitSha": SMOKE_SHA, "nAttempts": 5,
+                        "modelName": "gpt-5.5", "env": {"__validation_stage": "codex"}},
+             "stats": {"passed": 2, "failed": 3, "errored": 0, "completed": 5}},
+            {"id": "2", "status": "completed", "createdAt": "2026-09-10T01:00:00Z",
+             "config": {"agentName": "claude-code", "commitSha": SMOKE_SHA, "nAttempts": 5,
+                        "modelName": "claude-opus-5", "env": {"__validation_stage": "agent"}},
+             "stats": {"passed": 2, "failed": 3, "errored": 0, "completed": 5}},
+            {"id": "9", "status": "completed", "createdAt": "2026-09-10T02:00:00Z",
+             "reviewIdentity": {"attempt": 1, "stage": "agentic-review"},
+             "config": {"agentName": "codex", "commitSha": SMOKE_SHA, "nAttempts": 1},
+             "agenticReview": {"verdict": "GOOD", "rubrics": {"summary": {"nPassed": 17, "nTotal": 17},
+                                                              "items": []}}},
+        ],
+        "trials": {
+            "1": [{"id": f"t1{i}", "status": "completed", "reward": 1.0 if i < 2 else 0.0,
+                   "modelName": "gpt-5.5",
+                   "ctrfResults": {"summary": {"tests": 11, "passed": 11 if i < 2 else 10,
+                                               "failed": 0 if i < 2 else 1}}} for i in range(5)],
+            "2": [{"id": f"t2{i}", "status": "completed", "reward": 1.0 if i < 2 else 0.0,
+                   "modelName": "claude-opus-5",
+                   "ctrfResults": {"summary": {"tests": 11, "passed": 11 if i < 2 else 10,
+                                               "failed": 0 if i < 2 else 1}}} for i in range(5)],
+        },
+        "strongest": [["gpt", "gpt-5.5"], ["opus", "claude-opus-5"]],
+        "steps": ["1"], "activeSha": SMOKE_SHA,
+    }))
+
+    invocations = [
+        (["preflight", "--json"], {0, 1}),
+        (["hash", "--repo", str(repo), "--task", "mytask"], {0}),
+        (["gate", "--repo", str(repo), "--task", "mytask", "--json"], {0, 1}),
+        (["record", "--repo", str(repo), "--task", "mytask", "--sha", "abc",
+          "--class", "corrective", "--fix", "smoke"], {0}),
+        (["bar", str(payload)], {0, 1}),
+        (["trailers", "--run-id", "r1", "--workflow", "smoke"], {0}),
+        (["install-hooks", "--repo", str(repo)], {0}),
+    ]
+    for argv, ok in invocations:
+        try:
+            rc = _cli.main(argv)
+            check(f"`benchsmith {argv[0]}` executes (rc={rc})", rc in ok, True)
+        except SystemExit as e:
+            check(f"`benchsmith {argv[0]}` executes", e.code in ok, True)
+        except Exception as e:  # noqa: BLE001 - a crash is the thing we are hunting
+            check(f"`benchsmith {argv[0]}` executes", f"{type(e).__name__}: {e}", "no exception")
+
+    # rc==0 from install-hooks proves nothing: the hook it wrote must point at a
+    # binary that exists. The first version resolved to lib/bin/benchsmith, one
+    # directory too deep, and every gate it was supposed to enforce silently
+    # never ran.
+    hook = repo / ".git" / "hooks" / "pre-push"
+    check("pre-push hook was written", hook.is_file(), True)
+    if hook.is_file():
+        import re as _re
+        m = _re.search(r'exec python3 "([^"]+)"', hook.read_text())
+        check("hook names an exec target", bool(m), True)
+        if m:
+            check("hook target exists on disk", Path(m.group(1)).is_file(), True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)
