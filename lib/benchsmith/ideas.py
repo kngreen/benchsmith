@@ -8,6 +8,7 @@ from a declared difficulty or a summary pass rate.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -354,7 +355,13 @@ def _card_description(candidate: Candidate) -> str:
     ]).rstrip()
 
 
-def _existing_card(run: _Run, idea_id: str) -> dict | None:
+def _existing_card(run: _Run, idea_id: str, board_rows: list[dict]) -> dict | None:
+    prefix = CARD_PREFIX.format(id=idea_id)
+    matches = [row for row in board_rows if str(row.get("title") or "").startswith(prefix)]
+    if len(matches) > 1:
+        raise IdeasError(f"Idea {idea_id} already has {len(matches)} cards on this GSD board")
+    if matches:
+        return matches[0]
     document = _call_json(
         run,
         ["meta", "tasks.task", "list", f"--external-identifier=aai-idea:{idea_id}",
@@ -375,63 +382,84 @@ def harvest(repo: Path, *, project: str = "", owner: str = "", limit: int = 25,
         raise IdeasError("--limit must be between 1 and 100")
     if max_cards < 1:
         raise IdeasError("--max-cards must be positive")
-    board = load_board(Path(repo))
+    repo = Path(repo).resolve()
+    board = load_board(repo)
     selector = project or str(board.get("projectId") or "")
+    card_owner = owner or str(board.get("assignee") or "")
     if not selector:
         raise IdeasError("no GSD board configured; run `benchsmith ideas init --repo . --apply`")
 
-    rows = _fetch_ideas(run, limit, idea_ids or [])
-    candidates = [candidate_from_idea(row) for row in rows]
-    planned, skipped, existing = [], [], []
-    seen_titles: set[str] = set()
-    for candidate in candidates:
-        if candidate.raw.get("track") != "tbench" or candidate.raw.get("status") != "up_for_grabs":
-            skipped.append({**candidate.as_dict(), "reason": "not an unclaimed T-Bench idea"})
-            continue
-        if not candidate.screen_ready:
-            skipped.append({**candidate.as_dict(), "reason": "missing human intake fields"})
-            continue
-        if not include_unassessed and candidate.novelty not in {"MEDIUM", "HIGH"}:
-            skipped.append({**candidate.as_dict(),
-                            "reason": "predicted novelty is not MEDIUM/HIGH; use --include-unassessed to include it"})
-            continue
-        title_key = candidate.title.casefold()
-        if title_key in seen_titles:
-            skipped.append({**candidate.as_dict(), "reason": "duplicate title in this harvest"})
-            continue
-        seen_titles.add(title_key)
-        if len(planned) >= max_cards:
-            skipped.append({**candidate.as_dict(), "reason": "max-cards limit reached"})
-            continue
-        duplicate = _existing_card(run, candidate.idea_id)
-        if duplicate:
-            existing.append({**candidate.as_dict(), "task": duplicate.get("number") or duplicate.get("id")})
-            continue
-        item = {**candidate.as_dict(), "action": "create_gsd_card"}
-        if apply:
-            argv = [
-                "meta", "tasks.task", "create",
-                f"--title={CARD_PREFIX.format(id=candidate.idea_id)}{candidate.title}",
-                f"--description={_card_description(candidate)}",
-                f"--project={selector}",
-                "--project-section-name=Needs hardness screen",
-                f"--external-identifier=aai-idea:{candidate.idea_id}",
-                "--priority=LOW", "--output=json",
-            ]
-            if owner:
-                argv.append(f"--owner={owner}")
-            created = _entity(_call_json(run, argv, f"create GSD card for idea {candidate.idea_id}"), "task")
-            item["task"] = created.get("number") or created.get("id")
-        planned.append(item)
-    return {
-        "applied": apply,
-        "project": selector,
-        "source": "Idea Exchange (human-originated seeds only)",
-        "created" if apply else "planned": planned,
-        "existing": existing,
-        "skipped": skipped,
-        "next": "run task-hardness-screen on each card; only GO cards should be marked ready to scaffold",
-    }
+    lock = None
+    if apply:
+        lock_path = repo / ".benchsmith" / "idea-harvest.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = lock_path.open("a+")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    try:
+        rows = _fetch_ideas(run, limit, idea_ids or [])
+        candidates = [candidate_from_idea(row) for row in rows]
+        board_doc = _call_json(
+            run,
+            ["meta", "tasks.gsd.task", "list", f"--project-id={selector}",
+             "--limit=500", "--output=json", "--no-truncate"],
+            "GSD board card list",
+        )
+        board_rows = _rows(board_doc, "tasks")
+        planned, skipped, existing = [], [], []
+        seen_titles: set[str] = set()
+        for candidate in candidates:
+            if candidate.raw.get("track") != "tbench" or candidate.raw.get("status") != "up_for_grabs":
+                skipped.append({**candidate.as_dict(), "reason": "not an unclaimed T-Bench idea"})
+                continue
+            if not candidate.screen_ready:
+                skipped.append({**candidate.as_dict(), "reason": "missing human intake fields"})
+                continue
+            if not include_unassessed and candidate.novelty not in {"MEDIUM", "HIGH"}:
+                skipped.append({**candidate.as_dict(),
+                                "reason": "predicted novelty is not MEDIUM/HIGH; use --include-unassessed to include it"})
+                continue
+            title_key = candidate.title.casefold()
+            if title_key in seen_titles:
+                skipped.append({**candidate.as_dict(), "reason": "duplicate title in this harvest"})
+                continue
+            seen_titles.add(title_key)
+            if len(planned) >= max_cards:
+                skipped.append({**candidate.as_dict(), "reason": "max-cards limit reached"})
+                continue
+            duplicate = _existing_card(run, candidate.idea_id, board_rows)
+            if duplicate:
+                existing.append({**candidate.as_dict(), "task": duplicate.get("number") or duplicate.get("id")})
+                continue
+            item = {**candidate.as_dict(), "action": "create_gsd_card"}
+            if apply:
+                argv = [
+                    "meta", "tasks.task", "create",
+                    f"--title={CARD_PREFIX.format(id=candidate.idea_id)}{candidate.title}",
+                    f"--description={_card_description(candidate)}",
+                    f"--project={selector}",
+                    "--project-section-name=Needs hardness screen",
+                    f"--external-identifier=aai-idea:{candidate.idea_id}",
+                    "--priority=LOW", "--output=json",
+                ]
+                if card_owner:
+                    argv.append(f"--owner={card_owner}")
+                created = _entity(_call_json(run, argv, f"create GSD card for idea {candidate.idea_id}"), "task")
+                item["task"] = created.get("number") or created.get("id")
+                board_rows.append(created)
+            planned.append(item)
+        return {
+            "applied": apply,
+            "project": selector,
+            "source": "Idea Exchange (human-originated seeds only)",
+            "created" if apply else "planned": planned,
+            "existing": existing,
+            "skipped": skipped,
+            "next": "run task-hardness-screen on each card; only GO cards should be marked ready to scaffold",
+        }
+    finally:
+        if lock is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
 
 
 def mark(repo: Path, task: str, verdict: str, *, evidence: str, core_one: str = "",

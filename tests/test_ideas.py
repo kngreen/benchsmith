@@ -87,7 +87,7 @@ Mixed folds and several signatures.
 ## Verification intent
 Replay every physical operation.""",
         }
-        run = FakeRun([response({"ideas": [row]}), response([])])
+        run = FakeRun([response({"ideas": [row]}), response([]), response([])])
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ideas.BOARD_FILE
             path.parent.mkdir()
@@ -102,7 +102,7 @@ Replay every physical operation.""",
         row = {"id": "1", "title": "Thin", "track": "tbench", "status": "up_for_grabs",
                "creator": {"username": "human"}, "noveltyLevel": "HIGH",
                "description": "Just do a thing."}
-        run = FakeRun([response({"ideas": [row]})])
+        run = FakeRun([response({"ideas": [row]}), response([])])
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ideas.BOARD_FILE
             path.parent.mkdir()
@@ -127,7 +127,7 @@ Multiple coupled states and adversarial cases.
 ## Verification intent
 Replay and compare all final states.""",
         }
-        run = FakeRun([response({"ideas": [row]})])
+        run = FakeRun([response({"ideas": [row]}), response([])])
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ideas.BOARD_FILE
             path.parent.mkdir()
@@ -135,6 +135,62 @@ Replay and compare all final states.""",
             result = ideas.harvest(Path(tmp), run=run)
         self.assertEqual(result["planned"], [])
         self.assertIn("not MEDIUM/HIGH", result["skipped"][0]["reason"])
+
+    def test_board_title_deduplicates_before_eventual_external_index(self):
+        row = {
+            "id": "252", "title": "FoldForm", "track": "tbench", "status": "up_for_grabs",
+            "creator": {"username": "human"}, "noveltyLevel": "MEDIUM",
+            "description": """A coupled layout problem.
+## Domain
+Printing
+## Capability under test
+Spatial composition
+## Why SOTA should fail this
+Later folds invalidate local choices.
+## Difficulty levers (conceptual)
+Mixed folds and several signatures.
+## Verification intent
+Replay every physical operation.""",
+        }
+        card = {"number": "T123", "title": "[T-Bench seed #252] FoldForm"}
+        run = FakeRun([response({"ideas": [row]}), response([card])])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ideas.BOARD_FILE
+            path.parent.mkdir()
+            path.write_text(json.dumps({"gsd": {"projectId": "123"}}))
+            result = ideas.harvest(Path(tmp), run=run)
+        self.assertEqual(result["planned"], [])
+        self.assertEqual(result["existing"][0]["task"], "T123")
+        self.assertEqual(len(run.calls), 2)
+
+    def test_harvest_uses_configured_assignee_for_created_card(self):
+        row = {
+            "id": "252", "title": "FoldForm", "track": "tbench", "status": "up_for_grabs",
+            "creator": {"username": "human"}, "noveltyLevel": "MEDIUM",
+            "description": """A coupled layout problem.
+## Domain
+Printing
+## Capability under test
+Spatial composition
+## Why SOTA should fail this
+Later folds invalidate local choices.
+## Difficulty levers (conceptual)
+Mixed folds and several signatures.
+## Verification intent
+Replay every physical operation.""",
+        }
+        run = FakeRun([
+            response({"ideas": [row]}), response([]), response([]),
+            response({"task": {"number": "T123"}}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ideas.BOARD_FILE
+            path.parent.mkdir()
+            path.write_text(json.dumps({"gsd": {"projectId": "123", "assignee": "owner"}}))
+            result = ideas.harvest(Path(tmp), apply=True, run=run)
+        self.assertEqual(result["created"][0]["task"], "T123")
+        create = next(call for call in run.calls if call[1:3] == ["tasks.task", "create"])
+        self.assertIn("--owner=owner", create)
 
     def test_go_requires_two_independent_cores(self):
         with tempfile.TemporaryDirectory() as tmp:

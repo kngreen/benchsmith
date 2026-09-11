@@ -1131,6 +1131,13 @@ check("bootstrap is forceable for a local worker",
 check("plan is shell-quotable", "benchsmith: t1" in _p.shell, True)
 check("task appears in the prompt, not just the title",
       any("t1" in a and "YOU MAY NOT PUSH" in a for a in _p.argv), True)
+# "Use the benchsmith skill" sends the agent hunting for a Skillbook alias that
+# does not exist; it spends a minute failing and then asks which notebook it is.
+_pt = [a for a in _p.argv if "SKILL.md" in a][0]
+check("the prompt names the SKILL.md path", "/SKILL.md" in _pt, True)
+check("...and says there is no slash command", "no `/benchsmith` slash command" in _pt, True)
+check("...and does not say 'use the benchsmith skill'",
+      "Use the benchsmith skill" in _pt, False)
 
 # Probed live: agentcloud\wire\HarnessKind rejects these two. Encoding the
 # rejection here means the skill fails loudly rather than the API failing late.

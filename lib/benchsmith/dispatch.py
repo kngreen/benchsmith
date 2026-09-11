@@ -146,11 +146,19 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
         (bootstrap_block() if bootstrap else "")
         + (resume_block(repo, task) if resume else "")
         +
-        f"Use the benchsmith skill on exactly one task: {task}, in {repo}.\n"
-        f"Run `benchsmith preflight` first and honour what it says degrades.\n"
+        # NOT "use the benchsmith skill": agentcloud resolves a skill name
+        # through SkillsService, benchsmith is registered with neither namespace
+        # it serves, and an agent told to "use the skill" burns a minute looking
+        # for an alias and then asks which notebook it is. Name the file.
+        f"Read the instructions at {benchsmith_root()}/SKILL.md and follow them. "
+        f"There is no `/benchsmith` slash command and no Skillbook alias — the "
+        f"skill is a directory on this host, and `$BENCHSMITH_BIN` above is its CLI.\n"
+        f"Work on exactly one task: {task}, in {repo}.\n"
+        'Run `"$BENCHSMITH_BIN" preflight` first and honour what it says degrades.\n'
         f"BENCHSMITH_MODE={mode}. BENCHSMITH_TARGET={target}.\n"
         "\n"
-        "YOU MAY NOT PUSH. Prepare the commit, run `benchsmith gate`, and stop.\n"
+        'YOU MAY NOT PUSH. Prepare the commit, run `"$BENCHSMITH_BIN" gate`, and stop.\n'
+        
         "Pushing is owned by the coordinator's single publish lane; a worker that "
         "pushes creates the contention this design exists to remove.\n"
         "\n"
