@@ -503,7 +503,7 @@ def verify_receipt(repo_root: Path, task_name: str) -> tuple[bool, str]:
 PRE_PUSH = """#!/bin/sh
 # benchsmith pre-push gate. Never bypass with --no-verify.
 set -eu
-exec python3 "$BENCHSMITH_LIB/../bin/benchsmith" gate --repo "$(git rev-parse --show-toplevel)" \\
+exec python3 "$BENCHSMITH_BIN" gate --repo "$(git rev-parse --show-toplevel)" \\
      --task "${BENCHSMITH_TASK:?set BENCHSMITH_TASK to the task directory name}"
 """
 
@@ -537,7 +537,7 @@ def install_hooks(repo_root: Path, lib_dir: Path) -> list[str]:
 
     hooks.mkdir(parents=True, exist_ok=True)
     target = hooks / "pre-push"
-    body = PRE_PUSH.replace("$BENCHSMITH_LIB", str(lib_dir))
+    body = PRE_PUSH.replace("$BENCHSMITH_BIN", str(Path(lib_dir).parent.parent / "bin" / "benchsmith"))
     if target.exists():
         existing = target.read_text()
         if "benchsmith pre-push gate" in existing:

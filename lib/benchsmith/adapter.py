@@ -48,6 +48,7 @@ class Surface:
     trials_artifacts: tuple[str, ...] = ()
     supports_no_cache: bool = False
     supports_agentic_review: bool = False
+    supports_offset: bool = False
     legacy: bool = True
     notes: list[str] = field(default_factory=list)
 
@@ -58,12 +59,37 @@ class Surface:
             "legacy": self.legacy,
             "supportsNoCache": self.supports_no_cache,
             "supportsAgenticReview": self.supports_agentic_review,
+            "supportsOffset": self.supports_offset,
             "notes": self.notes,
         }
 
 
 def _run(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
+def _commands(help_text: str) -> set[str]:
+    """First token of each line under a `Commands:` block.
+
+    Matched against the parsed list, never a substring of the whole help text:
+    "task" appears in the *description* of unrelated commands, so a substring
+    test resolves a command that does not exist and fails only at call time.
+    """
+    out: set[str] = set()
+    in_block = False
+    for line in help_text.splitlines():
+        stripped = line.strip()
+        if stripped.lower().rstrip(":") in {"commands", "available commands"}:
+            in_block = True
+            continue
+        if in_block:
+            if not line.startswith((" ", "\t")):
+                if stripped:
+                    in_block = False
+                continue
+            if stripped and not stripped.startswith("-"):
+                out.add(stripped.split()[0])
+    return out
 
 
 def _help(binary: str, *words: str) -> str:
@@ -132,7 +158,9 @@ def discover(binary: str | None = None, site: str | None = None) -> Surface:
     surface.supports_no_cache = "--no-cache" in show_help
     if not surface.supports_no_cache:
         surface.notes.append("no --no-cache flag; reads may be served from cache")
-    surface.supports_agentic_review = "--include-agentic-review" in _help(binary, *surface.jobs_list)
+    jobs_help = _help(binary, *surface.jobs_list)
+    surface.supports_agentic_review = "--include-agentic-review" in jobs_help
+    surface.supports_offset = "--offset" in jobs_help
     return surface
 
 
@@ -191,11 +219,18 @@ class Platform:
         collected: list = []
         offset = 0
         while True:
-            argv = self._argv(
-                self.surface.jobs_list,
-                self.identity.task_name,
-                extra=("--limit", str(page_size), *extra),
-            )
+            page_flags = ("--limit", str(page_size))
+            if offset and self.surface.supports_offset:
+                page_flags += ("--offset", str(offset))
+            elif offset:
+                # Cannot page without an offset flag; refuse rather than refetch
+                # page one forever and silently return duplicates.
+                raise Unresolved(
+                    f"job list has more pages but this CLI exposes no --offset; "
+                    f"got {len(collected)} of {total} jobs"
+                )
+            argv = self._argv(self.surface.jobs_list, self.identity.task_name,
+                              extra=(*page_flags, *extra))
             out = self._json(argv)
             if isinstance(out, list):
                 return out
