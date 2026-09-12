@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from . import fixtures as fixtures_mod
+from . import fetchrepo as fetch_mod
 from . import gate as gate_mod
 from . import ideas as ideas_mod
 from . import preflight as preflight_mod
@@ -828,9 +829,23 @@ def cmd_reviewfleet(args) -> int:
             continue
         target = info.get("repo")
         if not target:
-            plans.append({"task": item.task,
-                          "skipped": "no checkout on this host holds it; a review needs the tree"})
-            continue
+            # A review queue is mostly other people's repositories -- ten
+            # assigned reviews here span three, none of them checked out.
+            # Skipping is the wrong answer when the tree is a clone away.
+            src = str(next((r.get("sourceRepo") for r in rows
+                            if str(r.get("name")) == item.task), "") or "")
+            got = fetch_mod.ensure(src, sha=str(next(
+                (r.get("validationCommitSha") or r.get("commitSha") for r in rows
+                 if str(r.get("name")) == item.task), "") or "")) if src else {
+                "ok": False, "reason": "the task record names no source repository"}
+            if not got.get("ok"):
+                plans.append({"task": item.task,
+                              "skipped": f"no checkout and could not fetch one: {got.get('reason')}"})
+                continue
+            target = got["path"]
+            entry_fetched = got.get("reused") is False
+        else:
+            entry_fetched = False
         try:
             p = dispatch_mod.plan(item.task, target, mode="review",
                                   idea={"track": item.track, "due": item.due})
@@ -866,7 +881,7 @@ def cmd_reviewfleet(args) -> int:
                 continue
         entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
                  "repo": target, "worktree": work_in if work_in != target else None,
-                 "track": item.track, "due": item.due}
+                 "track": item.track, "due": item.due, "clonedForReview": entry_fetched}
         if args.apply:
             print(f"[{n}/{len(ready)}] review {item.task}…", file=sys.stderr, flush=True)
             res = dispatch_mod.run(p, apply=True)

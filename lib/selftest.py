@@ -4473,5 +4473,73 @@ check("an injected runner converts a timeout like the real path",
       .split("if self._run is not None:")[1][:400], True)
 
 
+# --- a review queue is mostly other people's repositories ---------------------
+#
+# Ten assigned reviews span three repos, none checked out here. review-fleet
+# skipped all ten for "no checkout on this host holds it" -- the wrong answer
+# when the tree is a clone away, and a reviewer that cannot read the task cannot
+# review it.
+
+from benchsmith import fetchrepo as fr  # noqa: E402
+
+check("an https github url becomes the cert-backed ssh form",
+      fr.ssh_url("https://github.com/codimango/swe-bench-pro-ios-ssardar"),
+      "org-272075201@github.com:codimango/swe-bench-pro-ios-ssardar.git")
+check("...with .git tolerated",
+      fr.ssh_url("https://github.com/codimango/x.git").endswith("codimango/x.git"), True)
+check("a non-github reference is refused", fr.ssh_url("not-a-url"), "")
+
+# Reviewer checkouts live apart from the author's. Mixing them would put
+# somebody else's repo into the pool a worker could be dispatched to harden in.
+check("review checkouts are a separate root",
+      fr.DIRNAME != ".benchsmith-worktrees" and "review" in fr.DIRNAME, True)
+check("a hostile repo name cannot escape the root",
+      fr.path_for("https://github.com/o/../../etc"), None)
+
+_calls5 = []
+
+
+def _clone_ok(argv, cwd=None):
+    _calls5.append(argv)
+    class R:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+    return R
+
+
+_base = Path(tempfile.mkdtemp())
+_r10 = fr.ensure("https://github.com/codimango/demo", sha="abc", base=_base, runner=_clone_ok)
+check("an absent repo is cloned", _r10["ok"], True)
+check("...shallowly, because a reviewer never writes history",
+      any("--depth" in a for a in _calls5[0]), True)
+check("...and not reused", _r10["reused"], False)
+
+# An existing checkout may hold another reviewer's in-flight read; re-cloning it
+# would be minutes for nothing.
+(_base / fr.DIRNAME / "demo" / ".git").mkdir(parents=True, exist_ok=True)
+_calls5.clear()
+_r11 = fr.ensure("https://github.com/codimango/demo", base=_base, runner=_clone_ok)
+check("an existing checkout is reused, not recloned", _r11["reused"], True)
+check("...and no clone was run", any("clone" in a for a in _calls5), False)
+
+
+def _clone_fails(argv, cwd=None):
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "Repository not found"
+    return R
+
+
+check("a failed fetch is reported, not silently skipped",
+      fr.ensure("https://github.com/codimango/nope", base=Path(tempfile.mkdtemp()),
+                runner=_clone_fails)["ok"], False)
+
+_rf2 = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text()
+check("review-fleet fetches a missing checkout rather than skipping",
+      "could not fetch one" in _rf2, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

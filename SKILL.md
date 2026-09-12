@@ -413,6 +413,12 @@ excluded by name — it belongs in their queue, and showing it in both double-co
 A task whose validation is still pending is held: a review of moving evidence cites numbers that
 change under it.
 
+**Most of a review queue is somebody else's repository.** Ten assigned reviews here span three,
+none of them checked out locally. A missing tree is fetched — shallow, read-only, into
+`~/.benchsmith-review-checkouts/`, kept apart from the repositories you author in so nobody's
+review copy ends up in the pool a hardening worker is dispatched to. A fetch that fails is
+reported; the review is not silently dropped.
+
 Each worker runs the canonical track reviewer, then `codimango-review-critic` as the second pass.
 Where a track has **no** canonical reviewer — iOS today — that is reported, never substituted:
 another track's rubric assumes a different task shape and produces confident findings about the
