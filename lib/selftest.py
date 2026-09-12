@@ -3744,10 +3744,26 @@ check("landscape never fetches submitted task instructions",
 import socket as _sock  # noqa: E402
 
 _here = _sock.gethostname()
+
+
+def _dead_pid() -> int:
+    """A pid that is provably dead: fork, reap, reuse its number.
+
+    A hardcoded number is a coin flip -- 999999 was briefly live and two
+    liveness fixtures failed for a reason unrelated to the code they test.
+    """
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    os.waitpid(pid, 0)
+    return pid
+
+
+_DEADPID = _dead_pid()
 _mine = rl.parse_owner(f"uuid=a host={_here} pid={os.getpid()} task=t acquired=9")
 check("this process owns its own lease", _mine.mine, True)
 
-_dead = rl.parse_owner(f"uuid=a host={_here} pid=999999 task=t acquired=9")
+_dead = rl.parse_owner(f"uuid=a host={_here} pid={_DEADPID} task=t acquired=9")
 check("a dead process on this host is reclaimable", _dead.holder_is_gone, True)
 check("...but is not 'mine'", _dead.mine, False)
 
@@ -3889,14 +3905,14 @@ check("claims that never dispatched are released",
 # under live workers. Worse than having no lease at all.
 
 _h2h = _sock.gethostname()
-_dispatcher_only = rl.parse_owner(f"uuid=a host={_h2h} pid=999999 task=t acquired=9")
-_bound = rl.parse_owner(f"uuid=a host={_h2h} pid=999999 task=t acquired=9 session=sess-1")
+_dispatcher_only = rl.parse_owner(f"uuid=a host={_h2h} pid={_DEADPID} task=t acquired=9")
+_bound = rl.parse_owner(f"uuid=a host={_h2h} pid={_DEADPID} task=t acquired=9 session=sess-1")
 
 check("a dispatcher-only lease with a dead pid is reclaimable",
       _dispatcher_only.holder_is_gone, True)
 check("a lease bound to a worker session is NOT",
       _bound.holder_is_gone, False)
-check("...even though its recorded pid is long dead", _bound.pid, 999999)
+check("...even though its recorded pid is long dead", _bound.pid, _DEADPID)
 check("the session is carried in the token", _bound.session, "sess-1")
 check("...and reported to a caller", rl.parse_owner(
     f"host={_h2h} pid=1 session=s9 acquired=9").as_dict()["session"], "s9")
@@ -4392,16 +4408,17 @@ check("the critic's description leads with the no-task case", "NO task" in _cdes
 check("...and carries no double quotes for the frontmatter parser",
       chr(34) in _cdesc.split("---")[0], False)
 
-check("a bare critic invocation runs the queue", "review-fleet --apply" in _critic, True)
-# Telling an agent to run a command that is not on PATH is the same failure as
-# telling it to run one that does not exist: it reported the queue unworkable.
-check("...after locating the dispatcher, which is not on PATH",
-      "$BENCHSMITH_BIN" in _critic and "command -v benchsmith" in _critic, True)
-check("...and off-host means attach, not give up",
-      "Attach that devserver and retry once" in _critic, True)
+# The dependency runs one way: benchsmith invokes the critic as its required
+# second pass (§10a). The critic must not invoke benchsmith -- a review skill
+# that needs an authoring tool installed is not independent, and it stopped
+# outright when that tool was absent.
+check("the critic does not depend on benchsmith", "benchsmith" in _critic, False)
+check("...and works its own queue", "tasks list --reviewing" in _critic, True)
+check("...dispatching one fresh session per task",
+      "one fresh session per task" in _critic, True)
 check("...and is told not to describe it", "Do not describe it" in _critic, True)
-check("...naming printing-a-command as the failure",
-      "failed invocation" in _critic, True)
+check("...naming delegation as a non-answer",
+      "do not delegate to another tool" in _critic, True)
 # Enumerating is the dispatcher's job; reviewing after enumerating is not.
 check("the dispatcher must not then review in the same session",
       "do not then review a task yourself" in _critic, True)
