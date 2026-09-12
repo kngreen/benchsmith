@@ -60,6 +60,11 @@ HANDOFF_FIELDS = ("work_item", "state", "base_sha", "commit_sha", "gate_receipt"
 HANDOFF_DIR = ".benchsmith/handoff"
 HANDOFF_STATES = frozenset({
     "ready_to_publish", "blocked", "needs_human", "no_change", "failed", "in_progress",
+    # The commit is published and the platform is chewing on it. A wave takes
+    # tens of minutes to hours; a worker that sits through one holds a slot,
+    # burns context, and learns nothing it could not learn on arrival. It hands
+    # the SHA back and the coordinator re-dispatches when the wave lands.
+    "awaiting_validation",
 })
 
 

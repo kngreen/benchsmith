@@ -190,6 +190,32 @@ rebase to a worker meant that by the time the worker answered, main had moved ag
 round four times before landing, and every lap was real work that was stale on arrival. Only a
 rebase that actually moves the task's tree needs fresh evidence.
 
+### Nobody waits on a wave
+
+Codimango is the largest wall-clock cost here, and a worker that sits through a validation wave
+holds a slot for tens of minutes to hours while learning nothing it could not read on arrival. One
+run spent 48 minutes and then 1h32m exactly that way.
+
+A worker whose commit has been published returns **`state=awaiting_validation`** with the SHA and
+stops. You watch, cheaply:
+
+```bash
+benchsmith watch --repo REPO --task TASK-NAME --sha SHA --pushed-at UNIXTIME
+```
+
+| State | What it means | What you do |
+|---|---|---|
+| `absent` | the platform has not imported it | wait; at 45 minutes it reports `orphaned` and one `rerun` is authorised |
+| `running` | the wave is in flight | wait |
+| `terminal` | finished, pass **or** fail | start a fresh worker to read every signal |
+| `unknown` | could not read, or an unrecognised status | resolve it; do not treat it as either |
+
+Only `terminal` exits zero. A fresh worker arrives with a clean context and reads the finished
+evidence in one pass, which is strictly better than one that spent an hour watching it accumulate.
+
+**This applies in fleet mode only.** A single-task invocation has no slot to free and should stay
+in-session through STEP 7.
+
 ### A hold on the branch, not on one task
 
 ```bash

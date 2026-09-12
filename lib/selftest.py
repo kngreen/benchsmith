@@ -21,6 +21,7 @@ os.environ["BENCHSMITH_NO_DISPATCH"] = "1"
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -4296,6 +4297,62 @@ check("the rebase carry-forward is documented", "needsRegate: false" in _docs, T
 check("rerun resolves its verb from the installed CLI",
       "discover" in Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/rerun.py").read_text(),
       True)
+
+
+# --- waiting on a wave must not cost a worker slot ---------------------------
+#
+# Codimango is the largest wall-clock cost in the loop. A worker that sits
+# through a wave holds a slot for tens of minutes to hours and learns nothing it
+# could not read on arrival -- observed at 48m and 1h32m in one run.
+
+from benchsmith import watch as wch  # noqa: E402
+
+check("awaiting_validation is a handoff state",
+      "awaiting_validation" in dsp.HANDOFF_STATES, True)
+check("...and parses",
+      dsp.parse_handoff('{"state":"awaiting_validation","commit_sha":"abc"}')["state"],
+      "awaiting_validation")
+
+_saved9 = wch._read
+try:
+    wch._read = lambda task, binary="codimango": ({"validationCommitSha": "other",
+                                                   "validationStatus": "passing"}, "")
+    _w1 = wch.state("t", "mine")
+    check("a commit the platform has not imported is absent", _w1["state"], wch.ABSENT)
+    check("...and names what the platform does have", _w1["platformSha"], "other")
+    # 45 minutes with no import is orphaned, not merely slow.
+    check("a long-absent commit is called orphaned",
+          wch.state("t", "mine", pushed_at=time.time() - 50 * 60)["orphaned"], True)
+    check("a recently pushed one is not",
+          wch.state("t", "mine", pushed_at=time.time() - 60)["orphaned"], False)
+
+    wch._read = lambda task, binary="codimango": ({"validationCommitSha": "mine",
+                                                   "validationStatus": "pending"}, "")
+    check("an in-flight wave is running", wch.state("t", "mine")["state"], wch.RUNNING)
+
+    wch._read = lambda task, binary="codimango": ({"validationCommitSha": "mine",
+                                                   "validationStatus": "failed"}, "")
+    _term = wch.state("t", "mine")
+    check("a finished wave is terminal", _term["state"], wch.TERMINAL)
+    # Terminal includes failed: there is something to act on either way.
+    check("...including a failed one", _term["validation"], "failed")
+
+    wch._read = lambda task, binary="codimango": ({}, "offline")
+    check("an unreadable platform is unknown, not running",
+          wch.state("t", "mine")["state"], wch.UNKNOWN)
+    wch._read = lambda task, binary="codimango": ({"validationCommitSha": "mine",
+                                                   "validationStatus": "wat"}, "")
+    check("an unrecognised status is unresolved, not terminal",
+          wch.state("t", "mine")["state"], wch.UNKNOWN)
+finally:
+    wch._read = _saved9
+
+# A successor with no lease is a second worker on a task somebody still owns.
+_relsrc = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text()
+_rel = _relsrc[_relsrc.index("def cmd_relieve"):_relsrc.index("def cmd_status")]
+check("relieve claims the lease before starting a successor", "RemoteLease" in _rel, True)
+check("...binds it to the new session", "lease.bind(sid)" in _rel, True)
+check("...and releases it if no worker started", "lease.release()" in _rel, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

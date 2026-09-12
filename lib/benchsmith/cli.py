@@ -36,6 +36,7 @@ from . import reviewreport as rr_mod
 from . import reviews as reviews_mod
 from . import rerun as rerun_mod
 from . import resolve as resolve_mod
+from . import watch as watch_mod
 from . import worktree as wt_mod
 from . import publish as publish_mod
 from . import sources
@@ -645,9 +646,26 @@ def cmd_relieve(args) -> int:
         except wt_mod.WorktreeRefused as e:
             _out({**out, "successor": None, "reason": f"worktree: {e}"})
             return 2
+    # The replacement needs the claim too. Starting one without a lease is how
+    # a "replacement" becomes a second worker on a task somebody still owns.
+    lease = None
+    if not args.no_remote_lease:
+        try:
+            lease = rlease_mod.RemoteLease(args.task, info.get("repo") or repo)
+            got = lease.acquire()
+        except rlease_mod.LeaseLost as e:
+            _out({**out, "successor": None, "reason": f"remote lease unreadable: {e}"})
+            return 2
+        if not got.get("held"):
+            _out({**out, "successor": None,
+                  "reason": f"not claiming a successor: {got.get('reason', 'lease held')}",
+                  "owner": got.get("owner")})
+            return 2
     try:
         p = dispatch_mod.plan(args.task, work_in, mode=info.get("mode", "harden"))
     except dispatch_mod.DispatchRefused as e:
+        if lease is not None:
+            lease.release()
         _out({**out, "successor": None, "reason": str(e)})
         return 2
     if not args.apply:
@@ -657,6 +675,12 @@ def cmd_relieve(args) -> int:
     sid = dispatch_mod.session_id(res.get("stdout") or "")
     if sid and not args.no_snooze:
         dispatch_mod.snooze(sid)
+    if lease is not None:
+        if sid:
+            lease.bind(sid)
+        else:
+            # No session means no worker; holding the claim would strand the task.
+            lease.release()
     _out({**out, "successor": sid, "applied": True,
           "note": "the successor resumes from the journal, not from the old session"})
     return 0
@@ -876,6 +900,14 @@ def cmd_causal(args) -> int:
     j = Journal.open(Path(args.repo), args.task)
     _out(causal_mod.assess(j.data.get("rounds") or []).as_dict())
     return 0
+
+
+def cmd_watch(args) -> int:
+    """Has the wave for this exact SHA landed? One cheap read, not a held slot."""
+    res = watch_mod.state(args.task, args.sha, pushed_at=args.pushed_at or None)
+    _out(res)
+    # Only `terminal` means there is something new to act on.
+    return 0 if res["state"] == watch_mod.TERMINAL else 1
 
 
 def cmd_collect(args) -> int:
@@ -1260,6 +1292,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--session-id", default="")
     s.add_argument("--apply", action="store_true")
     s.add_argument("--no-successor", action="store_true", help="end it without replacing it")
+    s.add_argument("--no-remote-lease", action="store_true")
     s.add_argument("--no-snooze", action="store_true")
     s.add_argument("--shared-tree", action="store_true")
     s.set_defaults(fn=cmd_relieve)
@@ -1267,6 +1300,12 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("status", help="what every dispatched worker is doing")
     s.add_argument("--repo", default=".")
     s.set_defaults(fn=cmd_status)
+
+    s = common(sub.add_parser("watch", help="has the wave for this SHA landed?"))
+    s.add_argument("--sha", required=True)
+    s.add_argument("--pushed-at", type=float, default=0.0,
+                   help="unix time of the push, so a stalled import can be called orphaned")
+    s.set_defaults(fn=cmd_watch)
 
     s = sub.add_parser("collect", help="read a worker session and return its handoff")
     s.add_argument("--session-id", required=True)
