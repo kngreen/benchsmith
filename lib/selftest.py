@@ -4641,5 +4641,32 @@ _nolink = rrp.render(rrp.collect(_plans, links=False))
 check("a host path is labelled as on-host", "(on host)" in _nolink, True)
 
 
+# --- never ask for a credential ----------------------------------------------
+#
+# A reviewer in a fresh container could not authenticate and asked the user to
+# open an OAuth page and upload the token as a file. A credential pasted into a
+# session is stored in that conversation, its journal, and anything indexing
+# either -- and the request itself is the bug: the fix is placement, not access.
+
+_bb2 = dsp.bootstrap_block()
+check("workers are told never to ask for a credential",
+      "Never ask for a credential" in _bb2, True)
+check("...including read-only and just-once", "not read-only, not once" in _bb2, True)
+check("...and are told it is a placement problem",
+      "fresh container rather than on the host" in _bb2, True)
+check("...with blocked as the answer", "state=blocked" in _bb2, True)
+check("...and are told not to mint one", "mint a token" in _bb2, True)
+
+_critic2 = " ".join(Path("/home/kngreen/.claude/skills/codimango-review-critic/SKILL.md")
+                    .read_text().split())
+check("the critic carries the same rule", "Never ask for a credential" in _critic2, True)
+check("...naming what must not be asked for",
+      all(w in _critic2 for w in ("token", "cookie", "OIDC", "API key")), True)
+check("...and tells spawned children to attach the host first",
+      "Attach the devserver where codimango is authenticated" in _critic2, True)
+check("...so a child does not rediscover it the hard way",
+      "not on an authenticated host" in _critic2, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

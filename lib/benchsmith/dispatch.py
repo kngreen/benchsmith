@@ -179,6 +179,12 @@ def bootstrap_block(root: str | None = None) -> str:
         "once. If you still cannot reach it, report `state=blocked` saying so and stop -- being "
         "off-host is the finding, not something to work around, and cloning from GitHub will only "
         "produce a misleading 403.\n\n"
+        "**Never ask for a credential.** Not a token, cookie, OIDC value, API key, or a file "
+        "containing one; not to unblock yourself, not read-only, not once. A credential pasted "
+        "into a session is stored in that conversation and its journal. If `codimango` cannot "
+        "authenticate you are in a fresh container rather than on the host that holds the "
+        "credential -- attach the host, or report `state=blocked` saying you are not on an "
+        "authenticated one. Do not open a login page or mint a token.\n\n"
         "Never improvise a substitute for the gate: an ungated push is the failure this exists "
         "to prevent.\n\n"
     )
