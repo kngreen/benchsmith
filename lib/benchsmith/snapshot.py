@@ -745,11 +745,27 @@ def _agentic_row(jobs: list[dict], active_sha: str) -> tuple[Review, list[str]]:
     )
 
 
-def review_manifest(task: dict, jobs: list[dict], active_sha: str, required=REQUIRED_REVIEWS):
+def _critic_row(receipt: dict | None, active_sha: str) -> Review:
+    if not receipt:
+        return Review(name="review-critic", state="absent")
+    sha = str(receipt.get("sha") or "")
+    return Review(
+        name="review-critic",
+        state="completed",
+        verdict=str(receipt.get("decision") or ""),
+        job_id=str(receipt.get("session_id") or ""),
+        reviewed_sha=sha,
+        selection="exact-head" if sha and sha == active_sha else "fallback",
+        stale=not bool(sha and sha == active_sha),
+    )
+
+
+def review_manifest(task: dict, jobs: list[dict], active_sha: str, required=REQUIRED_REVIEWS,
+                    critic_receipt: dict | None = None):
     """One row per required review. A missing row is a missing pass, not silence."""
     agentic, failed_rubrics = _agentic_row(jobs, active_sha)
     rows = [_tbr_row(task, active_sha), agentic, _quality_row(task, active_sha),
-            _oracle_row(task, active_sha)]
+            _critic_row(critic_receipt, active_sha), _oracle_row(task, active_sha)]
     if failed_rubrics:
         agentic.verdict = f"{agentic.verdict} [FAIL: {', '.join(failed_rubrics)}]"
     known = {r.name for r in rows}
@@ -758,7 +774,7 @@ def review_manifest(task: dict, jobs: list[dict], active_sha: str, required=REQU
 
 
 def build(task: dict, jobs: list[dict], trials_by_job: dict, *, strongest, steps, active_sha,
-          categories=(), covers=None):
+          categories=(), covers=None, critic_receipt=None):
     """Assemble a Measurement from platform records.
 
     Job selection is coverage-scoped and cohort-deduplicated first: the task
@@ -776,7 +792,7 @@ def build(task: dict, jobs: list[dict], trials_by_job: dict, *, strongest, steps
         plan=plan,
         rows=rows,
         active_sha=active_sha,
-        reviews=review_manifest(task, jobs, active_sha),
+        reviews=review_manifest(task, jobs, active_sha, critic_receipt=critic_receipt),
     )
     m.selection_notes = notes
     return m

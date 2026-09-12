@@ -42,6 +42,8 @@ PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags",
                  "diff-ratchet", "diff-weakening", "contamination",
                  # A repair that addressed nothing is not a repair.
                  "review-findings")
+CONTROL_REQUIRED = ("control-manifest", "obligation-witnesses", "mutation-adequacy",
+                    "metamorphic-variation", "verifier-closure")
 
 
 @dataclass
@@ -73,6 +75,7 @@ class Check:
 @dataclass
 class Report:
     checks: list[Check] = field(default_factory=list)
+    artifacts: dict = field(default_factory=dict)
 
     def add(self, *a, **kw) -> None:
         self.checks.append(Check(*a, **kw))
@@ -102,6 +105,7 @@ class Report:
             "blockedByNotRun": [c.name for c in self.checks
                                 if c.required and c.state == NOT_RUN],
             "timedOut": [c.name for c in self.checks if c.state == TIMEOUT],
+            "artifacts": self.artifacts,
         }
 
     def render(self) -> str:
@@ -666,6 +670,69 @@ def check_structural(task_dir: Path, report: Report, binary: str = "codimango") 
                else f"{len(checks)} upstream check(s) pass{note}")
 
 
+def check_control_manifest(repo_root: Path, task_dir: Path, task_name: str,
+                           report: Report, *, mutation_runner=None,
+                           closure_runner=None, metamorphic_runner=None) -> None:
+    """Resolve declared, detected, and policy-required controls, then fire them."""
+    from . import controls
+
+    resolved = controls.resolve(repo_root, task_name, task_dir)
+    report.artifacts["controlManifest"] = resolved
+    if resolved["mode"] == "shadow" and not resolved.get("digest"):
+        report.add("control-manifest", PASS,
+                   resolved["reason"] + "; shadow-only, 0 obligations examined")
+        for name in ("obligation-witnesses", "mutation-adequacy",
+                     "metamorphic-variation", "verifier-closure"):
+            report.add(name, NOT_RUN, "shadow-only legacy task; 0 inputs examined", blocking=False)
+        return
+    if not resolved["ok"]:
+        state = FAIL if resolved["mode"] == "enforce" else NOT_RUN
+        detail = "; ".join(resolved["errors"]) or resolved["reason"]
+        if state == NOT_RUN:
+            detail += "; shadow policy, 0 obligations examined"
+        report.add("control-manifest", state, detail,
+                   required=resolved["mode"] == "enforce", blocking=resolved["mode"] == "enforce")
+        for name in ("obligation-witnesses", "mutation-adequacy",
+                     "metamorphic-variation", "verifier-closure"):
+            report.add(name, FAIL if state == FAIL else NOT_RUN,
+                       "manifest unresolved" if state == FAIL else
+                       "shadow policy; 0 inputs examined",
+                       required=resolved["mode"] == "enforce",
+                       blocking=resolved["mode"] == "enforce")
+        return
+
+    report.add("control-manifest", PASS,
+               f"{resolved['examined']} obligation(s), effective {', '.join(resolved['effective'])}",
+               required=True)
+    witnesses = controls.obligation_witnesses(task_dir, resolved)
+    report.artifacts["obligationWitnesses"] = witnesses
+    report.add("obligation-witnesses", PASS if witnesses["ok"] else FAIL,
+               witnesses["detail"] + f"; examined {witnesses['examined']}", required=True)
+    mutation = controls.mutation_adequacy(task_dir, resolved, runner=mutation_runner)
+    report.artifacts["mutationAdequacy"] = mutation
+    report.add("mutation-adequacy", PASS if mutation["ok"] else
+               (FAIL if resolved["mode"] == "enforce" else PASS),
+               mutation["detail"] + f"; examined {mutation['examined']}", required=True)
+
+    if "metamorphic_variation" in resolved["effective"]:
+        metamorphic = controls.run_metamorphic(task_dir, resolved, runner=metamorphic_runner)
+        report.artifacts["metamorphicVariation"] = metamorphic
+        report.add("metamorphic-variation", PASS if metamorphic["ok"] else FAIL,
+                   metamorphic["detail"] + f"; examined {metamorphic['examined']}", required=True)
+    else:
+        report.add("metamorphic-variation", PASS,
+                   "not applicable by effective manifest; 0 inputs examined", required=True)
+
+    if "candidate_execution" in resolved["effective"]:
+        closure = controls.verifier_closure(task_dir, resolved, runner=closure_runner)
+        report.artifacts["verifierClosure"] = closure
+        report.add("verifier-closure", PASS if closure["ok"] else FAIL,
+                   closure["detail"] + f"; examined {closure['examined']}", required=True)
+    else:
+        report.add("verifier-closure", PASS,
+                   "no candidate-influenced execution detected; 0 probes examined", required=True)
+
+
 def check_diff(repo_root: Path, report: Report) -> None:
     """Staged-vs-HEAD checks: is this change worse than the last one?
 
@@ -750,6 +817,8 @@ def run(
     check_fixture_corpus(task_dir, report)
     check_contamination(repo_root, report)
     check_untracked_deps(repo_root, report)
+    check_control_manifest(repo_root, task_dir, task_name, report)
+    check_structural(task_dir, report)
     check_diff(repo_root, report)
     check_formatting(repo_root, report, hook_specs)
     check_hygiene(task_dir, report)
@@ -844,7 +913,10 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
     if not report.ok:
         return {"state": "not_written", "reason": "gate did not pass"}
     by_name = {c.name: c for c in report.checks}
-    unsafe = [name for name in PUSH_REQUIRED
+    required_checks = list(PUSH_REQUIRED)
+    if (report.artifacts.get("controlManifest") or {}).get("mode") == "enforce":
+        required_checks.extend(CONTROL_REQUIRED)
+    unsafe = [name for name in required_checks
               if name not in by_name or by_name[name].state != PASS]
     if unsafe:
         return {"state": "not_written",
@@ -870,9 +942,15 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
         "ok": True,
         "checks": {c.name: c.state for c in report.checks},
         "notRun": [c.name for c in report.checks if c.state == NOT_RUN],
+        "artifacts": report.artifacts,
         "source": "canonical" if canonical_receipt(repo_root) else "benchsmith-native-fallback",
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    resolved = report.artifacts.get("controlManifest") or {}
+    if resolved:
+        from . import controls
+
+        body["cacheIdentity"] = controls.cache_identity(tree, resolved, report.artifacts)
     if derived_from:
         body["derivedFrom"] = derived_from
     body["digest"] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
@@ -900,7 +978,10 @@ def _receipt_body(repo_root: Path, task_name: str) -> tuple[dict | None, str]:
         return None, "receipt digest does not match its contents"
     if not body.get("ok"):
         return None, "receipt records a failing gate"
-    unsafe = [name for name in PUSH_REQUIRED if (body.get("checks") or {}).get(name) != PASS]
+    required_checks = list(PUSH_REQUIRED)
+    if ((body.get("artifacts") or {}).get("controlManifest") or {}).get("mode") == "enforce":
+        required_checks.extend(CONTROL_REQUIRED)
+    unsafe = [name for name in required_checks if (body.get("checks") or {}).get(name) != PASS]
     if unsafe:
         return None, "receipt lacks passing push-required checks: " + ", ".join(unsafe)
     try:
@@ -972,6 +1053,7 @@ def carry_receipt(repo_root: Path, task_name: str, candidate: str) -> dict:
     check_diff(repo_root, report)
     check_contamination(repo_root, report)
     check_findings(task_name, Journal.open(repo_root, task_name), report)
+    check_control_manifest(repo_root, repo_root / task_name, task_name, report)
     report.require(PUSH_REQUIRED)
     if not report.ok:
         return {"ok": False, "reason": "candidate controls did not pass", "report": report.as_dict()}

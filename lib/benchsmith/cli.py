@@ -25,6 +25,8 @@ from . import preflight as preflight_mod
 from . import backoff as backoff_mod
 from . import config as config_mod
 from . import coverage
+from . import critic_receipt as critic_mod
+from . import controls as controls_mod
 from . import hold as hold_mod
 from . import hooks as hooks_mod
 from . import dispatch as dispatch_mod
@@ -148,6 +150,10 @@ def cmd_bar(args) -> int:
     covers = None
     if args.repo and args.task:
         covers = coverage.covers_factory(Path(args.repo).resolve(), args.task)
+    critic = None
+    if args.repo and args.task:
+        critic, _ = critic_mod.load(Path(args.repo).resolve(), args.task,
+                                    raw.get("activeSha") or args.sha or "")
     m = build(
         raw.get("task") or {},
         raw.get("jobs") or [],
@@ -157,6 +163,7 @@ def cmd_bar(args) -> int:
         active_sha=raw.get("activeSha") or args.sha or "",
         categories=tuple(raw.get("categories") or ()),
         covers=covers,
+        critic_receipt=critic,
     )
     all_trials = [t for lst in (raw.get("trials") or {}).values() for t in lst]
     result = evaluate(m, target=args.target)
@@ -1158,25 +1165,63 @@ def cmd_publish(args) -> int:
     repo = Path(args.repo).resolve()
     handoff = json.loads(Path(args.handoff).read_text()) if args.handoff else json.load(sys.stdin)
     lane = publish_mod.Lane(repo, run_id=args.run_id)
+    lease = None
     try:
-        _out(publish_mod.publish(repo, args.task, handoff, remote=args.remote,
-                                 branch=args.branch, lane=lane, apply=args.apply,
-                                 rebase=args.rebase,
-                                 allow_review_status=args.allow_review_status))
+        if args.apply and not args.no_remote_lease:
+            lease = rlease_mod.RemoteLease(args.task, repo, remote=args.remote)
+            claim = lease.acquire()
+            if not claim.get("held"):
+                raise publish_mod.PublishRefused(
+                    "publication could not claim the task lease: "
+                    + str(claim.get("reason") or claim.get("owner") or "unknown lease state")
+                )
+        result = publish_mod.publish(repo, args.task, handoff, remote=args.remote,
+                                     branch=args.branch, lane=lane, apply=args.apply,
+                                     rebase=args.rebase,
+                                     allow_review_status=args.allow_review_status,
+                                     remote_lease=lease)
+        _out(result)
+        if args.apply and result.get("ok") is False:
+            return 2
     except publish_mod.PublishRefused as e:
         _out({"ok": False, "reason": str(e)})
         return 2
+    finally:
+        if lease is not None and lease.sha and lane.pending() is None:
+            lease.release()
     return 0
+
+
+def cmd_critic_receipt(args) -> int:
+    result = critic_mod.ingest(Path(args.repo).resolve(), args.task, args.sha, args.session_id)
+    _out(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_controls(args) -> int:
+    repo = Path(args.repo).resolve()
+    result = controls_mod.resolve(repo, args.task, repo / args.task)
+    _out(result)
+    return 0 if result.get("ok") else 1
 
 
 def cmd_reconcile(args) -> int:
     """After a crash: did the pending push land?"""
     repo = Path(args.repo).resolve()
-    res = publish_mod.Lane(repo, run_id=args.run_id).reconcile(repo)
+    lane = publish_mod.Lane(repo, run_id=args.run_id)
+    pending = lane.pending()
+    res = lane.reconcile(repo)
+    if res["state"] == publish_mod.LANDED and pending and pending.lease_sha:
+        lease = rlease_mod.RemoteLease(pending.task, repo, remote=pending.remote)
+        released = lease.release(pending.lease_sha)
+        res["leaseRelease"] = released
+        if released.get("released"):
+            lane.clear_intent()
     _out(res)
     # `unknown` must not read as success -- a caller that retries on 0 would
     # double-push exactly when it is least able to tell.
-    return 0 if res["state"] in ("clean", publish_mod.NOT_LANDED, publish_mod.LANDED) else 1
+    lease_ok = not res.get("leaseRelease") or res["leaseRelease"].get("released")
+    return 0 if res["state"] in ("clean", publish_mod.NOT_LANDED, publish_mod.LANDED) and lease_ok else 1
 
 
 def cmd_hash(args) -> int:
@@ -1528,7 +1573,17 @@ def main(argv: list[str] | None = None) -> int:
                         "and never permits a frozen (accepted / training) task")
     s.add_argument("--rebase", action="store_true",
                    help="if the remote moved but this task is untouched, rebase onto it")
+    s.add_argument("--no-remote-lease", action="store_true",
+                   help="publish without a shared task lease (repositories with no shared remote only)")
     s.set_defaults(fn=cmd_publish)
+
+    s = common(sub.add_parser("critic-receipt", help="ingest an exact-SHA critic session receipt"))
+    s.add_argument("--session-id", required=True)
+    s.add_argument("--sha", required=True)
+    s.set_defaults(fn=cmd_critic_receipt)
+
+    s = common(sub.add_parser("controls", help="resolve declared, detected, and required controls"))
+    s.set_defaults(fn=cmd_controls)
 
     s = sub.add_parser("reconcile", help="after a crash: did the pending push land?")
     s.add_argument("--repo", default=".")

@@ -46,7 +46,8 @@ _COMMON = [
 ]
 
 RULES: dict[str, list[tuple[str, str, str]]] = {
-    ".py": _COMMON + [
+    ".py": _COMMON
+    + [
         (r"\bTrue\b", "False", "truth-flip"),
         (r"\bFalse\b", "True", "truth-flip"),
         (r"\band\b", "or", "connective-swap"),
@@ -54,7 +55,8 @@ RULES: dict[str, list[tuple[str, str, str]]] = {
         (r"\bnot\s+", "", "negation-drop"),
         (r"\breturn\s+(?!None\b)\S.*", "return None", "return-none"),
     ],
-    ".go": _COMMON + [
+    ".go": _COMMON
+    + [
         (r"\btrue\b", "false", "truth-flip"),
         (r"\bfalse\b", "true", "truth-flip"),
         (r"&&", "||", "connective-swap"),
@@ -76,9 +78,14 @@ class Mutant:
     outcome: str = ""
 
     def as_dict(self) -> dict:
-        return {"path": self.path, "line": self.line, "operator": self.operator,
-                "before": self.before.strip()[:120], "after": self.after.strip()[:120],
-                "outcome": self.outcome}
+        return {
+            "path": self.path,
+            "line": self.line,
+            "operator": self.operator,
+            "before": self.before.strip()[:120],
+            "after": self.after.strip()[:120],
+            "outcome": self.outcome,
+        }
 
 
 def code_mask(src: str, suffix: str) -> list:
@@ -135,7 +142,9 @@ def _skip(line: str, suffix: str) -> bool:
     return s.startswith("//")
 
 
-def build_battery(files: dict[str, str], *, cap: int = MAX_BATTERY) -> tuple[list[Mutant], list[str]]:
+def build_battery(
+    files: dict[str, str], *, cap: int = MAX_BATTERY
+) -> tuple[list[Mutant], list[str]]:
     """Generate mutants deterministically. `files` maps path -> source text.
 
     Deterministic because a battery that varies run to run cannot be compared
@@ -168,8 +177,15 @@ def build_battery(files: dict[str, str], *, cap: int = MAX_BATTERY) -> tuple[lis
                         # behaviour: it survives every honest test and is
                         # reported as a hole in the grader that is not one.
                         if all(mask[offset + k] for k in range(s, min(e, len(line)))):
-                            out.append(Mutant(path=path, line=lineno, operator=op,
-                                              before=line, after=line[:s] + repl + line[e:]))
+                            out.append(
+                                Mutant(
+                                    path=path,
+                                    line=lineno,
+                                    operator=op,
+                                    before=line,
+                                    after=line[:s] + repl + line[e:],
+                                )
+                            )
                             placed = True
                         pos = e
                     if placed:
@@ -197,21 +213,39 @@ def build_battery(files: dict[str, str], *, cap: int = MAX_BATTERY) -> tuple[lis
     return out, notes
 
 
-def run_battery(task_dir: Path, mutants: list[Mutant], test_cmd: list[str], *,
-                runner=None, timeout: int = 600) -> dict:
+def run_battery(
+    task_dir: Path,
+    mutants: list[Mutant],
+    test_cmd: list[str],
+    *,
+    runner=None,
+    timeout: int = 600,
+) -> dict:
     """Apply each mutant to a throwaway copy and run the suite.
 
     A suite that passes on the mutated tree did not notice the wrong answer.
     """
     if not test_cmd:
-        return {"status": "NOT_RUN", "reason": "no test command; the probe cannot be run",
-                "mutants": [], "survivors": [], "viable": 0}
+        return {
+            "status": "NOT_RUN",
+            "reason": "no test command; the probe cannot be run",
+            "mutants": [],
+            "survivors": [],
+            "viable": 0,
+        }
     if not mutants:
-        return {"status": "NOT_RUN", "reason": "no mutants generated for these files",
-                "mutants": [], "survivors": [], "viable": 0}
+        return {
+            "status": "NOT_RUN",
+            "reason": "no mutants generated for these files",
+            "mutants": [],
+            "survivors": [],
+            "viable": 0,
+        }
 
     def _default(cwd: Path) -> tuple[int, str]:
-        r = subprocess.run(test_cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(
+            test_cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout
+        )
         return r.returncode, (r.stdout + r.stderr)[-2000:]
 
     run = runner or _default
@@ -227,13 +261,24 @@ def run_battery(task_dir: Path, mutants: list[Mutant], test_cmd: list[str], *,
         try:
             base_code, base_log = run(base)
         except Exception as e:  # noqa: BLE001
-            return {"status": "NOT_RUN", "reason": f"baseline run failed: {type(e).__name__}: {e}",
-                    "mutants": [], "survivors": [], "viable": 0}
+            return {
+                "status": "NOT_RUN",
+                "reason": f"baseline run failed: {type(e).__name__}: {e}",
+                "mutants": [],
+                "survivors": [],
+                "viable": 0,
+            }
     if base_code != 0:
-        return {"status": "NOT_RUN",
-                "reason": ("the suite does not pass on the unmutated tree, so a 'caught' mutant "
-                           f"would be indistinguishable from a broken harness: {base_log.strip()[-300:]}"),
-                "mutants": [], "survivors": [], "viable": 0}
+        return {
+            "status": "NOT_RUN",
+            "reason": (
+                "the suite does not pass on the unmutated tree, so a 'caught' mutant "
+                f"would be indistinguishable from a broken harness: {base_log.strip()[-300:]}"
+            ),
+            "mutants": [],
+            "survivors": [],
+            "viable": 0,
+        }
 
     done: list[Mutant] = []
     for mut in mutants:
@@ -260,18 +305,28 @@ def run_battery(task_dir: Path, mutants: list[Mutant], test_cmd: list[str], *,
                 # The compiler rejected it. That is not the tests discriminating.
                 done.append(Mutant(**{**mut.__dict__, "outcome": NOT_VIABLE}))
             else:
-                done.append(Mutant(**{**mut.__dict__,
-                                      "outcome": SURVIVED if code == 0 else CAUGHT}))
+                done.append(
+                    Mutant(
+                        **{**mut.__dict__, "outcome": SURVIVED if code == 0 else CAUGHT}
+                    )
+                )
 
     survivors = [m for m in done if m.outcome == SURVIVED]
     viable = [m for m in done if m.outcome != NOT_VIABLE]
     return {
         "status": "FAIL" if survivors else ("NOT_RUN" if not viable else "PASS"),
-        "reason": (f"{len(survivors)} of {len(viable)} viable mutants survived — the suite does "
-                   "not discriminate here")
-        if survivors
-        else ("every mutant was rejected before it could be tested; the probe proved nothing"
-              if not viable else f"all {len(viable)} viable mutants were caught"),
+        "reason": (
+            (
+                f"{len(survivors)} of {len(viable)} viable mutants survived — the suite does "
+                "not discriminate here"
+            )
+            if survivors
+            else (
+                "every mutant was rejected before it could be tested; the probe proved nothing"
+                if not viable
+                else f"all {len(viable)} viable mutants were caught"
+            )
+        ),
         "mutants": [m.as_dict() for m in done],
         "survivors": [m.as_dict() for m in survivors],
         "viable": len(viable),
@@ -289,7 +344,9 @@ def _unbuildable(log: str) -> bool:
     return bool(_UNBUILDABLE.search(log or ""))
 
 
-def probe(task_dir: Path, targets: list[str], test_cmd: list[str], **kw) -> dict:
+def probe(
+    task_dir: Path, targets: list[str], test_cmd: list[str], *, operators=None, **kw
+) -> dict:
     """Full probe: read the targets, build the battery, run it."""
     files: dict[str, str] = {}
     unsupported: list[str] = []
@@ -303,12 +360,24 @@ def probe(task_dir: Path, targets: list[str], test_cmd: list[str], **kw) -> dict
         files[rel] = p.read_text(errors="replace")
     if not files:
         langs = ", ".join(SUPPORTED)
-        return {"status": "NOT_RUN",
-                "reason": (f"no probeable target ({langs} only); "
-                           f"unsupported: {', '.join(unsupported) or 'none found'}. "
-                           "Uncovered, not clean."),
-                "mutants": [], "survivors": [], "viable": 0}
+        return {
+            "status": "NOT_RUN",
+            "reason": (
+                f"no probeable target ({langs} only); "
+                f"unsupported: {', '.join(unsupported) or 'none found'}. "
+                "Uncovered, not clean."
+            ),
+            "mutants": [],
+            "survivors": [],
+            "viable": 0,
+        }
     mutants, notes = build_battery(files)
+    if operators is not None:
+        selected = set(operators)
+        mutants = [mutant for mutant in mutants if mutant.operator in selected]
+        notes.append("selected operators: " + ", ".join(sorted(selected)))
     result = run_battery(Path(task_dir), mutants, test_cmd, **kw)
-    result["notes"] = notes + ([f"unsupported targets: {', '.join(unsupported)}"] if unsupported else [])
+    result["notes"] = notes + (
+        [f"unsupported targets: {', '.join(unsupported)}"] if unsupported else []
+    )
     return result

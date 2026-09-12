@@ -539,13 +539,14 @@ commit itself against its parent. `commit, then gate, then push` is the natural 
 that only read the index reported `NOT_RUN` for every diff-shaped check at exactly the moment they
 mattered. The report says which it read (`index` or `commit`).
 
-**A required check that did not run blocks the push.** `benchsmith gate --require-push-set` (which
-the installed pre-push hook passes) makes `NOT_RUN` blocking for `oracle`, `scope`,
+**A required check that did not run blocks the push.** `benchsmith gate --require-push-set` makes
+`NOT_RUN` blocking for `oracle`, `scope`,
 `config-integrity` and `tags`. Elsewhere `NOT_RUN` is reported but does not block, because at
 scaffold time half these checks legitimately cannot run yet. At the push boundary the two states
 have the same consequence: you do not know the thing you would need to know in order to push.
 Without this, arranging for a check *not to run* was enough to skip it — which made every other
-gate optional.
+gate optional. The installed pre-push hook verifies the exact-HEAD receipt produced by that run;
+it does not rerun a weaker predicate.
 
 **Run preflight first, every session.** Composed skills that are absent must fail loudly: a
 field run spent nine rounds improvising the mechanics by hand because nothing said they were
@@ -939,13 +940,15 @@ denominator. A cohort at 0/5 is the loudest version of this signal — audit tho
 trajectories before hardening or easing anything, since on a task with this history
 a fifth constraint is more likely than genuine difficulty.
 
-### The honest gap
+### Executable obligations
 
-**benchsmith has no mutation probe.** Nothing here builds a battery of plausible wrong answers and
-checks which ones the tests fail to catch, and `codimango bench` exposes no such command. So on
-every task, in every language, the question "would these tests catch a near-miss?" is
-**unanswered** — not answered cleanly. Say so in the verdict. A test suite that passes the
-reference and fails the base has not thereby been shown to discriminate.
+New or materially modified tasks use `.benchsmith/controls.json`; untouched legacy tasks begin in
+shadow mode. Benchsmith resolves declared, independently detected, and policy-required
+capabilities, and under-declaration blocks. Every scored semantic obligation names its stable
+contract reference, actual observation boundary, accepting witness, rejecting witness or verified
+non-applicability proof, adapter version and digest, and applicability evidence. Allowed freedoms
+are evidence-bearing positive witnesses, not prose. The schema, rollout, mutation adequacy,
+metamorphic variation, verifier closure and cache identity are in `references/controls.md`.
 
 ---
 
@@ -1223,8 +1226,11 @@ So dispatch it: a fresh session or a same-task subagent, given only the task ide
 exact SHA. It runs `aai-review-flow` (or the track fallback) first and audits that, so do not
 pre-supply your own findings — feeding it your conclusions is what it exists to check.
 
-**It writes nothing.** Read-only on the task repository: no commits, no pushes, no reruns, no
-author contact. Its output is a decision plus an evidence report; benchsmith is what acts on it.
+**It writes nothing in the task repository.** Read-only means no task edits, commits, pushes,
+reruns, or author contact. It emits one structured receipt line in its own session transcript;
+`benchsmith critic-receipt --repo REPO --task TASK --sha SHA --session-id SESSION` fetches that
+terminal transcript and stores the verified exact-SHA receipt outside the worktree. An absent,
+malformed, stale, or locally supplied replacement remains an absent review.
 
 | Its decision | What benchsmith does |
 |---|---|
@@ -1326,6 +1332,7 @@ These are full sections, not summaries. Read the file when the flow calls for it
 | Topic | File |
 |---|---|
 | running the fleet: queue discovery, ownership, dispatch, handoff, publish lane | `references/coordinator.md` |
+| executable obligations, capability resolution, mutation and trust closure | `references/controls.md` |
 | which measurements cover your commit, one lever per hardening round, the mutation probe, backoff | `references/attribution.md` |
 | pass@k from local runs, and the three ways this track differs | `references/passatk.md` |
 | diff-shaped checks, snapshot integrity, the fixture corpus, formatters | `references/hooks.md` |

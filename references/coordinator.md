@@ -174,6 +174,13 @@ One lane **per repository**, not per task. The platform validates the branch tip
 pushing to one repository invalidate each other's evidence and the second push quietly turns the
 first one's measurement into somebody else's.
 
+An applied publication first claims a fresh remote task lease, passes that exact lease into the
+publisher for revalidation immediately before the push, and releases it afterwards. Repositories
+without a shared remote must opt out explicitly with `--no-remote-lease`.
+If the push result is ambiguous, the durable intent retains the exact lease token. `reconcile`
+releases it only after confirming that the push landed; unknown and retryable-not-landed outcomes
+keep the claim so another worker cannot enter the task during recovery.
+
 Publishing refuses unless all of these hold: the handoff says `ready_to_publish`, it carries a
 `commit_sha`, it carries a **`gate_receipt`** (without which the lane's one job — that only gated
 work reaches the remote — was never done), the lane is free, and the remote head still matches the

@@ -34,8 +34,9 @@ class PublishRefused(Exception):
 
 
 def _git(repo: Path, *args, timeout: int = 300) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout
+    )
 
 
 @dataclass
@@ -47,6 +48,7 @@ class Intent:
     branch: str
     key: str
     at: float
+    lease_sha: str = ""
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
@@ -130,30 +132,56 @@ class Lane:
         if r.returncode != 0:
             # Not knowing is not the same as not landed. Pushing again here is
             # how a crash becomes a double push.
-            return {"state": UNKNOWN, "intent": intent.as_dict(),
-                    "detail": f"cannot read the remote: {r.stderr.strip()[:160]}"}
+            return {
+                "state": UNKNOWN,
+                "intent": intent.as_dict(),
+                "detail": f"cannot read the remote: {r.stderr.strip()[:160]}",
+            }
         head = (r.stdout.split() or [""])[0]
         if head == intent.commit_sha:
-            return {"state": LANDED, "intent": intent.as_dict(),
-                    "detail": "the push landed; clear the intent and record the round"}
+            return {
+                "state": LANDED,
+                "intent": intent.as_dict(),
+                "detail": "the push landed; clear the intent and record the round",
+            }
         if head == intent.base_sha:
-            return {"state": NOT_LANDED, "intent": intent.as_dict(),
-                    "detail": "the remote is still at our base; the push can be retried"}
-        return {"state": DIVERGED, "intent": intent.as_dict(),
-                "detail": f"the remote moved to {head[:8]}; someone else published. Rebase and "
-                          "re-gate before retrying — the prepared commit's evidence is stale"}
+            return {
+                "state": NOT_LANDED,
+                "intent": intent.as_dict(),
+                "detail": "the remote is still at our base; the push can be retried",
+            }
+        return {
+            "state": DIVERGED,
+            "intent": intent.as_dict(),
+            "detail": f"the remote moved to {head[:8]}; someone else published. Rebase and "
+            "re-gate before retrying — the prepared commit's evidence is stale",
+        }
 
 
-def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin",
-            branch: str = "main", lane: Lane | None = None, apply: bool = False,
-            git=_git, check_review: bool = True, rebase: bool = False,
-            allow_review_status: str = "", remote_lease=None, check_hold: bool = True) -> dict:
+def publish(
+    repo_root: Path,
+    task: str,
+    handoff: dict,
+    *,
+    remote: str = "origin",
+    branch: str = "main",
+    lane: Lane | None = None,
+    apply: bool = False,
+    git=_git,
+    check_review: bool = True,
+    rebase: bool = False,
+    allow_review_status: str = "",
+    remote_lease=None,
+    check_hold: bool = True,
+) -> dict:
     """Verify, claim the lane, record the intent, then push exactly once."""
     repo_root = Path(repo_root)
     lane = lane or Lane(repo_root)
 
     if str(handoff.get("state")) != "ready_to_publish":
-        raise PublishRefused(f"handoff state is {handoff.get('state')!r}, not ready_to_publish")
+        raise PublishRefused(
+            f"handoff state is {handoff.get('state')!r}, not ready_to_publish"
+        )
     commit_sha = str(handoff.get("commit_sha") or "")
     base_sha = str(handoff.get("base_sha") or "")
     if not commit_sha:
@@ -174,10 +202,15 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
         if body is None:
             raise PublishRefused(problem)
         marker = str(handoff.get("gate_receipt") or "")
-        accepted = {str(body["digest"]), f"sha256:{body['digest']}",
-                    str(gate_mod.receipt_path(repo_root, task))}
+        accepted = {
+            str(body["digest"]),
+            f"sha256:{body['digest']}",
+            str(gate_mod.receipt_path(repo_root, task)),
+        }
         if marker not in accepted:
-            raise PublishRefused("handoff gate_receipt does not identify the verified receipt")
+            raise PublishRefused(
+                "handoff gate_receipt does not identify the verified receipt"
+            )
         current = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
         if current != commit_sha:
             raise PublishRefused(
@@ -231,7 +264,9 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
 
     pend = lane.reconcile(repo_root, git=git)
     if pend["state"] in (LANDED, DIVERGED, UNKNOWN):
-        raise PublishRefused(f"resolve the pending push first ({pend['state']}): {pend['detail']}")
+        raise PublishRefused(
+            f"resolve the pending push first ({pend['state']}): {pend['detail']}"
+        )
 
     if not lane.acquire(task):
         held = lane.holder() or {}
@@ -264,10 +299,14 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
                     f"the remote moved to {head[:8]}, but this task is untouched between the two. "
                     "Re-run with rebase=True to move the commit onto it and re-gate."
                 )
-            rb = git(repo_root, "rebase", "--onto", head, base_sha, commit_sha, timeout=600)
+            rb = git(
+                repo_root, "rebase", "--onto", head, base_sha, commit_sha, timeout=600
+            )
             if rb.returncode != 0:
                 git(repo_root, "rebase", "--abort")
-                raise PublishRefused(f"rebase onto {head[:8]} failed: {rb.stderr.strip()[:200]}")
+                raise PublishRefused(
+                    f"rebase onto {head[:8]} failed: {rb.stderr.strip()[:200]}"
+                )
             # First field only: a git wrapper that appends anything would
             # otherwise put a ref name inside the SHA we publish.
             moved = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
@@ -281,35 +320,73 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
             # (it has no task oracle), so it returned every rebase to a worker;
             # by the time that worker answered, main had moved again. One task
             # went round four times before landing.
-            before = (git(repo_root, "rev-parse", f"{commit_sha}:{task}").stdout.split() or [""])[0]
-            after = (git(repo_root, "rev-parse", f"{moved}:{task}").stdout.split() or [""])[0]
+            before = (
+                git(repo_root, "rev-parse", f"{commit_sha}:{task}").stdout.split()
+                or [""]
+            )[0]
+            after = (
+                git(repo_root, "rev-parse", f"{moved}:{task}").stdout.split() or [""]
+            )[0]
             if before and after and before == after:
                 from . import gate as gate_mod
 
                 carried = gate_mod.carry_receipt(repo_root, task, moved)
                 if not carried.get("ok"):
-                    return {"state": "rebased", "task": task, "from": commit_sha,
-                            "newSha": moved, "onto": head, "needsRegate": True,
-                            "detail": f"task tree is unchanged, but candidate receipt failed: "
-                                      f"{carried.get('reason', 'unknown')}"}
-                return {"state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
-                        "onto": head, "needsRegate": False, "taskTree": before,
-                        "gateReceipt": carried["receipt"]["digest"],
-                        "detail": (f"rebased onto {head[:8]}; the task tree is byte-identical "
-                                   f"({before[:12]}). Tree-invariant evidence was carried and "
-                                   "commit-relative controls reran for the new SHA.")}
-            return {"state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
-                    "onto": head, "needsRegate": True,
-                    "detail": ("rebased onto the new head and the task tree changed, so the "
-                               "receipt no longer describes it. Re-gate this SHA.")}
+                    return {
+                        "state": "rebased",
+                        "task": task,
+                        "from": commit_sha,
+                        "newSha": moved,
+                        "onto": head,
+                        "needsRegate": True,
+                        "detail": f"task tree is unchanged, but candidate receipt failed: "
+                        f"{carried.get('reason', 'unknown')}",
+                    }
+                return {
+                    "state": "rebased",
+                    "task": task,
+                    "from": commit_sha,
+                    "newSha": moved,
+                    "onto": head,
+                    "needsRegate": False,
+                    "taskTree": before,
+                    "gateReceipt": carried["receipt"]["digest"],
+                    "detail": (
+                        f"rebased onto {head[:8]}; the task tree is byte-identical "
+                        f"({before[:12]}). Tree-invariant evidence was carried and "
+                        "commit-relative controls reran for the new SHA."
+                    ),
+                }
+            return {
+                "state": "rebased",
+                "task": task,
+                "from": commit_sha,
+                "newSha": moved,
+                "onto": head,
+                "needsRegate": True,
+                "detail": (
+                    "rebased onto the new head and the task tree changed, so the "
+                    "receipt no longer describes it. Re-gate this SHA."
+                ),
+            }
 
-        intent = Intent(task=task, base_sha=base_sha or head, commit_sha=commit_sha,
-                        remote=remote, branch=branch,
-                        key=lane.key(task, commit_sha), at=time.time())
+        intent = Intent(
+            task=task,
+            base_sha=base_sha or head,
+            commit_sha=commit_sha,
+            remote=remote,
+            branch=branch,
+            key=lane.key(task, commit_sha),
+            at=time.time(),
+            lease_sha=str(getattr(remote_lease, "sha", "")),
+        )
         if not apply:
-            return {"planned": intent.as_dict(), "applied": False,
-                    "reviewNote": review_note or None,
-                    "hint": "re-run with apply=True to actually push"}
+            return {
+                "planned": intent.as_dict(),
+                "applied": False,
+                "reviewNote": review_note or None,
+                "hint": "re-run with apply=True to actually push",
+            }
 
         _verify_candidate_receipt()
 
@@ -324,11 +401,17 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
 
             h = _hold(repo_root, remote=remote)
             if not h.get("readable"):
-                raise PublishRefused(f"{h.get('reason')}; an unreadable hold is not permission")
+                raise PublishRefused(
+                    f"{h.get('reason')}; an unreadable hold is not permission"
+                )
             if h.get("held"):
                 raise PublishRefused(
                     f"{h['holder']} holds {remote}/{branch}"
-                    + (f" for another {h['minutesLeft']}m" if h.get("minutesLeft") else "")
+                    + (
+                        f" for another {h['minutesLeft']}m"
+                        if h.get("minutesLeft")
+                        else ""
+                    )
                     + (f": {h['why']}" if h.get("why") else "")
                     + ". Wait for the window to close; the commit is gated and keeps."
                 )
@@ -336,15 +419,45 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
             # Same rule as the freeze check, for the same reason: the window
             # between acquiring the lane and pushing is exactly when another
             # host can take the task.
-            remote_lease.assert_owned()
+            try:
+                remote_lease.assert_owned()
+            except Exception as error:  # the lease module supplies the precise cause
+                raise PublishRefused(f"remote lease is not owned: {error}") from error
         lane.record_intent(intent)
-        pr = git(repo_root, "push", remote, f"{commit_sha}:refs/heads/{branch}", timeout=600)
+        try:
+            pr = git(
+                repo_root,
+                "push",
+                remote,
+                f"{commit_sha}:refs/heads/{branch}",
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "state": UNKNOWN,
+                "task": task,
+                "key": intent.key,
+                "error": "push timed out; it may have landed",
+                "hint": "the intent and lease are retained; run reconcile before retrying",
+            }
         if pr.returncode != 0:
-            return {"ok": False, "task": task, "key": intent.key,
-                    "error": pr.stderr.strip()[:400],
-                    "hint": "the intent is recorded; run reconcile before retrying"}
+            return {
+                "ok": False,
+                "state": UNKNOWN,
+                "task": task,
+                "key": intent.key,
+                "error": pr.stderr.strip()[:400],
+                "hint": "the intent and lease are retained; run reconcile before retrying",
+            }
         lane.clear_intent()
-        return {"ok": True, "task": task, "key": intent.key, "commit": commit_sha,
-                "remote": remote, "branch": branch}
+        return {
+            "ok": True,
+            "task": task,
+            "key": intent.key,
+            "commit": commit_sha,
+            "remote": remote,
+            "branch": branch,
+        }
     finally:
         lane.release(task)

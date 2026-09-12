@@ -546,7 +546,7 @@ with tempfile.TemporaryDirectory() as td:
     check("journal reopens with its rounds", len(other.rounds), 4)
 
     rep = gate_mod.run(repo_root=repo, task_dir=task_dir, task_name="mytask")
-    check("gate passes on a sound tree", rep.ok, True)
+    check("normal gate blocks a structurally incomplete task", rep.ok, False)
     check("NOT_RUN reported, not hidden", "oracle" in rep.as_dict()["notRun"], True)
     config_state = next(c.state for c in rep.checks if c.name == "config-integrity")
     check("missing SWE config is inapplicable on other tracks", config_state, "PASS")
@@ -2377,10 +2377,23 @@ _texts = [text for _, text in _seen[0]]
 check("a suffix fixture leaves earlier steps as gold", "tamper" in _texts[0], False)
 check("...and appends to the last", "tamper" in _texts[-1] and "gold2" in _texts[-1], True)
 
-# A positive overlay composes onto gold with its preamble stripped.
-_c = fx.compose_overlay("#!/bin/sh\ngold\n", "#!/bin/sh\nset -e\nextra\n")
-check("the overlay preamble is stripped", "set -e" in _c, False)
-check("...and gold survives", "gold" in _c and "extra" in _c, True)
+# A positive fixture is an independent replacement, never gold plus an overlay.
+_positive_seen = []
+
+
+def _capture_positive(td):
+    _positive_seen.append((td / "solve.sh").read_text())
+    return 0, ["1.0"]
+
+
+fx.run_corpus(_fr, runner=_capture_positive)
+check("a positive fixture runs without golden bytes",
+      any("other_fix" in text and "gold_fix" not in text for text in _positive_seen), True)
+(_multi / "qa" / "positive").mkdir(parents=True)
+(_multi / "qa" / "positive" / "incomplete.sh").write_text("alternative\n")
+_multi_positive = fx.run_corpus(_multi, runner=_capture)
+check("an incomplete multi-step positive alternative blocks",
+      _multi_positive["state"], fx.NOT_RUN)
 
 # --- TIMEOUT is a first-class gate state ---
 _tr = gate_mod.Report()
@@ -4960,6 +4973,375 @@ _future_health = dsp.health("future", runner=_feed([
 check("future timestamps are unknown, never healthy", _future_health["state"], "unknown")
 check("future timestamp output retains the negative measurement",
       _future_health["idleSeconds"] < 0, True)
+
+
+# --- executable controls manifest and trusted critic receipt ----------------
+from types import SimpleNamespace  # noqa: E402
+from benchsmith import controls as ctl  # noqa: E402
+from benchsmith import critic_receipt as cr  # noqa: E402
+from benchsmith import snapshot as snap  # noqa: E402
+
+_controls_root = Path(tempfile.mkdtemp())
+_controls_repo = scratch_repo(_controls_root)
+_controls_task = _controls_repo / "mytask"
+(_controls_task / "instruction.md").write_text("Return the requested value.\n")
+(_controls_task / "solution.py").write_text("def answer():\n    return True\n")
+(_controls_task / "qa" / "positive").mkdir(parents=True)
+(_controls_task / "qa" / "negative").mkdir(parents=True)
+(_controls_task / "qa" / "positive" / "valid.sh").write_text("#!/bin/sh\nexit 0\n")
+(_controls_task / "qa" / "negative" / "invalid.sh").write_text("#!/bin/sh\nexit 1\n")
+(_controls_task / ".benchsmith").mkdir(exist_ok=True)
+
+
+def _manifest(capabilities):
+    return {
+        "schema_version": 1,
+        "capabilities": capabilities,
+        "obligations": [{
+            "id": "VALUE-1",
+            "contract_reference": "instruction.md#requested-value",
+            "observation_boundary": "public return value",
+            "accepting_witness": {
+                "path": "qa/positive/valid.sh", "control": "command",
+                "command": ["bash", "{path}"],
+            },
+            "rejecting_witness": {
+                "path": "qa/negative/invalid.sh", "control": "command",
+                "command": ["bash", "{path}"],
+            },
+            "adapter": {"name": "python", "version": "1", "digest": "b" * 64},
+            "control_version": "1",
+            "applicability": {"state": "applicable", "evidence": ["public return value"]},
+            "allowed_freedoms": [{
+                "description": "equivalent implementation",
+                "witness": {
+                    "path": "qa/positive/valid.sh", "control": "command",
+                    "command": ["bash", "{path}"],
+                },
+            }],
+        }],
+        "mutation": {
+            "test_command": ["test-value"],
+            "cases": [{
+                "obligation": "VALUE-1",
+                "targets": ["solution.py"],
+                "operators": ["truth-flip"],
+            }],
+        },
+    }
+
+
+os.environ["BENCHSMITH_CONTROLS_ENFORCE"] = "1"
+try:
+    (_controls_task / ctl.MANIFEST).write_text(json.dumps(_manifest({"mutation_adequacy": True})))
+    _under = ctl.resolve(_controls_repo, "mytask", _controls_task)
+    check("policy-required capabilities cannot be omitted",
+          "critic_receipt" in "; ".join(_under["errors"]), True)
+    _under_report = gate_mod.Report()
+    gate_mod.check_control_manifest(_controls_repo, _controls_task, "mytask", _under_report)
+    check("under-declaration fires the gate",
+          {item.name: item.state for item in _under_report.checks}["control-manifest"],
+          gate_mod.FAIL)
+
+    (_controls_task / ctl.MANIFEST).write_text(json.dumps(_manifest({
+        "mutation_adequacy": True,
+        "critic_receipt": True,
+    })))
+    _resolved = ctl.resolve(_controls_repo, "mytask", _controls_task)
+    check("a complete executable manifest resolves", (_resolved["ok"], _resolved["examined"]),
+          (True, 1))
+    _witnesses = ctl.obligation_witnesses(_controls_task, _resolved)
+    check("accepting, rejecting, and freedom witnesses all fire",
+          (_witnesses["state"], _witnesses["examined"]), ("PASS", 3))
+    (_controls_task / "qa" / "negative" / "invalid.sh").write_text("#!/bin/sh\nexit 0\n")
+    check("a rejecting witness that passes fails the control",
+          ctl.obligation_witnesses(_controls_task, _resolved)["state"], "FAIL")
+    (_controls_task / "qa" / "negative" / "invalid.sh").write_text("#!/bin/sh\nexit 1\n")
+
+    def _mutation_runner(work):
+        return (1, "caught") if "False" in (work / "solution.py").read_text() else (0, "valid")
+
+    _adequate = ctl.mutation_adequacy(_controls_task, _resolved, runner=_mutation_runner)
+    check("mutation adequacy examines and kills a relevant mutant",
+          (_adequate["state"], _adequate["examined"]), ("PASS", 1))
+    _zero = ctl.mutation_adequacy(
+        _controls_task,
+        {**_resolved, "mutation": {
+            "test_command": ["test"],
+            "cases": [{
+                "obligation": "VALUE-1",
+                "targets": ["instruction.md"],
+                "operators": ["truth-flip"],
+            }],
+        }},
+        runner=_mutation_runner,
+    )
+    check("zero applicable mutation inputs block", _zero["ok"], False)
+
+    (_controls_task / "instruction.md").write_text("Unauthenticated callers must be rejected.\n")
+    _under_detected = ctl.resolve(_controls_repo, "mytask", _controls_task)
+    check("detected authorization cannot be under-declared",
+          "authorization" in "; ".join(_under_detected["errors"]), True)
+    (_controls_task / "instruction.md").write_text("Return the requested value.\n")
+
+    _meta = ctl.metamorphic_variants(
+        [{"id": "one"}, {"id": "two"}], ["ordering", "multiplicity"], seed="fixed-seed"
+    )
+    check("seeded metamorphic generation is reproducible",
+          _meta["fixture_digest"],
+          ctl.metamorphic_variants(
+              [{"id": "one"}, {"id": "two"}], ["ordering", "multiplicity"],
+              seed="fixed-seed",
+          )["fixture_digest"])
+    check("a different metamorphic seed changes generated evidence",
+          _meta["fixture_digest"] != ctl.metamorphic_variants(
+              [{"id": "one"}, {"id": "two"}], ["ordering", "multiplicity"],
+              seed="other-seed",
+          )["fixture_digest"], True)
+    check("metamorphic generation examines selected transforms", len(_meta["variants"]), 2)
+    (_controls_task / "fixture.json").write_text('[{"id":"one"},{"id":"two"}]\n')
+    _meta_resolved = {
+        **_resolved,
+        "metamorphic": {
+            "source": "fixture.json",
+            "transforms": ["ordering", "rename_ids"],
+            "command": ["check-fixture", "{fixture}"],
+        },
+    }
+    _meta_run = ctl.run_metamorphic(
+        _controls_task,
+        _meta_resolved,
+        runner=lambda argv, cwd: SimpleNamespace(returncode=0),
+    )
+    check("metamorphic control fires selected variants",
+          (_meta_run["state"], _meta_run["examined"]), ("PASS", 2))
+    _meta_fail = ctl.run_metamorphic(
+        _controls_task,
+        _meta_resolved,
+        runner=lambda argv, cwd: SimpleNamespace(returncode=1),
+    )
+    check("metamorphic rejection is blocking", _meta_fail["state"], "FAIL")
+
+    _closure = {
+        **_resolved,
+        "verifier_closure": {
+            "valid_run": {"command": ["valid"]},
+            "tamper_probe": {"command": ["tamper"]},
+        },
+    }
+    _closure_ok = ctl.verifier_closure(
+        _controls_task,
+        _closure,
+        runner=lambda argv, cwd: SimpleNamespace(returncode=0 if argv[0] == "valid" else 7),
+    )
+    check("closure requires a valid run and rejected tamper",
+          (_closure_ok["state"], _closure_ok["examined"]), ("PASS", 2))
+    _closure_bad = ctl.verifier_closure(
+        _controls_task,
+        _closure,
+        runner=lambda argv, cwd: SimpleNamespace(returncode=0),
+    )
+    check("a successful tamper probe fails closure", _closure_bad["state"], "FAIL")
+    _closure_trace = {
+        **_closure,
+        "verifier_closure": {
+            **_closure["verifier_closure"],
+            "candidate_roots": ["."],
+            "executables": [],
+            "reads": ["qa/positive/*"],
+            "writes": [],
+            "dependencies": [],
+            "result_channels": [],
+        },
+    }
+    _unexpected_trace = ctl.verifier_closure(
+        _controls_task,
+        _closure_trace,
+        runner=lambda argv, cwd: SimpleNamespace(
+            returncode=0 if argv[0] == "valid" else 7,
+            trace={"reads": {str(_controls_task / "qa" / "negative" / "invalid.sh")}},
+        ),
+    )
+    check("an undeclared candidate-influenced read fails closure",
+          _unexpected_trace["state"], "FAIL")
+finally:
+    os.environ.pop("BENCHSMITH_CONTROLS_ENFORCE", None)
+
+# The normal gate must invoke structural validation; source presence alone is
+# not evidence that the runner calls it.
+_saved_structural = gate_mod.check_structural
+try:
+    gate_mod.check_structural = lambda task, report, binary="codimango": report.add(
+        "structural", gate_mod.FAIL, "firing fixture"
+    )
+    _wired = gate_mod.run(
+        repo_root=_controls_repo,
+        task_dir=_controls_task,
+        task_name="mytask",
+    )
+    check("normal gate fires structural validation",
+          {item.name: item.state for item in _wired.checks}["structural"], gate_mod.FAIL)
+finally:
+    gate_mod.check_structural = _saved_structural
+
+# Publication acquires a task lease, passes that exact object into the
+# publisher, and releases it after both success and refusal.
+_lease_events = []
+
+
+class _PublishLease:
+    def __init__(self, task, repo, remote="origin"):
+        self.task, self.sha = task, "lease-token"
+
+    def acquire(self):
+        _lease_events.append("acquire")
+        return {"held": True}
+
+    def release(self, token=""):
+        _lease_events.append("release" + (f":{token}" if token else ""))
+        self.sha = ""
+        return {"released": True}
+
+
+_saved_publish_lease = _cli.rlease_mod.RemoteLease
+_saved_publish_call = _cli.publish_mod.publish
+_handoff_path = _controls_root / "handoff.json"
+_handoff_path.write_text(json.dumps({
+    "state": "ready_to_publish",
+    "commit_sha": "a" * 40,
+    "base_sha": "b" * 40,
+    "gate_receipt": "receipt",
+}))
+try:
+    _cli.rlease_mod.RemoteLease = _PublishLease
+
+    def _publish_with_lease(repo, task, handoff, **kwargs):
+        _lease_events.append("passed" if isinstance(kwargs.get("remote_lease"), _PublishLease)
+                             else "missing")
+        return {"ok": True}
+
+    _cli.publish_mod.publish = _publish_with_lease
+    _publish_code = _cli.cmd_publish(SimpleNamespace(
+        repo=str(_controls_repo), task="mytask", handoff=str(_handoff_path), run_id="test",
+        remote="origin", branch="main", apply=True, rebase=False, allow_review_status="",
+        no_remote_lease=False,
+    ))
+    check("CLI publication binds the remote lease to the publisher",
+          (_publish_code, _lease_events), (0, ["acquire", "passed", "release"]))
+
+    class _RejectedLease(_PublishLease):
+        def acquire(self):
+            return {"held": False, "reason": "CAS race"}
+
+    _cli.rlease_mod.RemoteLease = _RejectedLease
+    _publish_code = _cli.cmd_publish(SimpleNamespace(
+        repo=str(_controls_repo), task="mytask", handoff=str(_handoff_path), run_id="test",
+        remote="origin", branch="main", apply=True, rebase=False, allow_review_status="",
+        no_remote_lease=False,
+    ))
+    check("publication fails when lease binding loses a CAS race", _publish_code, 2)
+
+    _lease_events.clear()
+    _cli.rlease_mod.RemoteLease = _PublishLease
+
+    def _ambiguous_publish(repo, task, handoff, **kwargs):
+        kwargs["lane"].record_intent(pub.Intent(
+            task=task,
+            base_sha="b" * 40,
+            commit_sha="a" * 40,
+            remote="origin",
+            branch="main",
+            key="ambiguous",
+            at=time.time(),
+            lease_sha=kwargs["remote_lease"].sha,
+        ))
+        return {"ok": False, "state": pub.UNKNOWN}
+
+    _cli.publish_mod.publish = _ambiguous_publish
+    _publish_code = _cli.cmd_publish(SimpleNamespace(
+        repo=str(_controls_repo), task="mytask", handoff=str(_handoff_path), run_id="test",
+        remote="origin", branch="main", apply=True, rebase=False, allow_review_status="",
+        no_remote_lease=False,
+    ))
+    check("an ambiguous publication retains its exact task lease",
+          (_publish_code, _lease_events), (2, ["acquire"]))
+
+    _saved_reconcile = _cli.publish_mod.Lane.reconcile
+    try:
+        _cli.publish_mod.Lane.reconcile = lambda self, repo: {
+            "state": pub.LANDED, "detail": "confirmed"
+        }
+        _reconcile_code = _cli.cmd_reconcile(SimpleNamespace(
+            repo=str(_controls_repo), run_id="test"
+        ))
+        check("confirmed reconciliation releases the retained exact token",
+              (_reconcile_code, _lease_events[-1]), (0, "release:lease-token"))
+    finally:
+        _cli.publish_mod.Lane.reconcile = _saved_reconcile
+finally:
+    _cli.rlease_mod.RemoteLease = _saved_publish_lease
+    _cli.publish_mod.publish = _saved_publish_call
+
+# Critic decisions are ingested only from a terminal session transcript and
+# remain bound to its exact task SHA.
+_critic_sha = subprocess.run(
+    ["git", "-C", str(_controls_repo), "rev-parse", "HEAD"],
+    capture_output=True,
+    text=True,
+    check=True,
+).stdout.strip()
+_critic_document = {
+    "task_id": "task-123",
+    "sha": _critic_sha,
+    "critic_version": "critic-v1",
+    "session_id": "session-123",
+    "decision": "Accept",
+    "evidence_digest": "a" * 64,
+    "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+}
+_critic_events = [
+    {"type": "block", "event": {"block": {"text": cr.MARKER + json.dumps(_critic_document)}}},
+    {"type": "run_finished", "event": {}},
+]
+
+
+def _critic_poller(argv):
+    return 0, json.dumps(_critic_events) + "\n" + json.dumps({"has_more": "no"}), ""
+
+
+_old_critic_dir = os.environ.get("BENCHSMITH_CRITIC_RECEIPT_DIR")
+os.environ["BENCHSMITH_CRITIC_RECEIPT_DIR"] = str(_controls_root / "critic-receipts")
+try:
+    _ingested = cr.ingest(
+        _controls_repo, "mytask", _critic_sha, "session-123", poller=_critic_poller
+    )
+    check("terminal AgentCloud critic receipt is ingested", _ingested["ok"], True)
+    _trusted, _problem = cr.load(_controls_repo, "mytask", _critic_sha)
+    _critic_row = next(
+        row for row in snap.review_manifest({}, [], _critic_sha, critic_receipt=_trusted)
+        if row.name == "review-critic"
+    )
+    check("trusted critic receipt produces an exact-SHA review row",
+          (_critic_row.verdict, _critic_row.selection), ("Accept", "exact-head"))
+    check("the same critic receipt cannot certify another SHA",
+          cr.load(_controls_repo, "mytask", "f" * 40)[0], None)
+    _nonterminal = cr.ingest(
+        _controls_repo,
+        "mytask",
+        _critic_sha,
+        "session-123",
+        poller=lambda argv: (
+            0,
+            json.dumps(_critic_events[:1]) + "\n" + json.dumps({"has_more": "no"}),
+            "",
+        ),
+    )
+    check("a nonterminal critic session cannot mint a receipt", _nonterminal["ok"], False)
+finally:
+    if _old_critic_dir is None:
+        os.environ.pop("BENCHSMITH_CRITIC_RECEIPT_DIR", None)
+    else:
+        os.environ["BENCHSMITH_CRITIC_RECEIPT_DIR"] = _old_critic_dir
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
