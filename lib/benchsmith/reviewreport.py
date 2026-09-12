@@ -13,7 +13,9 @@ action, and it is the only step in the review loop that should be.
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,9 +90,10 @@ def find(task: str, *roots) -> Path | None:
     return None
 
 
-def collect(plans: list) -> dict:
+def collect(plans: list, *, links: bool = False, runner=None) -> dict:
     """One row per dispatched review."""
-    drafts, absent = [], []
+    drafts, absent, rows = [], [], []
+    by_task = {str(pl.get("task") or ""): pl for pl in plans or []}
     for pl in plans or []:
         task = str(pl.get("task") or "")
         path = find(task, pl.get("worktree"), pl.get("repo"))
@@ -101,13 +104,62 @@ def collect(plans: list) -> dict:
             drafts.append(parse(task, path, path.read_text(errors="replace")))
         except OSError as e:
             absent.append({"task": task, "reason": f"unreadable: {e}"})
-    ready = [d for d in drafts if d.submittable]
+    for d in drafts:
+        row = d.as_dict()
+        pl = by_task.get(d.task, {})
+        row["reviewUrl"] = link(d, runner=runner) if links else None
+        row["sessionUrl"] = SESSION_URL.format(sid=pl["session"]) if pl.get("session") else None
+        row["taskUrl"] = TASK_URL.format(id=pl["taskId"]) if pl.get("taskId") else None
+        rows.append(row)
     return {
         "drafted": len(drafts),
-        "submittable": len(ready),
-        "reviews": [d.as_dict() for d in drafts],
+        "submittable": sum(1 for d in drafts if d.submittable),
+        "reviews": rows,
         "absent": absent,
     }
+
+
+TASK_URL = "https://codimango.internalmeta.com/submissions/{id}"
+SESSION_URL = "https://agentcloud.internalmeta.com/{sid}"
+
+
+def link(draft: Draft, *, runner=None) -> str:
+    """A URL for the full review, because a devserver path is not one.
+
+    The orchestrator thread renders a one-line verdict and the reader has no way
+    to reach the reasoning behind it -- the draft is a file on a host they are
+    not on. A private paste is durable, clickable, and costs one call.
+
+    The URL is cached beside the draft: re-pasting on every status call would
+    make a new link each time, and a verdict whose link changes is worse than
+    one with none.
+    """
+    cached = Path(draft.path).with_suffix(".paste")
+    try:
+        existing = cached.read_text().strip()
+        if existing.startswith("http"):
+            return existing
+    except OSError:
+        pass
+
+    run = runner or (lambda argv, text: subprocess.run(
+        argv, input=text, capture_output=True, text=True, timeout=180))
+    r = run(["meta", "phabricator.paste", "create", "--stdin", "--private",
+             "--title", f"review: {draft.task}", "--language", "markdown",
+             "--output", "json"], Path(draft.path).read_text(errors="replace"))
+    out = getattr(r, "stdout", "") or ""
+    if getattr(r, "returncode", 1) != 0 or "{" not in out:
+        return ""
+    try:
+        url = str(json.loads(out[out.index("{"):]).get("url") or "")
+    except ValueError:
+        return ""
+    if url:
+        try:
+            cached.write_text(url)
+        except OSError:
+            pass
+    return url
 
 
 def render(res: dict) -> str:
@@ -115,19 +167,23 @@ def render(res: dict) -> str:
     if not rows and not res.get("absent"):
         return "No reviews drafted yet."
     out = [f"**Reviews drafted — {res['drafted']}, of which {res['submittable']} are complete "
-           "and ready for you to submit.** Nothing has been submitted.", ""]
+           "and ready for you to submit.** Nothing has been submitted.", "",
+           "| | Task | Verdict | Review | Session |",
+           "|---|---|---|---|---|"]
     for r in sorted(rows, key=lambda x: (not x["submittable"], x["task"])):
         mark = "✓" if r["submittable"] else "·"
-        why = ""
+        # A path on a devserver is not a link. Fall back to naming it, but say
+        # so, rather than rendering it as though it were reachable.
+        review = (f"[full review]({r['reviewUrl']})" if r.get("reviewUrl")
+                  else f"`{r['path']}` (on host)")
+        session = f"[worker]({r['sessionUrl']})" if r.get("sessionUrl") else "—"
+        verdict = r["decision"] or "**no decision**"
+        note = ""
         if r["missingSections"]:
-            why = f"  — missing: {', '.join(r['missingSections'][:3])}"
-        elif not r["decision"]:
-            why = "  — no decision recorded"
+            note = f" <br>missing: {', '.join(r['missingSections'][:3])}"
         elif r["words"] > WORD_CAP:
-            why = f"  — {r['words']} words, over the {WORD_CAP} cap"
-        out.append(f"{mark} {r['task']}  **{r['decision'] or 'no decision'}**"
-                   f"  ({r['words']}w){why}")
-        out.append(f"    {r['path']}")
+            note = f" <br>{r['words']}w, over the {WORD_CAP} cap"
+        out.append(f"| {mark} | {r['task']} | {verdict}{note} | {review} | {session} |")
     for a in res.get("absent") or []:
-        out.append(f"· {a['task']}  — {a['reason']}")
+        out.append(f"| · | {a['task']} | — | {a['reason']} | — |")
     return "\n".join(out)

@@ -4570,5 +4570,76 @@ check("review-fleet fetches a missing checkout rather than skipping",
       "could not fetch one" in _rf2, True)
 
 
+# --- one argument shape, everywhere ------------------------------------------
+#
+# `read` was the only task-scoped subcommand that rejected `--repo`. An agent
+# that learned the shape from the other thirty passed it, got "unrecognized
+# arguments", and had to discover a second shape by trial: "the first signal
+# read used the wrong argument shape".
+
+import re as _re5  # noqa: E402
+import subprocess as _sp5  # noqa: E402
+
+_bin = "/home/kngreen/.claude/skills/benchsmith/bin/benchsmith"
+_root_help = _sp5.run([_bin, "--help"], capture_output=True, text=True).stdout
+_names = _re5.search(r"\{([a-z0-9,\-]+)\}", _root_help.replace("\n", "")).group(1).split(",")
+
+_inconsistent = []
+for _n in _names:
+    _h = _sp5.run([_bin, _n, "--help"], capture_output=True, text=True).stdout
+    if _re5.search(r"--task[ ,\n]", _h) and "--repo" not in _h:
+        _inconsistent.append(_n)
+check("every task-scoped subcommand also accepts --repo", _inconsistent, [])
+check("...across the whole surface", len(_names) > 30, True)
+
+
+# --- a verdict needs a link, not a path ---------------------------------------
+#
+# The orchestrator thread renders "task: Request changes. The grader bypasses
+# the submitted iOS target" and the reader has no way to reach the reasoning:
+# the draft is a file on a host they are not on.
+
+_lk = Path(tempfile.mkdtemp()) / "wt"
+(_lk / ".benchsmith" / "handoff").mkdir(parents=True)
+_okmd = ("\n".join(f"### {s}" for s in rrp.REQUIRED_SECTIONS)
+         + "\n- **Decision:** Request changes\n")
+(_lk / ".benchsmith" / "handoff" / "review-t1.md").write_text(_okmd)
+
+_pastes = []
+
+
+def _fake_paste(argv, text):
+    _pastes.append(text)
+    class R:
+        returncode = 0
+        stdout = json.dumps({"url": f"https://paste/P{len(_pastes)}"})
+    return R
+
+
+_plans = [{"task": "t1", "worktree": str(_lk), "session": "sess-1", "taskId": "207170"}]
+_res2 = rrp.collect(_plans, links=True, runner=_fake_paste)
+_row = _res2["reviews"][0]
+check("the review gets a link", _row["reviewUrl"], "https://paste/P1")
+check("...carrying the review text", "Decision" in _pastes[0], True)
+check("the worker session is linked", _row["sessionUrl"].endswith("sess-1"), True)
+check("the task is linked", _row["taskUrl"].endswith("207170"), True)
+
+# A verdict whose link changes on every look is worse than one with none.
+_before_n = len(_pastes)
+_again = rrp.collect(_plans, links=True, runner=_fake_paste)
+check("the link is cached, not regenerated", len(_pastes), _before_n)
+check("...and is the same URL", _again["reviews"][0]["reviewUrl"], _row["reviewUrl"])
+
+_tbl = rrp.render(_res2)
+check("the report is a table", _tbl.count("|") > 8, True)
+check("...with the verdict in it", "Request changes" in _tbl, True)
+check("...and a clickable review", "[full review](https://paste/P1)" in _tbl, True)
+check("...and still says nothing was submitted", "Nothing has been submitted" in _tbl, True)
+
+# Without links, a host path is shown as a path -- not dressed up as a link.
+_nolink = rrp.render(rrp.collect(_plans, links=False))
+check("a host path is labelled as on-host", "(on host)" in _nolink, True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

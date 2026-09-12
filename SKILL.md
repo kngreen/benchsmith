@@ -450,6 +450,12 @@ recorded, and it is under the 700-word cap. A `Decision` field still holding the
 `Accept / Request changes / Reject` menu is **not** a decision — the reviewer left it untouched,
 and treating it as one would put an unmade decision in front of an author.
 
+Each row links to the **full review** as a private Phabricator paste and to the **worker session**
+that wrote it. A devserver path is not a link — the reader of an orchestrator thread is not on that
+host — so the review is pasted once and the URL cached beside the draft. A verdict whose link
+changes every time you look is worse than one with no link at all. `--no-links` skips pasting for
+an offline or throwaway look.
+
 **This is where your green light belongs.** Nothing above it needs you; nothing below it happens
 without you.
 

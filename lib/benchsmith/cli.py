@@ -924,7 +924,7 @@ def cmd_reviewstatus(args) -> int:
         _out({"drafted": 0, "reviews": [],
               "reason": "no review run recorded in this checkout"})
         return 0
-    res = rr_mod.collect(run.get("plans") or [])
+    res = rr_mod.collect(run.get("plans") or [], links=not args.no_links)
     res["brief"] = rr_mod.render(res)
     # Nothing here submits. That is the one step in the review loop that should
     # stay a person's, and the whole point of gathering them is to make it easy.
@@ -1102,6 +1102,23 @@ def cmd_trailers(args) -> int:
     return 0
 
 
+def _friendly(e: Exception) -> str | None:
+    """A message for the errors a caller can actually act on.
+
+    A traceback tells an agent the tool is broken. Most of these mean it passed
+    the wrong thing, which is a different problem with a different fix -- and
+    guessing at the difference is how one ends up trying a second argument shape
+    instead of a correct id.
+    """
+    from .adapter import IdentityMismatch, Unresolved
+
+    if isinstance(e, IdentityMismatch):
+        return f"{e}. The name and the id disagree: check which task you meant."
+    if isinstance(e, Unresolved):
+        return f"{e}"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="benchsmith", description="The hard-task bar for benchmark tasks.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1122,7 +1139,7 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("probe", help="resolve the platform CLI surface")
     s.set_defaults(fn=cmd_probe)
 
-    s = common(sub.add_parser("read", help="fresh, identity-checked platform read"), repo=False)
+    s = common(sub.add_parser("read", help="fresh, identity-checked platform read"))
     for flag in ("--task-id", "--task-uuid", "--source-repo", "--sha"):
         s.add_argument(flag, default="")
     s.set_defaults(fn=cmd_read)
@@ -1318,6 +1335,8 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("review-status", help="every drafted review, ready or not")
     s.add_argument("--repo", default=".")
+    s.add_argument("--no-links", action="store_true",
+                   help="skip creating a paste per review (offline, or a dry look)")
     s.set_defaults(fn=cmd_reviewstatus)
 
     s = sub.add_parser("review-fleet", help="work the queue of tasks assigned to you to review")
@@ -1432,7 +1451,14 @@ def main(argv: list[str] | None = None) -> int:
 
     args = p.parse_args(argv)
     try:
-        return args.fn(args)
+        try:
+            return args.fn(args)
+        except Exception as e:  # noqa: BLE001 - a traceback reads as a broken tool
+            friendly = _friendly(e)
+            if friendly is None:
+                raise
+            _out({"ok": False, "reason": friendly})
+            return 2
     except (ValueError, FileNotFoundError) as e:
         # A refused operation is a result, not a crash. The message is the point.
         print(f"benchsmith: {e}", file=sys.stderr)
