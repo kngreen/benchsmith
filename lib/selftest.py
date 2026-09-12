@@ -4392,7 +4392,13 @@ check("the critic's description leads with the no-task case", "NO task" in _cdes
 check("...and carries no double quotes for the frontmatter parser",
       chr(34) in _cdesc.split("---")[0], False)
 
-check("a bare critic invocation runs the queue", "benchsmith review-fleet --apply" in _critic, True)
+check("a bare critic invocation runs the queue", "review-fleet --apply" in _critic, True)
+# Telling an agent to run a command that is not on PATH is the same failure as
+# telling it to run one that does not exist: it reported the queue unworkable.
+check("...after locating the dispatcher, which is not on PATH",
+      "$BENCHSMITH_BIN" in _critic and "command -v benchsmith" in _critic, True)
+check("...and off-host means attach, not give up",
+      "Attach that devserver and retry once" in _critic, True)
 check("...and is told not to describe it", "Do not describe it" in _critic, True)
 check("...naming printing-a-command as the failure",
       "failed invocation" in _critic, True)
