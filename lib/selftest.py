@@ -4413,7 +4413,19 @@ check("...and carries no double quotes for the frontmatter parser",
 # that needs an authoring tool installed is not independent, and it stopped
 # outright when that tool was absent.
 check("the critic does not depend on benchsmith", "benchsmith" in _critic, False)
+# The review queue and the authoring backlog are disjoint sets -- 30 tasks vs
+# 37, zero overlap in what is actionable. Reading the wrong one would put the
+# author's own drafts in front of a reviewer.
 check("...and works its own queue", "tasks list --reviewing" in _critic, True)
+check("...not the authoring backlog",
+      "tasks list --json" in _critic or "--filter mine" in _critic, False)
+check("...taking only tasks assigned to it", "being_reviewed" in _critic, True)
+check("...and leaving needs_revision to the author",
+      "the author's move, not yours" in _critic, True)
+# Told to start a session without being told how is why it stopped last time.
+check("...and is told how to start one", "agentcloud.session create" in _critic, True)
+check("...with the harness that actually works on this tenant",
+      "--harness codex is rejected" in _critic.replace("`", ""), True)
 check("...dispatching one fresh session per task",
       "one fresh session per task" in _critic, True)
 check("...and is told not to describe it", "Do not describe it" in _critic, True)
