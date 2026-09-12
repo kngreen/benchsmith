@@ -446,34 +446,39 @@ class Journal:
             return row
         return None
 
-    def stop_reason(self) -> str | None:
-        # Repair terminates on closure, not on an exhausted budget. Continuing to
-        # harden after the last finding closes is a new commission and needs a
-        # new ask.
+    def stop_outcome(self) -> dict | None:
+        """Return termination separately from whether it blocks publication."""
         if self.mode == "repair":
             f = self.data.get("findings") or {}
             if f and not self.open_findings():
-                return f"repair complete: {self.closure_summary()} — hardening requires a new ask"
+                return {"kind": "complete", "blocking": False,
+                        "detail": f"repair complete: {self.closure_summary()} — hardening requires a new ask"}
             if self.data.get("probesSpent", 0) >= self.probe_budget():
-                return (f"probe budget of {self.probe_budget()} spent with "
-                        f"{len(self.open_findings())} findings still open")
-        """Why the campaign should stop, or None to keep going.
-
-        Round count is never a reason. What is bounded is hardening.
-        """
+                return {"kind": "probe-limit", "blocking": True,
+                        "detail": (f"probe budget of {self.probe_budget()} spent with "
+                                   f"{len(self.open_findings())} findings still open")}
         if self.data["noProgressStreak"] >= 3:
-            return "inert: three rounds with no change in sha, status or failing set"
+            return {"kind": "inert", "blocking": True,
+                    "detail": "inert: three rounds with no change in sha, status or failing set"}
         if self.data["ineffectiveStreak"] >= INEFFECTIVE_ROUND_CAP:
-            return f"{INEFFECTIVE_ROUND_CAP} measured rounds moved d(p) less than one trial-equivalent"
+            return {"kind": "ineffective", "blocking": True,
+                    "detail": (f"{INEFFECTIVE_ROUND_CAP} measured rounds moved d(p) less than "
+                               "one trial-equivalent")}
         # The hardening budget is a HARDEN-mode stop. In repair mode the findings
         # decide, and an exhausted hardening budget carried over from an earlier
         # commission must not close a repair with findings still open.
         if self.mode != "repair" and self.data["hardeningBudgetExhausted"]:
-            return f"hardening budget of {self.budget()} spent"
+            return {"kind": "hardening-limit", "blocking": True,
+                    "detail": f"hardening budget of {self.budget()} spent"}
         last = self.rounds[-1] if self.rounds else None
         if last and last.get("excursion"):
-            return f"unresolved excursion: {last['excursion']}"
+            return {"kind": "excursion", "blocking": True,
+                    "detail": f"unresolved excursion: {last['excursion']}"}
         return None
+
+    def stop_reason(self) -> str | None:
+        outcome = self.stop_outcome()
+        return str(outcome["detail"]) if outcome else None
 
     def set_status(self, status: str, *, oracle_passing: bool = True) -> None:
         if status not in STATUSES:

@@ -21,6 +21,8 @@ import socket
 import subprocess
 import time
 
+from . import remote_ref
+
 REF = "refs/heads/benchsmith-locks/__repo__"
 DEFAULT_MINUTES = 45
 
@@ -43,11 +45,11 @@ def _parse(msg: str) -> dict:
 
 def current(repo, *, remote: str = "origin") -> dict:
     """Who holds the branch, if anyone. Unreadable is not free."""
-    r = _git(repo, "ls-remote", "--heads", remote, REF)
-    if r.returncode:
+    observed = remote_ref.read(repo, remote, REF)
+    if not observed["readable"]:
         return {"readable": False, "held": None,
-                "reason": f"could not read the repository hold: {r.stderr.strip()[:140]}"}
-    sha = (r.stdout.split() or [""])[0]
+                "reason": f"could not read the repository hold: {observed['detail'][:140]}"}
+    sha = observed["sha"]
     if not sha:
         return {"readable": True, "held": False}
     info = _parse(_git(repo, "show", "-s", "--format=%B", sha).stdout)
@@ -76,17 +78,18 @@ def take(repo, *, why: str = "", minutes: int = DEFAULT_MINUTES,
     if not tok:
         return {"taken": False, "reason": "could not create the hold token"}
     # A hold that never expires is a hold somebody forgets to release.
-    p = _git(repo, "push", "-q", "--no-verify", remote, f"{tok}:{REF}")
-    if p.returncode:
-        return {"taken": False, "reason": f"another host claimed it first: {p.stderr.strip()[:120]}"}
-    return {"taken": True, "minutes": minutes, "why": why}
+    result = remote_ref.update(repo, remote, REF, tok)
+    if result["state"] != remote_ref.CONFIRMED:
+        return {"taken": False, "reason": result["detail"], "reconciliation": result}
+    return {"taken": True, "minutes": minutes, "why": why, "token": tok,
+            "reconciliation": result}
 
 
 def release(repo, *, remote: str = "origin") -> dict:
     now = current(repo, remote=remote)
     if not now.get("held"):
         return {"released": False, "reason": "not held"}
-    p = _git(repo, "push", "-q", "--no-verify",
-             f"--force-with-lease={REF}:{now['sha']}", remote, f":{REF}")
-    return {"released": p.returncode == 0,
-            "reason": "" if p.returncode == 0 else p.stderr.strip()[:140]}
+    result = remote_ref.update(repo, remote, REF, "", expected=now["sha"])
+    return {"released": result["state"] == remote_ref.CONFIRMED,
+            "reason": "" if result["state"] == remote_ref.CONFIRMED else result["detail"],
+            "reconciliation": result}

@@ -226,7 +226,13 @@ the worker, then binds the lease to that worker's session id. Until it is bound 
 only the dispatcher — which exits seconds later — so a lease judged by that process's liveness
 frees itself the moment dispatch finishes. That is worse than no lease: a second run claims tasks
 already being worked, two sessions edit one task, and worktrees get released out from under live
-workers.
+workers. A failed or indeterminate binding is a failed dispatch: benchsmith terminates the created
+session, confirms a terminal event, and only then releases the claim. Archiving without observed
+termination is not success.
+
+Remote ref updates reconcile ambiguous pushes with bounded backoff. A timeout may have landed, so
+the result is `confirmed`, `rejected`, or `unknown` based on the observed ref; `unknown` never starts
+a worker or releases a claim.
 
 **Never release a worktree or lease on a task you have not confirmed is idle.** `worktree release`
 refuses when the task is leased to a session, and refuses when it cannot read the lease at all — an
@@ -272,7 +278,7 @@ thinking hard and one that died twenty minutes ago both look like silence:
 | `working` | activity within the last 90 minutes |
 | `stalled` | nothing for 90+ minutes — it is stuck, not thinking |
 | `finished` | the run ended |
-| `unknown` | no parseable timestamps; unverified, **not** healthy |
+| `unknown` | no parseable timestamp or an event dated in the future; unverified, **not** healthy |
 
 The threshold is deliberately generous: a worker waiting an hour on a validation wave is doing
 exactly the right thing. `errorEvents` counts errors in its journal, and `overRuntime` flags one
@@ -347,7 +353,11 @@ turns this off.
 
 `collect` reads `<repo>/.benchsmith/handoff/<task>.json` first and falls back to the session
 journal. The file is the contract: it survives a launcher that loses its pipe, and it means the
-worker's visible last word can be a plain sentence instead of a wire format.
+worker's visible last word can be a plain sentence instead of a wire format. Workers finalize with
+`benchsmith handoff`: it atomically renames a handoff containing the exact session and lease token,
+then releases that token with compare-and-swap. A crash after the rename leaves phase `durable` and
+is safe to replay; phase `released` is terminal. Existing handoffs without lease fields remain
+readable but are not allowed to guess which lease to release.
 
 | Handoff state | What you do |
 |---|---|

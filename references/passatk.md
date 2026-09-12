@@ -16,6 +16,9 @@ Three differences, each enforced rather than noted:
 `metacode` maps to the `avocado` family and is therefore subject to the same model-under-test
 saturation block as the hosted tracks.
 
-**Not yet exercised against live iOS infrastructure.** The normalisation and the blocks are
-fixture-tested; the `run.sh` integration is not. Treat a first real run as a probe of this code,
-not only of the task.
+**Route before leasing or dispatch.** Darwin is a native backend. On another host,
+`BENCHSMITH_IOS_BACKEND` must name an executable native runner; otherwise the task is reported
+`unavailable` without consuming a worker or lease. This blocks only that task, not the Linux fleet.
+
+The normalisation is fixture-tested, but the `run.sh` integration still needs proof from a native
+host. Treat a first real run as a probe of that integration, not only of the task.

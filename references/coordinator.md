@@ -180,10 +180,11 @@ work reaches the remote — was never done), the lane is free, and the remote he
 base the commit was prepared on. A moved remote means rebase and re-gate; pushing anyway would
 measure a tree nobody gated.
 
-**A rebase does not always need a re-gate.** When the remote moved and the rebase leaves this
-task's tree object byte-identical, every check the gate ran is still true of it — the oracle ran on
-exactly those bytes. `publish --rebase` returns `needsRegate: false` and the existing receipt
-stands.
+**A rebase does not always need a full re-gate.** When the remote moved and the rebase leaves this
+task's tree object byte-identical, only explicitly whitelisted tree-invariant evidence is carried
+(`oracle`, `config-integrity`, and `tags`). Scope, diff ratchet/weakening, contamination, and review
+findings rerun against the rebased commit. A new exact-commit receipt is issued only if they pass;
+then `publish --rebase` returns `needsRegate: false`. The old receipt never stands for a new SHA.
 
 That matters because **the coordinator has no task oracle and cannot re-gate**. Returning every
 rebase to a worker meant that by the time the worker answered, main had moved again: one task went

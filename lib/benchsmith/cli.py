@@ -104,6 +104,39 @@ def _load(args) -> dict:
     return json.loads(Path(args.input).read_text())
 
 
+def _bind_worker(lease, sid: str, worktree: str, task: str) -> dict:
+    """Bind a created worker or terminate it before reporting dispatch success."""
+    if lease is None:
+        return {"ok": True, "bound": False, "noRemoteLease": True}
+    bound = lease.bind(sid)
+    if bound.get("bound"):
+        try:
+            dispatch_mod.write_assignment(worktree, task, sid, lease.sha, lease.task)
+            return {"ok": True, **bound}
+        except OSError as error:
+            bound = {"bound": False, "reason": f"could not persist worker assignment: {error}"}
+    stopped = dispatch_mod.relieve(sid)
+    released = lease.release() if stopped.get("terminated") else {
+        "released": False,
+        "reason": "session termination was not confirmed; retaining the lease",
+    }
+    return {"ok": False, **bound, "termination": stopped, "release": released}
+
+
+def _release_session_lease(repo: Path, task: str, sid: str) -> dict:
+    """Release only the lease whose token names the terminated session."""
+    lease = rlease_mod.RemoteLease(task, repo)
+    sha = lease.remote_sha()
+    if not sha:
+        return {"released": True, "reason": "already absent"}
+    owner = lease.owner(sha)
+    if owner.session != sid:
+        return {"released": False, "reason": f"lease belongs to {owner.session or 'no session'}",
+                "owner": owner.as_dict()}
+    lease.sha = sha
+    return lease.release()
+
+
 def cmd_bar(args) -> int:
     """Compute the §5 bar from a snapshot payload."""
     raw = _load(args)
@@ -428,7 +461,8 @@ def cmd_fleet(args) -> int:
                  "deadline": time.time() + args.max_runtime * 3600,
                  "maxRuntimeHours": args.max_runtime,
                  "plans": [{k: v for k, v in pl.items()
-                            if k in ("task", "repo", "worktree", "mode", "session")}
+                            if k in ("task", "repo", "worktree", "mode", "session",
+                                     "remoteLease", "remoteLeaseToken")}
                            for pl in plans if "session" in pl]}, indent=1))
         except OSError:
             pass
@@ -455,6 +489,12 @@ def cmd_fleet(args) -> int:
         # An idea is dispatched under its PROPOSED SLUG, not the card number: the
         # worker is creating that directory, and a card number is not a name.
         name = (info.get("suggestedSlug") or item.task) if mode == "scaffold" else item.task
+        if mode != "scaffold":
+            native = passatk_mod.capability(Path(target) / name)
+            if native.get("applicable") and not native.get("ready"):
+                plans.append({"task": item.task, "skipped": native["reason"],
+                              "state": native["state"], "capability": native})
+                continue
         # Its own working tree, or eight workers share one index and stage over
         # each other long before anything reaches a remote.
         # Claim the task across hosts before spending a worker on it. A local
@@ -521,15 +561,23 @@ def cmd_fleet(args) -> int:
             if not sid:
                 entry["warning"] = "started but returned no session id; it cannot be followed"
             entry["error"] = res.get("error") or (res.get("stderr") or "")[:200] or None
-            started.append({"task": item.task, "session": sid})
             print(f"[{n}/{len(ready)}] {item.task}: started {sid or '(no session id)'}",
                   file=sys.stderr, flush=True)
             if sid:
-                claimed = [c for c in claimed if c[1] != item.task]  # in use, keep it
                 if lease is not None:
-                    # Hand the lease to the worker. Until now it named this
-                    # process, which is about to exit.
-                    lease.bind(sid)
+                    lifecycle = _bind_worker(lease, sid, work_in, name)
+                    entry["leaseBinding"] = lifecycle
+                    if not lifecycle["ok"]:
+                        entry["ok"] = False
+                        entry["skipped"] = "worker terminated because lease binding was not confirmed"
+                        plans.append(entry)
+                        _persist()
+                        continue
+                    entry["remoteLeaseToken"] = lease.sha
+                claimed = [c for c in claimed if c[1] != item.task]
+                started.append({"task": item.task, "session": sid})
+            elif lease is not None:
+                lease.release()
             _persist()
         else:
             entry["shell"] = p.shell
@@ -630,16 +678,32 @@ def cmd_relieve(args) -> int:
     """
     repo = Path(args.repo).resolve()
     out = {"task": args.task, "oldSession": args.session_id}
-    if args.session_id:
-        out["ended"] = dispatch_mod.relieve(args.session_id)["relieved"]
-    if args.no_successor:
-        _out({**out, "successor": None})
-        return 0
     try:
         info = resolve_mod.resolve(args.task)
     except resolve_mod.Unresolved as e:
         _out({**out, "successor": None, "reason": str(e)})
         return 2
+    lease_repo = Path(info.get("repo") or repo)
+    if args.session_id:
+        termination = dispatch_mod.relieve(args.session_id)
+        out["termination"] = termination
+        if not termination.get("terminated"):
+            _out({**out, "successor": None,
+                  "reason": "old session termination was not confirmed; retaining its lease"})
+            return 2
+    if args.session_id and not args.no_remote_lease:
+        try:
+            old_release = _release_session_lease(lease_repo, args.task, args.session_id)
+        except rlease_mod.LeaseLost as e:
+            old_release = {"released": False, "reason": str(e)}
+        out["oldLease"] = old_release
+        if not old_release.get("released"):
+            _out({**out, "successor": None,
+                  "reason": "terminated worker's lease could not be released safely"})
+            return 2
+    if args.no_successor:
+        _out({**out, "successor": None})
+        return 0
     work_in = info.get("repo") or str(repo)
     if not args.shared_tree:
         try:
@@ -652,7 +716,7 @@ def cmd_relieve(args) -> int:
     lease = None
     if not args.no_remote_lease:
         try:
-            lease = rlease_mod.RemoteLease(args.task, info.get("repo") or repo)
+            lease = rlease_mod.RemoteLease(args.task, lease_repo)
             got = lease.acquire()
         except rlease_mod.LeaseLost as e:
             _out({**out, "successor": None, "reason": f"remote lease unreadable: {e}"})
@@ -678,7 +742,12 @@ def cmd_relieve(args) -> int:
         dispatch_mod.snooze(sid)
     if lease is not None:
         if sid:
-            lease.bind(sid)
+            lifecycle = _bind_worker(lease, sid, work_in, args.task)
+            out["leaseBinding"] = lifecycle
+            if not lifecycle["ok"]:
+                _out({**out, "successor": None,
+                      "reason": "successor lease binding was not confirmed"})
+                return 2
         else:
             # No session means no worker; holding the claim would strand the task.
             lease.release()
@@ -891,10 +960,18 @@ def cmd_reviewfleet(args) -> int:
                 dispatch_mod.snooze(sid)
             if lease is not None:
                 if sid:
-                    lease.bind(sid)
+                    lifecycle = _bind_worker(lease, sid, work_in, item.task)
+                    entry["leaseBinding"] = lifecycle
+                    if not lifecycle["ok"]:
+                        entry["skipped"] = "reviewer terminated because lease binding was not confirmed"
+                        plans.append(entry)
+                        continue
+                    entry["remoteLease"] = lease.ref
+                    entry["remoteLeaseToken"] = lease.sha
                 else:
                     lease.release()
-            started.append({"task": item.task, "session": sid})
+            if sid:
+                started.append({"task": item.task, "session": sid})
         else:
             entry["shell"] = p.shell
         plans.append(entry)
@@ -905,7 +982,8 @@ def cmd_reviewfleet(args) -> int:
         (rdir / "reviews.json").write_text(json.dumps(
             {"started": started, "at": time.time(),
              "plans": [{k: v for k, v in pl.items()
-                        if k in ("task", "repo", "worktree", "track", "session")}
+                        if k in ("task", "repo", "worktree", "track", "session",
+                                 "remoteLease", "remoteLeaseToken")}
                        for pl in plans if "session" in pl]}, indent=1))
 
     _out({"queue": len(items), "dispatchable": sum(1 for i in items if i.dispatchable),
@@ -989,6 +1067,20 @@ def cmd_config(args) -> int:
             print()
             print(config_mod.HOWTO)
     return 0
+
+
+def cmd_handoff(args) -> int:
+    """Durably record a terminal handoff, then release its exact task lease."""
+    try:
+        document = _load(args)
+        result = dispatch_mod.finalize_handoff(
+            Path(args.repo).resolve(), args.task, document, remote=args.remote
+        )
+    except (OSError, ValueError, dispatch_mod.DispatchRefused) as error:
+        _out({"ok": False, "phase": "not-written", "reason": str(error)})
+        return 2
+    _out(result)
+    return 0 if result["ok"] else 2
 
 
 def cmd_fmt(args) -> int:
@@ -1380,6 +1472,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--repo", default="", help="read the handoff file from here first")
     s.add_argument("--task", default="")
     s.set_defaults(fn=cmd_collect)
+
+    s = common(sub.add_parser("handoff", help="persist a terminal handoff and release its lease"))
+    s.add_argument("input", nargs="?", default="-")
+    s.add_argument("--remote", default="origin")
+    s.set_defaults(fn=cmd_handoff)
 
     s = sub.add_parser("resolve", help="task name, id, or submissions URL -> a bound task")
     s.add_argument("ref")

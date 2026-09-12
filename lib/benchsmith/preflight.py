@@ -225,6 +225,27 @@ def run(repo_root: Path | None = None, task: str | None = None) -> dict:
             )
             blocking.append("journal")
 
+        try:
+            from .passatk import capability
+
+            native = capability(Path(repo_root) / task)
+            if native.get("applicable"):
+                rows.append({
+                    "kind": "host",
+                    "name": "iOS execution backend",
+                    "state": "present" if native["ready"] else "MISSING",
+                    "path": native.get("backend"),
+                    "usedFor": "running the iOS oracle and participant cohorts",
+                    "degradesTo": None if native["ready"] else native["reason"],
+                })
+                if not native["ready"]:
+                    blocking.append("ios-execution-backend")
+        except Exception as error:  # noqa: BLE001
+            rows.append({"kind": "host", "name": "iOS execution backend", "state": "MISSING",
+                         "path": None, "usedFor": "running iOS tasks",
+                         "degradesTo": f"could not probe: {error}"})
+            blocking.append("ios-execution-backend")
+
     return {
         "ok": not blocking,
         "blocking": blocking,

@@ -22,13 +22,19 @@ catching real defects. Two of its judgements are worth keeping deliberately:
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-GRADED = re.compile(r"(^|/)(steps/[^/]+/)?tests?/.*\.py$")
+GRADED = re.compile(r"(^|/)(steps/[^/]+/)?tests?/.*\.(py|go|swift)$")
+PATCH_CONFIG = re.compile(r"(^|/)(steps/[^/]+/)?tests?/config\.json$")
+GO_TEST = re.compile(r"(?m)^\s*func\s+(Test[A-Za-z0-9_]+)\s*\(")
+GO_ASSERT = re.compile(r"\b(?:t|tb)\.(?:Errorf?|Fatalf?|FailNow)\s*\(|\b(?:assert|require)\.[A-Za-z0-9_]+\s*\(")
+SWIFT_TEST = re.compile(r"(?m)^\s*func\s+(test[A-Za-z0-9_]+)\s*\(")
+SWIFT_ASSERT = re.compile(r"\bXCTAssert[A-Za-z0-9_]*\s*\(")
 
 # Tokens that turn a failing assertion into a passing one.
 WEAKEN_TOKENS = [
@@ -124,6 +130,59 @@ def test_names(text: str) -> set[str]:
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test_")}
 
 
+def _patch_sources(text: str) -> dict[str, str]:
+    """Extract candidate test source carried inside a config's test_patch."""
+    try:
+        patch = json.loads(text).get("test_patch") or ""
+    except (ValueError, TypeError) as error:
+        raise SyntaxError(f"config JSON does not parse: {error}") from error
+    sources: dict[str, list[str]] = {}
+    current = ""
+    for line in patch.splitlines():
+        if line.startswith("+++ "):
+            current = line[4:].removeprefix("b/")
+            if current == "/dev/null":
+                current = ""
+            else:
+                sources.setdefault(current, [])
+        elif current and line.startswith("+") and not line.startswith("+++"):
+            sources[current].append(line[1:])
+        elif current and line.startswith(" "):
+            sources[current].append(line[1:])
+    return {path: "\n".join(lines) + "\n" for path, lines in sources.items()
+            if re.search(r"(?:_test\.go$|Tests?\.swift$|(^|/)tests?/.*\.py$)", path)}
+
+
+def _sources(path: str, text: str) -> dict[str, str]:
+    if PATCH_CONFIG.search(path):
+        return _patch_sources(text)
+    return {path: text} if GRADED.search(path) else {}
+
+
+def _metrics(path: str, text: str) -> tuple[set[str], int]:
+    suffix = Path(path).suffix
+    if suffix == ".py":
+        return test_names(text), counts(text)[1]
+    if suffix == ".go":
+        try:
+            parsed = subprocess.run(["gofmt"], input=text, capture_output=True, text=True,
+                                    timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise SyntaxError(f"Go parser unavailable: {error}") from error
+        if parsed.returncode:
+            raise SyntaxError("Go source does not parse: " + parsed.stderr.strip()[:120])
+        return set(GO_TEST.findall(text)), len(GO_ASSERT.findall(text))
+    if suffix == ".swift":
+        if text.count("{") != text.count("}"):
+            raise SyntaxError("unbalanced Swift braces in extracted patch source")
+        return set(SWIFT_TEST.findall(text)), len(SWIFT_ASSERT.findall(text))
+    raise SyntaxError(f"unsupported graded syntax: {path}")
+
+
+def _graded(path: str) -> bool:
+    return bool(GRADED.search(path) or PATCH_CONFIG.search(path))
+
+
 def _records(text: str | None) -> dict:
     out = {}
     for line in (text or "").splitlines():
@@ -164,30 +223,45 @@ def check_ratchet(repo: Path, paths: list[str], cs: ChangeSet | None = None) -> 
     unparsed: list[Finding] = []
     examined = 0
     for path in paths:
-        if not GRADED.search(path):
+        if not _graded(path):
             continue
         new, old = blob(repo, cs.new, path), blob(repo, cs.old, path)
         if old is None:
             if new is None:
                 continue
             try:
-                counts(new)
+                new_sources = _sources(path, new)
+                if not new_sources:
+                    raise SyntaxError("test patch contains no supported graded source")
+                for source_path, source in new_sources.items():
+                    names, assertions = _metrics(source_path, source)
+                    if names and assertions == 0:
+                        raise SyntaxError(f"{source_path} contains tests but zero examined assertions")
             except SyntaxError as e:
                 unparsed.append(Finding(path, f"does not parse: {str(e).splitlines()[0]}"))
                 continue
-            examined += 1
+            examined += len(new_sources)
             continue
         if new is None:
             findings.append(Finding(path, "graded test file deleted outright"))
             continue
         try:
-            _, old_a = counts(old)
-            _, new_a = counts(new)
-            gone = test_names(old) - test_names(new)
+            old_sources, new_sources = _sources(path, old), _sources(path, new)
+            if not new_sources:
+                raise SyntaxError("test patch contains no supported graded source")
+            old_metrics = [_metrics(p, source) for p, source in old_sources.items()]
+            new_metrics = [_metrics(p, source) for p, source in new_sources.items()]
+            old_names = set().union(*(m[0] for m in old_metrics)) if old_metrics else set()
+            new_names = set().union(*(m[0] for m in new_metrics)) if new_metrics else set()
+            old_a = sum(m[1] for m in old_metrics)
+            new_a = sum(m[1] for m in new_metrics)
+            if new_names and new_a == 0:
+                raise SyntaxError("graded tests contain zero examined assertions")
+            gone = old_names - new_names
         except SyntaxError as e:
             unparsed.append(Finding(path, f"does not parse: {str(e).splitlines()[0]}"))
             continue
-        examined += 1
+        examined += len(new_sources)
         proven = fresh_proofs(repo, path.split("/tests/")[0].split("/steps/")[0], cs=cs)
         for name in sorted(gone):
             if name not in proven:
@@ -204,23 +278,27 @@ def check_weakening(repo: Path, paths: list[str], cs: ChangeSet | None = None) -
     unparsed: list[Finding] = []
     examined = 0
     for path in paths:
-        if not GRADED.search(path):
-            continue
-        r = (_git(repo, "diff", "--cached", "-U0", "--", path) if cs.source == "index"
-             else _git(repo, "diff", "-U0", cs.old, cs.new, "--", path))
-        if r.returncode != 0 or not r.stdout.strip():
+        if not _graded(path):
             continue
         new = blob(repo, cs.new, path)
-        if new is not None:
-            try:
-                ast.parse(new)
-            except SyntaxError as e:
-                # Line-based checks would "examine" this and report clean.
-                unparsed.append(Finding(path, f"does not parse: {str(e).splitlines()[0]}"))
-                continue
-        examined += 1
-        added = [l[1:] for l in r.stdout.splitlines() if l.startswith("+") and not l.startswith("+++")]
-        removed = [l[1:] for l in r.stdout.splitlines() if l.startswith("-") and not l.startswith("---")]
+        old = blob(repo, cs.old, path)
+        try:
+            new_sources = _sources(path, new or "")
+            if not new_sources:
+                raise SyntaxError("test patch contains no supported graded source")
+            for source_path, source in new_sources.items():
+                names, assertions = _metrics(source_path, source)
+                if names and assertions == 0:
+                    raise SyntaxError(f"{source_path} contains tests but zero examined assertions")
+        except SyntaxError as e:
+            unparsed.append(Finding(path, f"does not parse: {str(e).splitlines()[0]}"))
+            continue
+        examined += len(new_sources)
+        old_lines = (old or "").splitlines()
+        new_lines = (new or "").splitlines()
+        delta = list(difflib.unified_diff(old_lines, new_lines, n=0))
+        added = [l[1:] for l in delta if l.startswith("+") and not l.startswith("+++")]
+        removed = [l[1:] for l in delta if l.startswith("-") and not l.startswith("---")]
         for line in added:
             for pat, label in WEAKEN_TOKENS:
                 if pat.search(line):
@@ -258,6 +336,6 @@ def run(repo: Path, paths: list[str] | None = None) -> dict:
             "source": cs.source,
             "detail": ("; ".join(f"{f.path}: {f.what}" for f in all_f[:4]) if all_f
                        else (f"{examined} graded file(s) clean ({cs.source})" if examined
-                             else f"no graded python file in the {cs.source} diff")),
+                             else f"no supported graded source in the {cs.source} diff")),
         }
     return out

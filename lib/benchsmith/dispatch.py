@@ -20,6 +20,7 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Probed against the live API, not assumed: `--harness` accepts `codex` and
@@ -52,12 +53,16 @@ PROXY_PREAMBLE = (
 # A worker returns this and nothing else. The cap is the point: a supervisor
 # holding N full transcripts is the context-exhaustion the fleet audit measured
 # at 550-724K input tokens per call, most of it spent waiting.
-HANDOFF_FIELDS = ("work_item", "state", "base_sha", "commit_sha", "gate_receipt", "next_action", "note")
+HANDOFF_FIELDS = (
+    "work_item", "state", "base_sha", "commit_sha", "gate_receipt", "next_action", "note",
+    "lease_token", "lease_task", "session", "finalization",
+)
 
 # Where a worker also writes its answer. Stdout is not durable: a launcher that
 # backgrounds the process, or drops its pipe, loses the handoff and the work
 # with it -- observed once, where a completed local pass reported nothing.
 HANDOFF_DIR = ".benchsmith/handoff"
+ASSIGNMENT_DIR = ".benchsmith/assignments"
 HANDOFF_STATES = frozenset({
     "ready_to_publish", "blocked", "needs_human", "no_change", "failed", "in_progress",
     # The commit is published and the platform is chewing on it. A wave takes
@@ -221,11 +226,11 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
         "get that far, report `state=blocked` and say where you stopped; do not report a skeleton "
         "as a result.\n\n"
         "YOU MAY NOT PUSH. Prepare the commit, run the gate, and stop.\n\n"
-        f"**Write the handoff to `{repo}/{HANDOFF_DIR}/{slug}.json`.** That file is the "
-        "answer: the coordinator reads it from disk, so it survives a launcher that backgrounds "
-        "you or loses its pipe.\n\n"
+        "**Finalize through the CLI; do not write the handoff file directly.** Pipe the JSON "
+        f"below to `$BENCHSMITH_BIN handoff --repo {shlex.quote(repo)} --task {shlex.quote(slug)}`. "
+        "It durably renames the handoff before releasing this worker's exact lease.\n\n"
         "```json\n"
-        '{"work_item":"...","state":"ready_to_publish|blocked|needs_human|no_change|failed",'
+        '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
         '"note":"<=200 chars"}\n'
         "```\n\n"
@@ -276,10 +281,11 @@ def review_prompt(task: str, repo: str, *, track: str = "", due: str = "") -> st
         "Bind every finding to the exact revision you read. A finding cited against a commit the "
         "task has moved past is worse than no finding: the author cannot reproduce it, and "
         "reconciling that costs more than the review saved.\n\n"
-        f"Write your report to `{repo}/{HANDOFF_DIR}/review-{task}.md`, and a handoff to "
-        f"`{repo}/{HANDOFF_DIR}/{task}.json` with `state` one of "
-        "`ready_to_publish` (feedback drafted and ready for a human to submit), `blocked`, "
-        "`needs_human`, or `failed`. Then say in one plain sentence what you found.\n"
+        f"Write your report to `{repo}/{HANDOFF_DIR}/review-{task}.md`. Finalize the JSON handoff "
+        f"through `$BENCHSMITH_BIN handoff --repo {shlex.quote(repo)} --task {shlex.quote(task)}` "
+        "with `state` one of `ready_to_publish` (feedback drafted and ready for a human to "
+        "submit), `blocked`, `needs_human`, or `failed`. Then say in one plain sentence what "
+        "you found.\n"
     )
 
 
@@ -307,11 +313,11 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
         "pushes creates the contention this design exists to remove.\n"
         "\n"
         "Do not work on any other task, and do not read another task's files.\n\n"
-        f"**Write the handoff to `{repo}/{HANDOFF_DIR}/{task}.json`.** That file is the "
-        "answer: the coordinator reads it from disk, so it survives a launcher that backgrounds "
-        "you or loses its pipe.\n\n"
+        "**Finalize through the CLI; do not write the handoff file directly.** Pipe the JSON "
+        f"below to `$BENCHSMITH_BIN handoff --repo {shlex.quote(repo)} --task {shlex.quote(task)}`. "
+        "It durably renames the handoff before releasing this worker's exact lease.\n\n"
         "```json\n"
-        '{"work_item":"...","state":"ready_to_publish|blocked|needs_human|no_change|failed",'
+        '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
         '"note":"<=200 chars"}\n'
         "```\n\n"
@@ -354,6 +360,12 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
     bad = _placeholder(task)
     if bad:
         raise DispatchRefused(bad)
+    if mode not in {"review", "scaffold"} and repo and _exists(repo, task):
+        from .passatk import capability
+
+        native = capability(Path(repo) / task)
+        if native.get("applicable") and not native.get("ready"):
+            raise DispatchRefused(native["reason"])
     if mode == "review":
         prompt = ((bootstrap_block() if bootstrap else "")
                   + review_prompt(task, repo, track=(idea or {}).get("track", ""),
@@ -558,33 +570,31 @@ _ERRORY = re.compile(r"\berror\b|\bexception\b|traceback|fatal|failed to", re.I)
 
 
 def _stamp(text: str) -> float | None:
-    """Parse an event timestamp. Unparseable is None, never now().
-
-    The journal emits local wall-clock with an abbreviation: `2026-09-11
-    09:26:07 EDT`. `%Z` accepts UTC and GMT and little else, so every real
-    timestamp parsed as None -- which meant `idleSeconds` was always None and
-    stall detection never fired on a single live worker. The fixtures used a
-    zone-less format and passed throughout.
-
-    A trailing alphabetic token is dropped and the rest read as local time,
-    which is what the platform is reporting.
-    """
-    from datetime import datetime
-
+    """Parse an event timestamp without discarding its UTC offset."""
     raw = str(text or "").strip()
     if not raw:
         return None
-    candidates = [raw]
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed.timestamp()
+    except ValueError:
+        pass
     parts = raw.split()
-    if len(parts) == 3 and parts[2].isalpha():
-        candidates.append(" ".join(parts[:2]))
-    candidates.append(raw.replace("T", " ").rstrip("Z"))
-    for cand in candidates:
-        for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
-            try:
-                return datetime.strptime(cand, fmt).timestamp()
-            except (ValueError, TypeError):
-                continue
+    offsets = {"UTC": 0, "GMT": 0, "EST": -5, "EDT": -4, "CST": -6, "CDT": -5,
+               "MST": -7, "MDT": -6, "PST": -8, "PDT": -7}
+    if len(parts) == 3 and parts[2] in offsets:
+        try:
+            zone = timezone(timedelta(hours=offsets[parts[2]]))
+            return datetime.strptime(" ".join(parts[:2]), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=zone
+            ).timestamp()
+        except ValueError:
+            return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw.replace("T", " "), fmt).timestamp()
+        except (ValueError, TypeError):
+            continue
     return None
 
 
@@ -618,6 +628,8 @@ def health(sid: str, *, runner=None, now: float | None = None) -> dict:
         # No parseable timestamps: we cannot tell, and guessing "healthy" is how
         # a dead worker holds a slot all day.
         state = "unknown"
+    elif idle < 0:
+        state = "unknown"
     elif idle > STALL_SECONDS:
         state = "stalled"
     else:
@@ -632,19 +644,36 @@ def health(sid: str, *, runner=None, now: float | None = None) -> dict:
         "reason": {
             "finished": "the run ended",
             "stalled": f"no activity for {int((idle or 0) / 60)} minutes",
-            "unknown": "no parseable timestamps; treat as unverified, not healthy",
+            "unknown": (f"latest event is {abs(int(idle))} seconds in the future; clock skew is "
+                        "unverified" if idle is not None and idle < 0 else
+                        "no parseable timestamps; treat as unverified, not healthy"),
             "working": f"last activity {int((idle or 0) / 60)} minutes ago",
         }.get(state, ""),
     }
 
 
-def relieve(sid: str, *, runner=None) -> dict:
-    """End a worker's session so its slot can be reused."""
-    argv = ["meta", "agentcloud.ui", "archive", "--session-id", sid]
+def relieve(sid: str, *, runner=None, poller=None, sleeper=time.sleep,
+            delays=(0, 1, 2, 4, 8)) -> dict:
+    """Terminate a worker and confirm its journal reached a terminal event."""
+    argv = ["meta", "dm.session", "archive", f"--session={sid}", "--output=json"]
     run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=120))
     r = run(argv)
     code = r[0] if isinstance(r, tuple) else r.returncode
-    return {"session": sid, "relieved": code == 0}
+    if code != 0:
+        return {"session": sid, "relieved": False, "terminated": False,
+                "reason": "termination command failed"}
+    if poller is None and runner is not None:
+        return {"session": sid, "relieved": False, "terminated": False,
+                "reason": "termination command succeeded but no confirmation reader was supplied"}
+    for attempt, delay in enumerate(delays, 1):
+        if delay:
+            sleeper(delay)
+        events, _ = poll_session(sid, runner=poller)
+        if any(str(e.get("type")) in ("run_finished", "session_archived") for e in events):
+            return {"session": sid, "relieved": True, "terminated": True,
+                    "attempts": attempt}
+    return {"session": sid, "relieved": False, "terminated": False,
+            "attempts": len(delays), "reason": "termination was not confirmed"}
 
 
 def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
@@ -656,7 +685,10 @@ def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
         path = Path(repo).expanduser() / HANDOFF_DIR / f"{task}.json"
         try:
             doc = parse_handoff(path.read_text())
-            return {"session": sid, "state": "done", "handoff": doc, "source": "file"}
+            final = finalize_handoff(repo, task, {**doc, "session": doc.get("session") or sid})
+            durable = parse_handoff(path.read_text())
+            return {"session": sid, "state": "done", "handoff": durable, "source": "file",
+                    "finalization": final}
         except (OSError, DispatchRefused):
             pass
 
@@ -689,8 +721,15 @@ def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
     # it, and an earlier mention must not be mistaken for the answer.
     for txt in reversed(texts):
         try:
-            return {"session": sid, "state": "done", "handoff": parse_handoff(txt),
-                    "source": "session"}
+            doc = parse_handoff(txt)
+            if repo and task:
+                final = finalize_handoff(repo, task, {**doc, "session": doc.get("session") or sid})
+                durable = parse_handoff(
+                    (Path(repo) / HANDOFF_DIR / f"{task}.json").read_text()
+                )
+                return {"session": sid, "state": "done", "handoff": durable,
+                        "source": "session", "finalization": final}
+            return {"session": sid, "state": "done", "handoff": doc, "source": "session"}
         except DispatchRefused:
             continue
     return {"session": sid,
@@ -724,3 +763,83 @@ def parse_handoff(text: str) -> dict:
         # takeable on trust.
         raise DispatchRefused("state=ready_to_publish with no commit_sha")
     return {k: doc.get(k) for k in HANDOFF_FIELDS if k in doc}
+
+
+def _atomic_json(path: Path, document: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    with tmp.open("w") as handle:
+        json.dump(document, handle, separators=(",", ":"))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def assignment_path(repo: str | Path, task: str) -> Path:
+    return Path(repo) / ASSIGNMENT_DIR / f"{task}.json"
+
+
+def write_assignment(repo: str | Path, task: str, session: str, lease_token: str,
+                     lease_task: str = "") -> Path:
+    path = assignment_path(repo, task)
+    _atomic_json(path, {"task": task, "session": session, "lease_token": lease_token,
+                        "lease_task": lease_task or task})
+    return path
+
+
+def finalize_handoff(repo: str | Path, task: str, document: dict, *, remote: str = "origin",
+                     lease_runner=None) -> dict:
+    """Persist a terminal handoff, then release its exact lease by CAS.
+
+    The two operations cannot be atomic across a filesystem and a Git remote.
+    Their order makes every crash safe: a durable handoff with a live lease is
+    recoverable, and a missing lease is observed only after the handoff exists.
+    """
+    parsed = parse_handoff(json.dumps(document))
+    state = str(parsed.get("state") or "")
+    if state == "in_progress":
+        raise DispatchRefused("in_progress is not a terminal handoff")
+
+    assignment = {}
+    try:
+        assignment = json.loads(assignment_path(repo, task).read_text())
+    except (OSError, ValueError):
+        pass
+    for field in ("session", "lease_token", "lease_task"):
+        assigned = str(assignment.get(field) or "")
+        supplied = str(parsed.get(field) or "")
+        if assigned and supplied and assigned != supplied:
+            raise DispatchRefused(f"handoff {field} does not match the dispatched worker")
+        if assigned:
+            parsed[field] = assigned
+
+    finalization = dict(parsed.get("finalization") or {})
+    finalization["phase"] = "durable"
+    parsed["finalization"] = finalization
+    path = Path(repo) / HANDOFF_DIR / f"{task}.json"
+    _atomic_json(path, parsed)
+
+    token = str(parsed.get("lease_token") or "")
+    if not token:
+        return {"ok": True, "path": str(path), "phase": "durable", "released": False,
+                "reason": "legacy handoff has no lease token; release requires reconciliation"}
+
+    from .remote_lease import RemoteLease
+
+    lease = RemoteLease(str(parsed.get("lease_task") or task), repo, remote=remote,
+                        runner=lease_runner)
+    released = lease.release(token)
+    if not released["released"]:
+        return {"ok": False, "path": str(path), "phase": "durable", "released": False,
+                "reason": released["reason"]}
+
+    parsed["finalization"] = {"phase": "released"}
+    _atomic_json(path, parsed)
+    return {"ok": True, "path": str(path), "phase": "released", "released": True,
+            "session": parsed.get("session"), "leaseToken": token}

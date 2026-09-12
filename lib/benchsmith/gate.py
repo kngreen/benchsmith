@@ -353,9 +353,11 @@ def check_excursion(journal: Journal, report: Report) -> None:
 
 
 def check_budget(journal: Journal, report: Report) -> None:
-    stop = journal.stop_reason()
-    if stop:
-        report.add("budget", FAIL, stop)
+    outcome = journal.stop_outcome()
+    if outcome and outcome["blocking"]:
+        report.add("budget", FAIL, outcome["detail"])
+    elif outcome:
+        report.add("budget", PASS, outcome["detail"])
     else:
         report.add(
             "budget",
@@ -808,7 +810,7 @@ def _emit_hook_receipt(repo_root: Path, task_name: str, report: Report,
     path = Path(os.environ.get("GATE_RECEIPT") or HOOK_RECEIPT.format(task=task_name))
     gates = {}
     for c in report.checks:
-        if not c.blocking:
+        if not c.required:
             continue
         gates[c.name] = {PASS: "pass", FAIL: "fail",
                          NOT_RUN: "not_run", TIMEOUT: "timeout"}.get(c.state, c.state.lower())
@@ -824,7 +826,7 @@ def _emit_hook_receipt(repo_root: Path, task_name: str, report: Report,
     return str(path)
 
 
-def write_receipt(repo_root: Path, task_name: str, report: Report) -> dict:
+def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_from: str = "") -> dict:
     """Bind a passing gate run to an exact clean HEAD."""
     repo_root = Path(repo_root)
     try:
@@ -841,6 +843,12 @@ def write_receipt(repo_root: Path, task_name: str, report: Report) -> dict:
         return {"state": "not_written", "reason": "worktree is dirty; commit before gating"}
     if not report.ok:
         return {"state": "not_written", "reason": "gate did not pass"}
+    by_name = {c.name: c for c in report.checks}
+    unsafe = [name for name in PUSH_REQUIRED
+              if name not in by_name or by_name[name].state != PASS]
+    if unsafe:
+        return {"state": "not_written",
+                "reason": "push-required checks are not PASS: " + ", ".join(unsafe)}
 
     # The task repos ship their own pre-push hook, and it reads a receipt at
     # $GATE_RECEIPT (default /tmp/gate-receipt-<task>.json) with `commit`,
@@ -865,12 +873,44 @@ def write_receipt(repo_root: Path, task_name: str, report: Report) -> dict:
         "source": "canonical" if canonical_receipt(repo_root) else "benchsmith-native-fallback",
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if derived_from:
+        body["derivedFrom"] = derived_from
     body["digest"] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()[:16]
 
     out = receipt_path(repo_root, task_name)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(body, indent=2) + "\n")
     return body
+
+
+def _receipt_digest(body: dict) -> str:
+    unsigned = {k: v for k, v in body.items() if k != "digest"}
+    return hashlib.sha256(json.dumps(unsigned, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _receipt_body(repo_root: Path, task_name: str) -> tuple[dict | None, str]:
+    path = receipt_path(repo_root, task_name)
+    if not path.is_file():
+        return None, "no receipt; run the gate on this exact tree"
+    try:
+        body = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        return None, f"unreadable receipt: {error}"
+    if body.get("digest") != _receipt_digest(body):
+        return None, "receipt digest does not match its contents"
+    if not body.get("ok"):
+        return None, "receipt records a failing gate"
+    unsafe = [name for name in PUSH_REQUIRED if (body.get("checks") or {}).get(name) != PASS]
+    if unsafe:
+        return None, "receipt lacks passing push-required checks: " + ", ".join(unsafe)
+    try:
+        receipt_at = datetime.fromisoformat(str(body.get("at") or ""))
+        committed_at = datetime.fromisoformat(_git(repo_root, "show", "-s", "--format=%cI", body["head"]))
+    except (ValueError, KeyError, subprocess.CalledProcessError) as error:
+        return None, f"receipt binding is unreadable: {error}"
+    if receipt_at < committed_at:
+        return None, "receipt predates the commit it claims to certify"
+    return body, ""
 
 
 def verify_receipt(repo_root: Path, task_name: str) -> tuple[bool, str]:
@@ -881,18 +921,14 @@ def verify_receipt(repo_root: Path, task_name: str) -> tuple[bool, str]:
     never a copy.
     """
     repo_root = Path(repo_root)
-    p = receipt_path(repo_root, task_name)
-    if not p.is_file():
-        return (False, "no receipt; run the gate on this exact tree")
+    body, problem = _receipt_body(repo_root, task_name)
+    if body is None:
+        return False, problem
     try:
-        body = json.loads(p.read_text())
         head = _git(repo_root, "rev-parse", "HEAD")
         dirty = bool(_git(repo_root, "status", "--porcelain"))
-    except (OSError, json.JSONDecodeError, subprocess.CalledProcessError) as e:
+    except (OSError, subprocess.CalledProcessError) as e:
         return (False, f"unreadable receipt or git failure: {e}")
-
-    if not body.get("ok"):
-        return (False, "receipt records a failing gate")
     if body.get("head") != head:
         return (False, f"receipt is for {str(body.get('head'))[:8]}, HEAD is {head[:8]}")
     if dirty:
@@ -900,14 +936,60 @@ def verify_receipt(repo_root: Path, task_name: str) -> tuple[bool, str]:
     return (True, f"{body['source']} receipt {body['digest']} for {head[:8]}")
 
 
+CARRYABLE_CHECKS = frozenset({"oracle", "config-integrity", "tags"})
+RERUN_ON_CARRY = frozenset(PUSH_REQUIRED) - CARRYABLE_CHECKS
+
+
+def carry_receipt(repo_root: Path, task_name: str, candidate: str) -> dict:
+    """Issue an exact-candidate receipt from whitelisted tree-invariant evidence."""
+    repo_root = Path(repo_root)
+    body, problem = _receipt_body(repo_root, task_name)
+    if body is None:
+        return {"ok": False, "reason": problem}
+    original = str(body.get("head") or "")
+    try:
+        before = _git(repo_root, "rev-parse", f"{original}:{task_name}")
+        after = _git(repo_root, "rev-parse", f"{candidate}:{task_name}")
+        head = _git(repo_root, "rev-parse", "HEAD")
+    except subprocess.CalledProcessError as error:
+        return {"ok": False, "reason": f"could not resolve receipt trees: {error}"}
+    if head != candidate:
+        return {"ok": False, "reason": f"candidate {candidate[:8]} is not HEAD {head[:8]}"}
+    if not before or before != after:
+        return {"ok": False, "reason": "task tree changed; receipt evidence cannot be carried"}
+
+    prior = body.get("checks") or {}
+    unavailable = sorted(name for name in CARRYABLE_CHECKS if prior.get(name) != PASS)
+    if unavailable:
+        return {"ok": False, "reason": "prior receipt lacks carryable evidence: " +
+                ", ".join(unavailable)}
+
+    report = Report()
+    for name in sorted(CARRYABLE_CHECKS):
+        report.add(name, PASS,
+                   f"carried from {original[:12]} over identical task tree {before[:12]}")
+    check_scope(repo_root, task_name, report)
+    check_diff(repo_root, report)
+    check_contamination(repo_root, report)
+    check_findings(task_name, Journal.open(repo_root, task_name), report)
+    report.require(PUSH_REQUIRED)
+    if not report.ok:
+        return {"ok": False, "reason": "candidate controls did not pass", "report": report.as_dict()}
+    receipt = write_receipt(repo_root, task_name, report, derived_from=original)
+    if not receipt.get("ok"):
+        return {"ok": False, "reason": receipt.get("reason", "receipt was not written")}
+    return {"ok": True, "receipt": receipt, "carried": sorted(CARRYABLE_CHECKS),
+            "rerun": sorted(RERUN_ON_CARRY)}
+
+
 # --- hook installation ------------------------------------------------------
 
 PRE_PUSH = """#!/bin/sh
 # benchsmith pre-push gate. Never bypass with --no-verify.
 set -eu
-exec python3 "$BENCHSMITH_BIN" gate --repo "$(git rev-parse --show-toplevel)" \\
+exec "$BENCHSMITH_BIN" gate --repo "$(git rev-parse --show-toplevel)" \\
      --task "${BENCHSMITH_TASK:?set BENCHSMITH_TASK to the task directory name}" \\
-     --require-push-set
+     --verify-receipt
 """
 
 

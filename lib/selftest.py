@@ -49,6 +49,14 @@ def check(name: str, got, want) -> None:
         print(f"  FAIL  {name}\n        want {want!r}\n        got  {got!r}")
 
 
+def passing_push_report() -> gate_mod.Report:
+    report = gate_mod.Report()
+    for name in gate_mod.PUSH_REQUIRED:
+        report.add(name, gate_mod.PASS, "fixture passed")
+    report.require(gate_mod.PUSH_REQUIRED)
+    return report
+
+
 def section(title: str) -> None:
     if VERBOSE:
         print(f"\n{title}")
@@ -545,7 +553,9 @@ with tempfile.TemporaryDirectory() as td:
 
     subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "j"], check=True, capture_output=True)
-    receipt = gate_mod.write_receipt(repo, "mytask", rep)
+    check("a partial report cannot mint a push receipt",
+          gate_mod.write_receipt(repo, "mytask", rep).get("state"), "not_written")
+    receipt = gate_mod.write_receipt(repo, "mytask", passing_push_report())
     check("receipt written on a clean passing tree", receipt.get("ok"), True)
     check("receipt verifies", gate_mod.verify_receipt(repo, "mytask")[0], True)
 
@@ -1109,7 +1119,7 @@ with tempfile.TemporaryDirectory() as td:
     check("pre-push hook was written", hook.is_file(), True)
     if hook.is_file():
         import re as _re
-        m = _re.search(r'exec python3 "([^"]+)"', hook.read_text())
+        m = _re.search(r'exec "([^"]+)"', hook.read_text())
         check("hook names an exec target", bool(m), True)
         if m:
             check("hook target exists on disk", Path(m.group(1)).is_file(), True)
@@ -1718,16 +1728,17 @@ check("...and appears as a NOT_RUN entry",
 check("the push-required set names the oracle", "oracle" in gate_mod.PUSH_REQUIRED, True)
 check("the push-required set names scope", "scope" in gate_mod.PUSH_REQUIRED, True)
 
-# The hook is the push boundary, so the required set has to be applied there --
-# a flag nothing passes protects nothing.
+# The hook is the push boundary, so it must call the same exact-receipt
+# predicate as native publication.
 _hook_src = Path(gate_mod.__file__).read_text()
-check("the installed hook applies the push-required set",
-      "--require-push-set" in _hook_src, True)
+check("the installed hook applies the native receipt predicate",
+      "--verify-receipt" in gate_mod.PRE_PUSH, True)
 
 
 # --- stage 4: one publisher per repository -----------------------------------
 
 from benchsmith import publish as pub  # noqa: E402
+from benchsmith import reviews as _carry_reviews  # noqa: E402
 
 _pr = Path(tempfile.mkdtemp()) / "pubrepo"
 _pr.mkdir(parents=True)
@@ -2123,7 +2134,7 @@ _dgit("reset", "-q", "--hard")
 _dgit("add", "-A")
 check("a docs-only change examines nothing", dc.run(_dr)["diff-ratchet"]["state"], "NOT_RUN")
 check("...and does not claim clean",
-      "no graded python file" in dc.run(_dr)["diff-ratchet"]["detail"], True)
+      "no supported graded source" in dc.run(_dr)["diff-ratchet"]["detail"], True)
 _dgit("reset", "-q", "--hard"); _dgit("clean", "-qfd")
 
 # Adding coverage must not be mistaken for removing it.
@@ -2711,7 +2722,7 @@ check("...and is not retryable", _broken["retryable"], False)
 # A handoff that exists only on stdout dies with the launcher.
 _hp = [a for a in dsp.plan("real-task", str(_dr2)).argv if "handoff" in a][0]
 check("the worker is told to write the handoff to a file",
-      f"{dsp.HANDOFF_DIR}/real-task.json" in _hp, True)
+      "handoff --repo" in _hp and "--task real-task" in _hp, True)
 check("...and is told not to print it", "Do not print the JSON itself" in _hp, True)
 
 # The official skeleton with nothing authored looks like progress and is not.
@@ -2809,7 +2820,8 @@ _missing = dsp.collect("s1", repo=str(_hf), task="absent",
 check("no file falls back to the session", _missing["state"], "finished-without-handoff")
 
 _prompt = [a for a in dsp.plan("t1", _REPO).argv if "handoff" in a][0]
-check("the worker writes the handoff to a file", ".benchsmith/handoff/t1.json" in _prompt, True)
+check("the worker finalizes the handoff through the CLI", "benchsmith" in _prompt and
+      "handoff --repo" in _prompt, True)
 check("...and is told not to print the JSON", "Do not print the JSON itself" in _prompt, True)
 check("...but to say one plain sentence", "one plain sentence" in _prompt, True)
 
@@ -3274,11 +3286,14 @@ _rg("init", "-q", "-b", "main"); _rg("config", "user.email", "t@t"); _rg("config
 for _d in ("mine", "theirs"):
     (_rb / _d / "tests" / "t.py").write_text("def test():\n    assert True\n")
     (_rb / _d / "instruction.md").write_text("spec\n")
+    (_rb / _d / "solve.sh").write_text("#!/bin/sh\nexit 0\n")
+(_rb / ".gitignore").write_text(".benchsmith/\n")
 _rg("add", "-A"); _rg("commit", "-qm", "base")
 _BASE = _rg("rev-parse", "HEAD").stdout.strip()
 (_rb / "mine" / "tests" / "t.py").write_text("def test():\n    assert 1 == 1\n")
 _rg("add", "-A"); _rg("commit", "-qm", "ours")
 _OURS = _rg("rev-parse", "HEAD").stdout.strip()
+_old_receipt = gate_mod.write_receipt(_rb, "mine", passing_push_report())
 _rg("checkout", "-q", _BASE)
 (_rb / "theirs" / "tests" / "t.py").write_text("def test():\n    assert 2 == 2\n")
 _rg("add", "-A"); _rg("commit", "-qm", "sibling")
@@ -3300,7 +3315,8 @@ def _remote_at(head):
     return g
 
 
-_hh = {"state": "ready_to_publish", "commit_sha": _OURS, "base_sha": _BASE, "gate_receipt": "r"}
+_hh = {"state": "ready_to_publish", "commit_sha": _OURS, "base_sha": _BASE,
+       "gate_receipt": _old_receipt["digest"]}
 
 try:
     pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False, check_hold=False)
@@ -3308,7 +3324,11 @@ try:
 except pub.PublishRefused as e:
     check("a moved remote is refused without rebase", "rebase=True" in str(e), True)
 
-_res = pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False, check_hold=False, rebase=True)
+_saved_requests = _carry_reviews.requests
+_carry_reviews.requests = lambda task, binary="codimango": {"requests": []}
+_res = pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False,
+                   check_hold=False, rebase=True)
+_carry_reviews.requests = _saved_requests
 check("with rebase it moves onto the new head", _res["state"], "rebased")
 check("...producing a real sha", len(_res["newSha"]) == 40 and " " not in _res["newSha"], True)
 check("...that is a descendant of the sibling's commit",
@@ -3363,9 +3383,7 @@ subprocess.run(["git", "-C", str(_hr), "commit", "-qm", "base"], capture_output=
 _hrp = Path(tempfile.mkdtemp()) / "receipt.json"
 os.environ["GATE_RECEIPT"] = str(_hrp)
 try:
-    _rep5 = gate_mod.Report()
-    _rep5.add("oracle", gate_mod.PASS, "1.0")
-    _rep5.add("scope", gate_mod.PASS, "1 path")
+    _rep5 = passing_push_report()
     gate_mod.write_receipt(_hr, "mytask", _rep5)
     _doc = json.loads(_hrp.read_text())
     _head = subprocess.run(["git", "-C", str(_hr), "rev-parse", "HEAD"],
@@ -3375,12 +3393,10 @@ try:
     check("...records cleanliness", _doc["dirty"], False)
     check("...and every gate passes", all(v == "pass" for v in _doc["gates"].values()), True)
 
-    _rep6 = gate_mod.Report()
-    _rep6.add("oracle", gate_mod.NOT_RUN, "no oracle command")
-    gate_mod.write_receipt(_hr, "mytask", _rep6)
-    _doc2 = json.loads(_hrp.read_text())
-    # not_run is not pass, in the repo's hook as much as in ours.
-    check("a not-run check is recorded as not_run", _doc2["gates"]["oracle"], "not_run")
+    _rep6 = passing_push_report()
+    next(c for c in _rep6.checks if c.name == "oracle").state = gate_mod.NOT_RUN
+    check("a not-run check cannot replace the hook receipt",
+          gate_mod.write_receipt(_hr, "mytask", _rep6).get("state"), "not_written")
 finally:
     os.environ.pop("GATE_RECEIPT", None)
 
@@ -3398,8 +3414,9 @@ def _ev(mins_ago, typ="block", body="ok"):
     # The real journal emits a trailing zone abbreviation. Using the platform's
     # actual format is the whole point: the zone-less one hid a parser that
     # failed on every live event.
+    zone = time.tzname[time.localtime().tm_isdst]
     ts = ((_dt.datetime.now() - _dt.timedelta(minutes=mins_ago))
-          .strftime("%Y-%m-%d %H:%M:%S") + " EDT")
+          .strftime("%Y-%m-%d %H:%M:%S") + f" {zone}")
     return {"seq": "1", "type": typ, "created": ts,
             "event": json.dumps({"block": {"text": body}})}
 
@@ -3458,7 +3475,11 @@ def _spy_relieve(argv):
     return R()
 
 
-check("a worker can be ended", dsp.relieve("s1", runner=_spy_relieve)["relieved"], True)
+check("archiving without observing termination is not success",
+      dsp.relieve("s1", runner=_spy_relieve)["terminated"], False)
+check("a worker can be ended only after confirmation",
+      dsp.relieve("s1", runner=_spy_relieve,
+                  poller=_feed([_ev(0, "session_archived")]), delays=(0,))["terminated"], True)
 check("...by archiving its session", "archive" in _calls4[-1], True)
 
 
@@ -3646,7 +3667,8 @@ check("an expired foreign lease is reaped",
 _st4 = {"ref": "theirs", "msg": "uuid=z host=other pid=1 task=mytask acquired=1000",
         "push_fails": True}
 check("losing the race to reap is not owning it",
-      rl.RemoteLease("mytask", "/tmp", runner=_lease_git(_st4)).acquire()["held"], False)
+      rl.RemoteLease("mytask", "/tmp", runner=_lease_git(_st4),
+                     reconcile_delays=(0, 0)).acquire()["held"], False)
 
 
 # --- the published skill must route before it sets up ------------------------
@@ -3776,7 +3798,9 @@ check("...because its PIDs mean nothing here", _far.same_host, False)
 
 # The one hook bypass in benchsmith, and its scope.
 _src = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/remote_lease.py").read_text()
-check("lease pushes bypass the repo hook", "--no-verify" in _src, True)
+check("lease pushes bypass the repo hook",
+      "--no-verify" in Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/remote_ref.py").read_text(),
+      True)
 check("...and only lease pushes do",
       "--no-verify" in Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/publish.py").read_text(),
       False)
@@ -4280,11 +4304,15 @@ check("a parsed hold carries who and until",
       {"holder": "kngreen", "host": "box", "until": "99", "why": "landing_stack"})
 
 # publish must refuse into a held branch, and must refuse when it cannot tell.
-_hh3 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
+_hh3 = {"state": "ready_to_publish", "commit_sha": "b" * 40, "base_sha": "b" * 40,
         "gate_receipt": "r"}
 _saved8 = rv._tasks
+_saved_verify8 = gate_mod.verify_receipt
+_saved_body8 = gate_mod._receipt_body
 try:
     rv._tasks = _status("draft")
+    gate_mod.verify_receipt = lambda repo, task: (True, "fixture receipt")
+    gate_mod._receipt_body = lambda repo, task: ({"digest": "r"}, "")
     import benchsmith.hold as _hmod
     _origh = _hmod.current
     _hmod.current = lambda repo, remote="origin": {
@@ -4311,6 +4339,8 @@ try:
     _hmod.current = _origh
 finally:
     rv._tasks = _saved8
+    gate_mod.verify_receipt = _saved_verify8
+    gate_mod._receipt_body = _saved_body8
 
 # --- rerun must not hardcode a subcommand either ------------------------------
 # Three doc edits have now silently no-oped on a bad anchor while the code
@@ -4376,9 +4406,8 @@ finally:
 # A successor with no lease is a second worker on a task somebody still owns.
 _relsrc = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text()
 _rel = _relsrc[_relsrc.index("def cmd_relieve"):_relsrc.index("def cmd_status")]
-check("relieve claims the lease before starting a successor", "RemoteLease" in _rel, True)
-check("...binds it to the new session", "lease.bind(sid)" in _rel, True)
-check("...and releases it if no worker started", "lease.release()" in _rel, True)
+check("relieve uses the shared lifecycle binding", "_bind_worker" in _rel, True)
+check("...releases only the terminated session's lease", "_release_session_lease" in _rel, True)
 
 
 # --- reviewers need a claim too ----------------------------------------------
@@ -4391,7 +4420,7 @@ _rfsrc = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").r
 _rf = _rfsrc[_rfsrc.index("def cmd_reviewfleet"):_rfsrc.index("def cmd_reviewstatus")]
 check("review-fleet claims each task", "RemoteLease" in _rf, True)
 check("...batching the lease read per repo", "lease_states_for_review" in _rf, True)
-check("...binding to the reviewer's session", "lease.bind(sid)" in _rf, True)
+check("...binding to the reviewer's session", "_bind_worker" in _rf, True)
 check("...and releasing when no reviewer started", "lease.release()" in _rf, True)
 # The flag is declared in the parser, not the handler.
 check("...with an opt-out",
@@ -4471,13 +4500,11 @@ _lt = rl.RemoteLease("t", "/tmp", runner=_timeout_push(True))
 _got = _lt.acquire()
 check("a timed-out acquire that landed is ours", _got["held"], True)
 check("...and the token is recorded so bind can follow", bool(_lt.sha), True)
-check("...and it says what happened", "timed out but landed" in _got.get("note", ""), True)
+check("...and it says what happened", "ambiguous push" in _got.get("note", ""), True)
 
-try:
-    rl.RemoteLease("t", "/tmp", runner=_timeout_push(False)).acquire()
-    check("a timed-out acquire that did NOT land is refused", "held", "refused")
-except rl.LeaseLost:
-    check("a timed-out acquire that did NOT land is refused", True, True)
+_missed = rl.RemoteLease("t", "/tmp", runner=_timeout_push(False),
+                         reconcile_delays=(0, 0)).acquire()
+check("a timed-out acquire that did NOT land is refused", _missed["held"], False)
 
 # The same for bind. An unbound lease on a running worker is the worst state:
 # it holds nothing anyone can see, and the next reaper takes its task.
@@ -4487,7 +4514,8 @@ _lb._run = _timeout_push(True)
 _lb.sha = "tok1"
 _res_b = _lb.bind("sess-1")
 check("a timed-out bind that landed is bound", _res_b["bound"], True)
-_lb2 = rl.RemoteLease("t", "/tmp", runner=_bind_git({"ref": ""}))
+_lb2 = rl.RemoteLease("t", "/tmp", runner=_bind_git({"ref": ""}),
+                      reconcile_delays=(0, 0))
 _lb2.acquire()
 _lb2._run = _timeout_push(False)
 _res_b2 = _lb2.bind("sess-1")
@@ -4666,6 +4694,272 @@ check("...and tells spawned children to attach the host first",
       "Attach the devserver where codimango is authenticated" in _critic2, True)
 check("...so a child does not rediscover it the hard way",
       "not on an authenticated host" in _critic2, True)
+
+
+# --- integration boundaries added after the fleet incident -----------------
+
+from benchsmith import remote_ref as rref  # noqa: E402
+
+
+def _result(code=0, stdout="", stderr=""):
+    class Result:
+        returncode = code
+    Result.stdout = stdout
+    Result.stderr = stderr
+    return Result()
+
+
+# A real bare remote proves the reconciliation wrapper is wired to Git rather
+# than only satisfying a source-level assertion.
+_ri_root = Path(tempfile.mkdtemp())
+_ri = _ri_root / "work"
+_ri_bare = _ri_root / "remote.git"
+_ri.mkdir()
+subprocess.run(["git", "init", "-q", "-b", "main", str(_ri)], check=True)
+subprocess.run(["git", "init", "-q", "--bare", str(_ri_bare)], check=True)
+for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+    subprocess.run(["git", "-C", str(_ri), *_a], check=True)
+(_ri / "a").write_text("one\n")
+subprocess.run(["git", "-C", str(_ri), "add", "a"], check=True)
+subprocess.run(["git", "-C", str(_ri), "commit", "-qm", "one"], check=True)
+subprocess.run(["git", "-C", str(_ri), "remote", "add", "origin", str(_ri_bare)], check=True)
+_ri_one = subprocess.run(["git", "-C", str(_ri), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+_visibility = {"hidden": 2}
+
+
+def _delayed_remote(args):
+    if args[0] == "push":
+        subprocess.run(["git", "-C", str(_ri), *args], capture_output=True, text=True, check=True)
+        raise subprocess.TimeoutExpired(args, 60)
+    if args[0] == "ls-remote" and _visibility["hidden"]:
+        _visibility["hidden"] -= 1
+        return _result()
+    return subprocess.run(["git", "-C", str(_ri), *args], capture_output=True, text=True)
+
+
+_delayed = rref.update(_ri, "origin", "refs/heads/benchsmith-locks/delayed", _ri_one,
+                       runner=_delayed_remote, delays=(0, 0, 0))
+check("a timed-out real push reconciles after delayed visibility",
+      (_delayed["state"], _delayed["attempts"]), (rref.CONFIRMED, 3))
+
+# A real force-with-lease race has one winner. The stale contender must not
+# report success merely because the remote is readable.
+(_ri / "a").write_text("two\n")
+subprocess.run(["git", "-C", str(_ri), "commit", "-qam", "two"], check=True)
+_ri_two = subprocess.run(["git", "-C", str(_ri), "rev-parse", "HEAD"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+(_ri / "a").write_text("three\n")
+subprocess.run(["git", "-C", str(_ri), "commit", "-qam", "three"], check=True)
+_ri_three = subprocess.run(["git", "-C", str(_ri), "rev-parse", "HEAD"],
+                           capture_output=True, text=True, check=True).stdout.strip()
+_race_ref = "refs/heads/benchsmith-locks/race"
+check("the first real CAS creates the lease",
+      rref.update(_ri, "origin", _race_ref, _ri_one)["state"], rref.CONFIRMED)
+subprocess.run(["git", "-C", str(_ri), "push", "-q", "--force", "origin",
+                f"{_ri_two}:{_race_ref}"], check=True)
+_race = rref.update(_ri, "origin", _race_ref, _ri_three, expected=_ri_one,
+                    delays=(0,))
+check("a stale real CAS loses", _race["state"], rref.REJECTED)
+check("the CAS loser cannot overwrite the winner", _race["sha"], _ri_two)
+
+# Binding failure is one lifecycle: a created session is terminated and only a
+# confirmed termination permits release.
+class _BindingLease:
+    def __init__(self):
+        self.releases = 0
+    def bind(self, sid):
+        return {"bound": False, "reason": "ambiguous bind"}
+    def release(self):
+        self.releases += 1
+        return {"released": True}
+
+
+_saved_relieve = dsp.relieve
+try:
+    _lease_fail = _BindingLease()
+    dsp.relieve = lambda sid: {"terminated": True, "session": sid}
+    _life = _cli._bind_worker(_lease_fail, "session-1", str(_ri), "task")
+    check("failed binding terminates the created session", _life["termination"]["terminated"], True)
+    check("confirmed termination releases the unbound lease", _lease_fail.releases, 1)
+
+    _lease_unknown = _BindingLease()
+    dsp.relieve = lambda sid: {"terminated": False, "session": sid}
+    _life_unknown = _cli._bind_worker(_lease_unknown, "session-2", str(_ri), "task")
+    check("unconfirmed termination fails dispatch", _life_unknown["ok"], False)
+    check("unconfirmed termination strands no false release", _lease_unknown.releases, 0)
+finally:
+    dsp.relieve = _saved_relieve
+
+# Filesystem durability precedes release. A crash/failure after rename leaves a
+# recoverable durable phase; replay advances it to released.
+_fin = Path(tempfile.mkdtemp())
+dsp.write_assignment(_fin, "task", "session-3", "lease-token-3")
+_handoff = {"work_item": "task", "state": "blocked", "note": "done"}
+
+
+def _release_race(args):
+    if args[0] == "push":
+        return _result(1, stderr="lease changed")
+    if args[0] == "ls-remote":
+        return _result(stdout="other-token\trefs/heads/benchsmith-locks/task\n")
+    return _result()
+
+
+_phase1 = dsp.finalize_handoff(_fin, "task", _handoff, lease_runner=_release_race)
+_durable = json.loads((_fin / dsp.HANDOFF_DIR / "task.json").read_text())
+check("a release race leaves a durable handoff", (_phase1["ok"], _durable["finalization"]["phase"]),
+      (False, "durable"))
+check("the durable handoff records the exact owner",
+      (_durable["session"], _durable["lease_token"]), ("session-3", "lease-token-3"))
+_phase2 = dsp.finalize_handoff(_fin, "task", _handoff,
+                               lease_runner=lambda args: _result())
+check("recovery advances durable rename to CAS release",
+      (_phase2["ok"], _phase2["phase"]), (True, "released"))
+
+_legacy = dsp.finalize_handoff(_fin, "legacy", {"state": "no_change", "note": "old shape"})
+check("an existing handoff without lease fields remains readable",
+      (_legacy["ok"], _legacy["phase"], _legacy["released"]), (True, "durable", False))
+
+# Existing receipt JSON remains parseable but cannot authenticate itself after
+# the digest field is removed or its contents are changed.
+_receipt_doc = gate_mod.write_receipt(_ri, "task", passing_push_report())
+_receipt_file = gate_mod.receipt_path(_ri, "task")
+_without_digest = dict(_receipt_doc)
+_without_digest.pop("digest")
+_receipt_file.write_text(json.dumps(_without_digest))
+check("a legacy receipt without a digest is rejected",
+      gate_mod.verify_receipt(_ri, "task")[0], False)
+
+# Exercise the installed hook with an actual push. The first exact-HEAD receipt
+# passes; the next commit is rejected by that same verifier as stale.
+_hook_root = Path(tempfile.mkdtemp())
+_hook_repo = _hook_root / "work"
+_hook_bare = _hook_root / "remote.git"
+(_hook_repo / "task").mkdir(parents=True)
+subprocess.run(["git", "init", "-q", "-b", "main", str(_hook_repo)], check=True)
+subprocess.run(["git", "init", "-q", "--bare", str(_hook_bare)], check=True)
+for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"],
+           ["remote", "add", "origin", str(_hook_bare)]):
+    subprocess.run(["git", "-C", str(_hook_repo), *_a], check=True)
+(_hook_repo / "task" / "task.toml").write_text("[task]\n")
+subprocess.run(["git", "-C", str(_hook_repo), "add", "-A"], check=True)
+subprocess.run(["git", "-C", str(_hook_repo), "commit", "-qm", "one"], check=True)
+gate_mod.install_hooks(_hook_repo, Path(gate_mod.__file__).resolve().parent)
+_old_task_env = os.environ.get("BENCHSMITH_TASK")
+_old_receipt_env = os.environ.get("BENCHSMITH_RECEIPT_DIR")
+os.environ["BENCHSMITH_TASK"] = "task"
+os.environ["BENCHSMITH_RECEIPT_DIR"] = str(_hook_root / "receipts")
+try:
+    gate_mod.write_receipt(_hook_repo, "task", passing_push_report())
+    _hook_pass = subprocess.run(["git", "-C", str(_hook_repo), "push", "-q", "origin",
+                                 "HEAD:refs/heads/main"], capture_output=True, text=True)
+    check("the installed hook permits an exact-HEAD receipt", _hook_pass.returncode, 0)
+    (_hook_repo / "task" / "task.toml").write_text("[task]\nchanged = true\n")
+    subprocess.run(["git", "-C", str(_hook_repo), "commit", "-qam", "two"], check=True)
+    _hook_fail = subprocess.run(["git", "-C", str(_hook_repo), "push", "-q", "origin",
+                                 "HEAD:refs/heads/main"], capture_output=True, text=True)
+    check("the installed hook rejects a stale receipt", _hook_fail.returncode != 0, True)
+    check("the firing hook explains the exact-commit mismatch",
+          "receipt is for" in (_hook_fail.stdout + _hook_fail.stderr), True)
+finally:
+    if _old_task_env is None:
+        os.environ.pop("BENCHSMITH_TASK", None)
+    else:
+        os.environ["BENCHSMITH_TASK"] = _old_task_env
+    if _old_receipt_env is None:
+        os.environ.pop("BENCHSMITH_RECEIPT_DIR", None)
+    else:
+        os.environ["BENCHSMITH_RECEIPT_DIR"] = _old_receipt_env
+
+# The language adapter reads the code inside tests/config.json.test_patch.
+_go = Path(tempfile.mkdtemp()) / "repo"
+(_go / "task" / "tests").mkdir(parents=True)
+subprocess.run(["git", "init", "-q", "-b", "main", str(_go)], check=True)
+for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+    subprocess.run(["git", "-C", str(_go), *_a], check=True)
+(_go / "README").write_text("base\n")
+subprocess.run(["git", "-C", str(_go), "add", "-A"], check=True)
+subprocess.run(["git", "-C", str(_go), "commit", "-qm", "base"], check=True)
+
+
+def _patch_for(path, body):
+    added = "\n".join("+" + line for line in body.splitlines())
+    return f"diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,9 @@\n{added}\n"
+
+
+_go_cfg = _go / "task" / "tests" / "config.json"
+_go_cfg.write_text(json.dumps({"test_patch": _patch_for(
+    "pkg/widget_test.go",
+    'package pkg\nimport "testing"\nfunc TestWidget(t *testing.T) {\n t.Fatalf("checked")\n}',
+)}))
+subprocess.run(["git", "-C", str(_go), "add", "-A"], check=True)
+_go_ok = dc.run(_go)["diff-ratchet"]
+check("Go assertions inside test_patch are examined", (_go_ok["state"], _go_ok["examined"]),
+      ("PASS", 1))
+_go_cfg.write_text(json.dumps({"test_patch": _patch_for(
+    "pkg/widget_test.go", 'package pkg\nimport "testing"\nfunc TestWidget(t *testing.T) {\n}',
+)}))
+subprocess.run(["git", "-C", str(_go), "add", "-A"], check=True)
+check("a patch-contained Go test with zero assertions blocks",
+      dc.run(_go)["diff-ratchet"]["state"], "FAIL")
+_go_cfg.write_text(json.dumps({"test_patch": _patch_for(
+    "pkg/widget_test.rs", "fn test_widget() { assert!(true); }",
+)}))
+subprocess.run(["git", "-C", str(_go), "add", "-A"], check=True)
+check("unsupported patch syntax blocks instead of passing empty",
+      dc.run(_go)["diff-ratchet"]["state"], "FAIL")
+
+# Completion is a successful stop, while open findings at a probe limit remain
+# a blocking gate verdict.
+_stop_repo = Path(tempfile.mkdtemp())
+_done = Journal.open(_stop_repo, "done")
+_done.set_mode("repair")
+_done.open_finding("F", "symptom", "acceptance")
+_done.close_finding("F", "sha", "observed")
+_done_report = gate_mod.Report()
+gate_mod.check_budget(_done, _done_report)
+check("repair completion is a passing termination",
+      (_done.stop_outcome()["kind"], _done_report.checks[0].state), ("complete", gate_mod.PASS))
+_open = Journal.open(_stop_repo, "open")
+_open.set_mode("repair")
+_open.open_finding("F", "symptom", "acceptance")
+_open.data["probesSpent"] = _open.probe_budget()
+_open_report = gate_mod.Report()
+gate_mod.check_budget(_open, _open_report)
+check("an exhausted repair with open findings blocks",
+      (_open.stop_outcome()["kind"], _open_report.checks[0].state),
+      ("probe-limit", gate_mod.FAIL))
+
+# Native routing happens before any worker or lease exists.
+_ios = Path(tempfile.mkdtemp())
+(_ios / "ios-task" / "environment").mkdir(parents=True)
+(_ios / "ios-task" / "task.toml").write_text("[task]\n")
+(_ios / "ios-task" / "environment" / "vm.conf").write_text("image=x\n")
+check("Linux reports an iOS task unavailable without consuming a worker",
+      pk.capability(_ios / "ios-task", system="Linux", backend="")["state"], "unavailable")
+check("a configured native backend makes the same route available",
+      pk.capability(_ios / "ios-task", system="Linux", backend="/bin/true")["ready"], True)
+try:
+    _saved_ios_backend = os.environ.pop("BENCHSMITH_IOS_BACKEND", None)
+    try:
+        dsp.plan("ios-task", str(_ios), bootstrap=False)
+        check("dispatch routes unsupported iOS before session creation", "created", "refused")
+    except dsp.DispatchRefused as error:
+        check("dispatch routes unsupported iOS before session creation", "iOS task requires" in str(error), True)
+    finally:
+        if _saved_ios_backend is not None:
+            os.environ["BENCHSMITH_IOS_BACKEND"] = _saved_ios_backend
+except OSError as error:
+    check("dispatch routes unsupported iOS before session creation", str(error), "no error")
+
+_future = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=5)).isoformat()
+_future_health = dsp.health("future", runner=_feed([
+    {"seq": "1", "type": "block", "created": _future, "event": "{}"}
+]))
+check("future timestamps are unknown, never healthy", _future_health["state"], "unknown")
+check("future timestamp output retains the negative measurement",
+      _future_health["idleSeconds"] < 0, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

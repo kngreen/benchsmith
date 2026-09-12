@@ -25,8 +25,12 @@ noted:
 
 from __future__ import annotations
 
+import os
+import platform
+import shutil
 from dataclasses import dataclass
 from math import comb
+from pathlib import Path
 
 from .model import Kind, Row, SlotKey
 
@@ -35,6 +39,29 @@ ORACLE = "oracle"
 # with the same family on a hosted track rather than forming a parallel one.
 COHORTS = {"claude-code": "opus", "metacode": "avocado"}
 MODEL_UNDER_TEST = frozenset({"avocado"})
+
+
+def capability(task_dir: Path, *, system: str | None = None, backend: str | None = None) -> dict:
+    """Return whether this host has a proven execution route for an iOS task."""
+    task_dir = Path(task_dir)
+    is_ios = (task_dir / "environment" / "vm.conf").is_file()
+    if not is_ios:
+        return {"applicable": False, "ready": True, "examined": 1}
+    host_system = system or platform.system()
+    configured = backend if backend is not None else os.environ.get("BENCHSMITH_IOS_BACKEND", "")
+    if host_system == "Darwin":
+        return {"applicable": True, "ready": True, "backend": "local-darwin", "examined": 2}
+    resolved = shutil.which(configured) if configured else None
+    if resolved:
+        return {"applicable": True, "ready": True, "backend": resolved, "examined": 3}
+    return {
+        "applicable": True,
+        "ready": False,
+        "state": "unavailable",
+        "examined": 3,
+        "reason": (f"iOS task requires Darwin or an executable BENCHSMITH_IOS_BACKEND; "
+                   f"this host is {host_system}"),
+    }
 
 
 @dataclass(frozen=True)

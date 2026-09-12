@@ -28,6 +28,8 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from . import remote_ref
+
 REF = "refs/heads/benchsmith-locks/{task}"
 SAFE = re.compile(r"[A-Za-z0-9._-]+")
 
@@ -40,10 +42,14 @@ TTL_SECONDS = 4 * 3600
 # dispatch loop into one that timed out before a single worker started.
 def states(repo, *, remote: str = "origin", timeout: int = 60) -> dict:
     """Every held lease in this repository, task -> sha, in one ls-remote."""
-    p = subprocess.run(
-        ["git", "-C", str(repo), "ls-remote", "--heads", remote, "refs/heads/benchsmith-locks/*"],
-        capture_output=True, text=True, timeout=timeout,
-    )
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(repo), "ls-remote", "--heads", remote,
+             "refs/heads/benchsmith-locks/*"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LeaseLost(f"could not read the lease refs: {type(error).__name__}: {error}") from error
     if p.returncode:
         raise LeaseLost(f"could not read the lease refs: {p.stderr.strip()[:160]}")
     out = {}
@@ -133,13 +139,13 @@ def parse_owner(message: str) -> Owner:
 
 class RemoteLease:
     def __init__(self, task: str, repo, *, remote: str = "origin", ttl: int = TTL_SECONDS,
-                 runner=None, timeout: int = 60, known: str | None = None):
+                 runner=None, timeout: int = 60, known: str | None = None,
+                 reconcile_delays=remote_ref.DEFAULT_DELAYS, sleeper=time.sleep):
         if not SAFE.fullmatch(task or ""):
             raise LeaseLost(f"task name is not safe for a remote ref: {task!r}")
         self.task, self.repo, self.remote, self.ttl = task, str(repo), remote, ttl
         self.ref = REF.format(task=task)
         self.sha = ""
-        self.timed_out = False
         self.timeout = timeout
         # A sha the caller already fetched in a batch, so acquire() need not
         # make its own round trip just to discover the ref is free.
@@ -147,35 +153,19 @@ class RemoteLease:
         # Set once the worker exists, then written into the lease by `bind`.
         self.session_id = ""
         self._run = runner
-
-    # A lease ref is not a task publication, and the repos' pre-push hook does
-    # not distinguish: it computes the touched tasks from local HEAD's range
-    # regardless of which ref is being pushed, so a lock push is judged as
-    # though it were a code change and demands gate receipts for whatever
-    # happens to be in the range.
-    #
-    # This is the one place benchsmith bypasses a hook, and it is narrow: only
-    # pushes to `refs/heads/benchsmith-locks/*`, which contain no task content
-    # and can never reach a branch anyone validates. Task publication still goes
-    # through the hook, unbypassed.
-    _NOVERIFY = ("--no-verify",)
+        self.reconcile_delays = reconcile_delays
+        self.sleeper = sleeper
 
     def _git(self, *args, check: bool = False) -> subprocess.CompletedProcess:
         if self._run is not None:
-            # An injected runner takes the same timeout path as a real one, or
-            # the reconciliation below is never exercised by a test.
             try:
                 return self._run(list(args))
             except subprocess.TimeoutExpired as e:
-                self.timed_out = True
                 raise LeaseLost(f"git {args[0]} timed out") from e
         try:
             p = subprocess.run(["git", "-C", self.repo, *args],
                                capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired as e:
-            self.timed_out = True
-            # Named rather than raised as a bare timeout: a lease push that
-            # hangs looks exactly like an empty backlog from the outside.
             raise LeaseLost(
                 f"git {args[0]} against {self.remote} exceeded {self.timeout}s. The remote lease "
                 "cannot be taken, so no worker starts. Check the remote, or pass "
@@ -205,19 +195,19 @@ class RemoteLease:
                + (f" session={self.session_id}" if self.session_id else ""))
         return self._git("commit-tree", tree, "-m", msg, check=True).stdout.strip()
 
-    def _push_landed(self, token: str) -> bool:
-        """Did a push that timed out actually take?
-
-        A timeout means the call did not return, not that it did not happen. A
-        lease write timed out, landed anyway, and the caller believed it had no
-        claim -- so it started a successor with no lease and had to be stopped
-        before it touched the task. The token is generated before the push, so
-        the question is answerable: does the ref now hold exactly what we wrote?
-        """
-        try:
-            return self.remote_sha() == token
-        except LeaseLost:
-            return False
+    def _update(self, token: str, *, expected: str | None = None) -> dict:
+        run = self._run
+        return remote_ref.update(
+            self.repo,
+            self.remote,
+            self.ref,
+            token,
+            expected=expected,
+            timeout=self.timeout,
+            runner=run,
+            delays=self.reconcile_delays,
+            sleeper=self.sleeper,
+        )
 
     def acquire(self) -> dict:
         """Claim the task, or say who holds it."""
@@ -235,30 +225,23 @@ class RemoteLease:
             # Expired. Steal it with a compare-and-swap so two hosts reaping the
             # same stale lease cannot both win.
             token = self._token()
-            p = self._git("push", "-q", *self._NOVERIFY,
-                          f"--force-with-lease={self.ref}:{held}",
-                          self.remote, f"{token}:{self.ref}")
-            if p.returncode:
+            result = self._update(token, expected=held)
+            if result["state"] != remote_ref.CONFIRMED:
                 return {"held": False, "owner": who.as_dict(),
-                        "reason": f"lost the race to reap a stale lease: {p.stderr.strip()[:120]}"}
+                        "reason": f"could not reap stale lease: {result['detail']}",
+                        "reconciliation": result}
             self.sha = token
-            return {"held": True, "reaped": who.as_dict()}
+            return {"held": True, "reaped": who.as_dict(), "reconciliation": result,
+                    "note": result["detail"] if result.get("attempts") else ""}
 
         token = self._token()
         # Creating a ref that already exists is rejected, which is the claim.
-        try:
-            p = self._git("push", "-q", *self._NOVERIFY, self.remote, f"{token}:{self.ref}")
-        except LeaseLost:
-            if self._push_landed(token):
-                self.sha = token
-                return {"held": True, "owner": self.owner(token).as_dict(),
-                        "note": "the push timed out but landed; the claim is ours"}
-            raise
-        if p.returncode:
-            return {"held": False, "reason": f"another host claimed it first: "
-                                             f"{p.stderr.strip()[:120]}"}
+        result = self._update(token)
+        if result["state"] != remote_ref.CONFIRMED:
+            return {"held": False, "reason": result["detail"], "reconciliation": result}
         self.sha = token
-        return {"held": True, "owner": self.owner(token).as_dict()}
+        return {"held": True, "owner": self.owner(token).as_dict(), "reconciliation": result,
+                "note": result["detail"] if result.get("attempts") else ""}
 
     def bind(self, session_id: str) -> dict:
         """Record which worker this lease is for, once one exists.
@@ -270,24 +253,13 @@ class RemoteLease:
             raise LeaseLost("cannot bind a lease that is not held")
         self.session_id = session_id
         token = self._token()
-        try:
-            p = self._git("push", "-q", *self._NOVERIFY,
-                          f"--force-with-lease={self.ref}:{self.sha}",
-                          self.remote, f"{token}:{self.ref}")
-        except LeaseLost:
-            # An unbound lease on a running worker is the worst state: the
-            # worker holds nothing anyone can see, and the next reaper takes
-            # its task. Check before reporting failure.
-            if self._push_landed(token):
-                self.sha = token
-                return {"bound": True, "session": session_id,
-                        "note": "the bind timed out but landed"}
-            return {"bound": False, "reason": f"bind timed out and did not land; the lease is "
-                                              f"still {self.sha[:12]} and unbound"}
-        if p.returncode:
-            return {"bound": False, "reason": (p.stderr or p.stdout).strip()[:160]}
+        result = self._update(token, expected=self.sha)
+        if result["state"] != remote_ref.CONFIRMED:
+            return {"bound": False, "reason": "lease remains unbound: " + result["detail"],
+                    "reconciliation": result}
         self.sha = token
-        return {"bound": True, "session": session_id}
+        return {"bound": True, "session": session_id, "token": token,
+                "reconciliation": result}
 
     def assert_owned(self) -> None:
         """Fail closed immediately before a publication mutation."""
@@ -300,13 +272,13 @@ class RemoteLease:
                 "another host owns this task now"
             )
 
-    def release(self) -> dict:
-        if not self.sha:
+    def release(self, token: str = "") -> dict:
+        expected = token or self.sha
+        if not expected:
             return {"released": False, "reason": "not held"}
-        p = self._git("push", "-q", *self._NOVERIFY,
-                      f"--force-with-lease={self.ref}:{self.sha}",
-                      self.remote, f":{self.ref}")
-        ok = p.returncode == 0
+        result = self._update("", expected=expected)
+        ok = result["state"] == remote_ref.CONFIRMED
         if ok:
             self.sha = ""
-        return {"released": ok, "reason": "" if ok else p.stderr.strip()[:160]}
+        return {"released": ok, "reason": "" if ok else result["detail"],
+                "reconciliation": result}

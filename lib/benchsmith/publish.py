@@ -164,6 +164,26 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
         # remote -- was never actually done.
         raise PublishRefused("no gate_receipt; an ungated commit may not be published")
 
+    def _verify_candidate_receipt() -> None:
+        from . import gate as gate_mod
+
+        ok, why = gate_mod.verify_receipt(repo_root, task)
+        if not ok:
+            raise PublishRefused(f"gate receipt is not valid for the candidate: {why}")
+        body, problem = gate_mod._receipt_body(repo_root, task)
+        if body is None:
+            raise PublishRefused(problem)
+        marker = str(handoff.get("gate_receipt") or "")
+        accepted = {str(body["digest"]), f"sha256:{body['digest']}",
+                    str(gate_mod.receipt_path(repo_root, task))}
+        if marker not in accepted:
+            raise PublishRefused("handoff gate_receipt does not identify the verified receipt")
+        current = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
+        if current != commit_sha:
+            raise PublishRefused(
+                f"handoff commit is {commit_sha[:8]}, but the candidate HEAD is {current[:8]}"
+            )
+
     # Pushing to a task under review changes what the reviewer is looking at,
     # and their findings then cite a revision that no longer exists. Refused on
     # a positive read; noted, not blocked, when the platform cannot be reached,
@@ -253,10 +273,9 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
             moved = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
             git(repo_root, "checkout", "--detach", moved)
 
-            # Does the receipt still describe this tree? A rebase produces a
-            # different COMMIT, but if the task's own tree object is unchanged
-            # then every check the gate ran is still true of it -- the oracle
-            # ran against these exact bytes.
+            # A rebase produces a different commit. Byte-identical task bytes
+            # allow only whitelisted tree-invariant evidence to carry; checks
+            # whose meaning depends on the commit or diff rerun below.
             #
             # This is what ends the ping-pong. The coordinator cannot regate
             # (it has no task oracle), so it returned every rebase to a worker;
@@ -265,11 +284,20 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
             before = (git(repo_root, "rev-parse", f"{commit_sha}:{task}").stdout.split() or [""])[0]
             after = (git(repo_root, "rev-parse", f"{moved}:{task}").stdout.split() or [""])[0]
             if before and after and before == after:
+                from . import gate as gate_mod
+
+                carried = gate_mod.carry_receipt(repo_root, task, moved)
+                if not carried.get("ok"):
+                    return {"state": "rebased", "task": task, "from": commit_sha,
+                            "newSha": moved, "onto": head, "needsRegate": True,
+                            "detail": f"task tree is unchanged, but candidate receipt failed: "
+                                      f"{carried.get('reason', 'unknown')}"}
                 return {"state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
                         "onto": head, "needsRegate": False, "taskTree": before,
+                        "gateReceipt": carried["receipt"]["digest"],
                         "detail": (f"rebased onto {head[:8]}; the task tree is byte-identical "
-                                   f"({before[:12]}), so the existing receipt still describes it. "
-                                   "Publish this SHA without re-gating.")}
+                                   f"({before[:12]}). Tree-invariant evidence was carried and "
+                                   "commit-relative controls reran for the new SHA.")}
             return {"state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
                     "onto": head, "needsRegate": True,
                     "detail": ("rebased onto the new head and the task tree changed, so the "
@@ -282,6 +310,8 @@ def publish(repo_root: Path, task: str, handoff: dict, *, remote: str = "origin"
             return {"planned": intent.as_dict(), "applied": False,
                     "reviewNote": review_note or None,
                     "hint": "re-run with apply=True to actually push"}
+
+        _verify_candidate_receipt()
 
         # Written before the push, so a crash between here and the next line is
         # recoverable rather than ambiguous.

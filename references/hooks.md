@@ -9,7 +9,7 @@ The task repos wire hooks with `core.hooksPath` — `scripts/hooks` in the swe-b
 is bad. None asked that, which is why coverage shrinking, fixture-arm removal and assertion
 weakening were invisible to them.
 
-These compare the **staged index against HEAD**, which is cheaply available only at commit time.
+These compare the **staged index against HEAD**, or a clean committed `HEAD` against its parent.
 `check_test_ratchet` is *not* a substitute: it compares against the last round benchsmith
 **recorded**, so anything committed between rounds is invisible to it.
 
@@ -34,8 +34,13 @@ finding, not a skip** (a line-based check would happily "examine" it and report 
 silent-inert shape these exist to catch), and **nothing examined is `NOT_RUN`**, reported and never
 printed as a pass.
 
+Python files are parsed with `ast`; Go is parsed with `gofmt`; Swift test/assertion forms receive a
+structural balance check. For SWE-Bench tasks, code embedded in `tests/config.json.test_patch` is
+extracted and examined too. Unsupported syntax, parse failure, or tests with zero examined assertions block.
+An empty input is `NOT_RUN`, never clean.
+
 Cost: pure Python plus a couple of `git show` calls, scoped to graded files. Sub-millisecond when
-the staged diff has no graded Python in it.
+the diff has no supported graded source in it.
 
 ### 15b. Snapshot integrity
 
