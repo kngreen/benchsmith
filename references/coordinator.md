@@ -180,6 +180,32 @@ work reaches the remote — was never done), the lane is free, and the remote he
 base the commit was prepared on. A moved remote means rebase and re-gate; pushing anyway would
 measure a tree nobody gated.
 
+**A rebase does not always need a re-gate.** When the remote moved and the rebase leaves this
+task's tree object byte-identical, every check the gate ran is still true of it — the oracle ran on
+exactly those bytes. `publish --rebase` returns `needsRegate: false` and the existing receipt
+stands.
+
+That matters because **the coordinator has no task oracle and cannot re-gate**. Returning every
+rebase to a worker meant that by the time the worker answered, main had moved again: one task went
+round four times before landing, and every lap was real work that was stale on arrival. Only a
+rebase that actually moves the task's tree needs fresh evidence.
+
+### A hold on the branch, not on one task
+
+```bash
+benchsmith hold show --repo REPO
+benchsmith hold take --repo REPO --why "landing task 207170" --minutes 45
+benchsmith hold release --repo REPO
+```
+
+Task leases answer "is anyone working this task". They cannot answer "is anyone about to land a
+stack on main" — which was being coordinated by announcement, so every worker that did not read the
+message kept preparing pushes into a claimed branch.
+
+`publish` refuses into a held branch, and refuses when it cannot read the hold: unreadable is not
+permission, here as everywhere. Holds are always bounded — an open-ended one is one somebody
+forgets to release.
+
 **The intent is written down before the push.** The hard part is not the lock, it is crashing while
 holding it. `benchsmith reconcile` compares the recorded intent against the actual remote head and
 returns one of four answers:

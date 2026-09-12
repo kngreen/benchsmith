@@ -4286,6 +4286,13 @@ finally:
     rv._tasks = _saved8
 
 # --- rerun must not hardcode a subcommand either ------------------------------
+# Three doc edits have now silently no-oped on a bad anchor while the code
+# shipped. Assert the prose exists rather than trusting the edit ran.
+_docs = " ".join((Path("/home/kngreen/.claude/skills/benchsmith/references/coordinator.md")
+                  .read_text()).split())
+check("the branch hold is documented", "benchsmith hold take" in _docs, True)
+check("the rebase carry-forward is documented", "needsRegate: false" in _docs, True)
+
 check("rerun resolves its verb from the installed CLI",
       "discover" in Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/rerun.py").read_text(),
       True)
