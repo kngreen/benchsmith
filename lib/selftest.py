@@ -4385,10 +4385,22 @@ check("...with an opt-out",
 # an identifier that is not coming. One waited three hours, then two more.
 _critic = " ".join(Path("/home/kngreen/.claude/skills/codimango-review-critic/SKILL.md")
                    .read_text().split())
-check("the critic routes a bare invocation", "benchsmith review-fleet" in _critic, True)
-check("...and says why it cannot do the queue itself",
-      "cannot enumerate the queue" in _critic, True)
-check("...and stops rather than waiting", "Then stop." in _critic, True)
+# It must RUN the queue, not print the command. Telling the user to run a script
+# is the same failed invocation as asking which task -- they invoked a skill.
+_cdesc = _critic[_critic.index("description:"):_critic.index("--- #")] if "--- #" in _critic else _critic[:1400]
+check("the critic's description leads with the no-task case", "NO task" in _cdesc, True)
+check("...and carries no double quotes for the frontmatter parser",
+      chr(34) in _cdesc.split("---")[0], False)
+
+check("a bare critic invocation runs the queue", "benchsmith review-fleet --apply" in _critic, True)
+check("...and is told not to describe it", "Do not describe it" in _critic, True)
+check("...naming printing-a-command as the failure",
+      "failed invocation" in _critic, True)
+# Enumerating is the dispatcher's job; reviewing after enumerating is not.
+check("the dispatcher must not then review in the same session",
+      "do not then review a task yourself" in _critic, True)
+check("...and the two roles are separated explicitly",
+      "May enumerate" in _critic and "May review" in _critic, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
