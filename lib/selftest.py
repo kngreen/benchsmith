@@ -4403,5 +4403,69 @@ check("...and the two roles are separated explicitly",
       "May enumerate" in _critic and "May review" in _critic, True)
 
 
+# --- a push that times out may still have landed ------------------------------
+#
+# A lease write timed out, landed anyway, and the caller believed it held
+# nothing -- so it started a successor with no lease and had to stop it before
+# it touched the task. A timeout means the call did not return, not that it did
+# not happen. The token is generated before the push, so the question is
+# answerable: does the ref now hold exactly what we wrote?
+
+def _timeout_push(lands: bool):
+    state = {"ref": "", "n": 0}
+
+    def run(args):
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        if args[0] == "ls-remote":
+            R.stdout = f"{state['ref']}\tref" if state["ref"] else ""
+        elif args[0] in ("rev-parse", "commit-tree"):
+            state["n"] += 1
+            R.stdout = f"tok{state['n']}"
+        elif args[0] == "push":
+            if lands:
+                state["ref"] = args[-1].split(":")[0]
+            raise subprocess.TimeoutExpired(args, 1)
+        return R
+    return run
+
+
+_lt = rl.RemoteLease("t", "/tmp", runner=_timeout_push(True))
+_got = _lt.acquire()
+check("a timed-out acquire that landed is ours", _got["held"], True)
+check("...and the token is recorded so bind can follow", bool(_lt.sha), True)
+check("...and it says what happened", "timed out but landed" in _got.get("note", ""), True)
+
+try:
+    rl.RemoteLease("t", "/tmp", runner=_timeout_push(False)).acquire()
+    check("a timed-out acquire that did NOT land is refused", "held", "refused")
+except rl.LeaseLost:
+    check("a timed-out acquire that did NOT land is refused", True, True)
+
+# The same for bind. An unbound lease on a running worker is the worst state:
+# it holds nothing anyone can see, and the next reaper takes its task.
+_lb = rl.RemoteLease("t", "/tmp", runner=_bind_git({"ref": ""}))
+_lb.acquire()
+_lb._run = _timeout_push(True)
+_lb.sha = "tok1"
+_res_b = _lb.bind("sess-1")
+check("a timed-out bind that landed is bound", _res_b["bound"], True)
+_lb2 = rl.RemoteLease("t", "/tmp", runner=_bind_git({"ref": ""}))
+_lb2.acquire()
+_lb2._run = _timeout_push(False)
+_res_b2 = _lb2.bind("sess-1")
+check("a timed-out bind that did not land reports unbound", _res_b2["bound"], False)
+check("...and says the lease is still unbound", "unbound" in _res_b2["reason"], True)
+
+# An injected runner must take the same timeout path as a real one, or none of
+# the above is actually exercising the code it claims to.
+check("an injected runner converts a timeout like the real path",
+      "except subprocess.TimeoutExpired" in
+      Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/remote_lease.py").read_text()
+      .split("if self._run is not None:")[1][:400], True)
+
+
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")
 sys.exit(1 if FAILED else 0)

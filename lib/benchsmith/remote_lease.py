@@ -139,6 +139,7 @@ class RemoteLease:
         self.task, self.repo, self.remote, self.ttl = task, str(repo), remote, ttl
         self.ref = REF.format(task=task)
         self.sha = ""
+        self.timed_out = False
         self.timeout = timeout
         # A sha the caller already fetched in a batch, so acquire() need not
         # make its own round trip just to discover the ref is free.
@@ -161,11 +162,18 @@ class RemoteLease:
 
     def _git(self, *args, check: bool = False) -> subprocess.CompletedProcess:
         if self._run is not None:
-            return self._run(list(args))
+            # An injected runner takes the same timeout path as a real one, or
+            # the reconciliation below is never exercised by a test.
+            try:
+                return self._run(list(args))
+            except subprocess.TimeoutExpired as e:
+                self.timed_out = True
+                raise LeaseLost(f"git {args[0]} timed out") from e
         try:
             p = subprocess.run(["git", "-C", self.repo, *args],
                                capture_output=True, text=True, timeout=self.timeout)
         except subprocess.TimeoutExpired as e:
+            self.timed_out = True
             # Named rather than raised as a bare timeout: a lease push that
             # hangs looks exactly like an empty backlog from the outside.
             raise LeaseLost(
@@ -197,6 +205,20 @@ class RemoteLease:
                + (f" session={self.session_id}" if self.session_id else ""))
         return self._git("commit-tree", tree, "-m", msg, check=True).stdout.strip()
 
+    def _push_landed(self, token: str) -> bool:
+        """Did a push that timed out actually take?
+
+        A timeout means the call did not return, not that it did not happen. A
+        lease write timed out, landed anyway, and the caller believed it had no
+        claim -- so it started a successor with no lease and had to be stopped
+        before it touched the task. The token is generated before the push, so
+        the question is answerable: does the ref now hold exactly what we wrote?
+        """
+        try:
+            return self.remote_sha() == token
+        except LeaseLost:
+            return False
+
     def acquire(self) -> dict:
         """Claim the task, or say who holds it."""
         held = self._known if self._known is not None else self.remote_sha()
@@ -224,7 +246,14 @@ class RemoteLease:
 
         token = self._token()
         # Creating a ref that already exists is rejected, which is the claim.
-        p = self._git("push", "-q", *self._NOVERIFY, self.remote, f"{token}:{self.ref}")
+        try:
+            p = self._git("push", "-q", *self._NOVERIFY, self.remote, f"{token}:{self.ref}")
+        except LeaseLost:
+            if self._push_landed(token):
+                self.sha = token
+                return {"held": True, "owner": self.owner(token).as_dict(),
+                        "note": "the push timed out but landed; the claim is ours"}
+            raise
         if p.returncode:
             return {"held": False, "reason": f"another host claimed it first: "
                                              f"{p.stderr.strip()[:120]}"}
@@ -241,9 +270,20 @@ class RemoteLease:
             raise LeaseLost("cannot bind a lease that is not held")
         self.session_id = session_id
         token = self._token()
-        p = self._git("push", "-q", *self._NOVERIFY,
-                      f"--force-with-lease={self.ref}:{self.sha}",
-                      self.remote, f"{token}:{self.ref}")
+        try:
+            p = self._git("push", "-q", *self._NOVERIFY,
+                          f"--force-with-lease={self.ref}:{self.sha}",
+                          self.remote, f"{token}:{self.ref}")
+        except LeaseLost:
+            # An unbound lease on a running worker is the worst state: the
+            # worker holds nothing anyone can see, and the next reaper takes
+            # its task. Check before reporting failure.
+            if self._push_landed(token):
+                self.sha = token
+                return {"bound": True, "session": session_id,
+                        "note": "the bind timed out but landed"}
+            return {"bound": False, "reason": f"bind timed out and did not land; the lease is "
+                                              f"still {self.sha[:12]} and unbound"}
         if p.returncode:
             return {"bound": False, "reason": (p.stderr or p.stdout).strip()[:160]}
         self.sha = token
