@@ -552,14 +552,33 @@ _ERRORY = re.compile(r"\berror\b|\bexception\b|traceback|fatal|failed to", re.I)
 
 
 def _stamp(text: str) -> float | None:
-    """Parse an event timestamp. Unparseable is None, never now()."""
+    """Parse an event timestamp. Unparseable is None, never now().
+
+    The journal emits local wall-clock with an abbreviation: `2026-09-11
+    09:26:07 EDT`. `%Z` accepts UTC and GMT and little else, so every real
+    timestamp parsed as None -- which meant `idleSeconds` was always None and
+    stall detection never fired on a single live worker. The fixtures used a
+    zone-less format and passed throughout.
+
+    A trailing alphabetic token is dropped and the rest read as local time,
+    which is what the platform is reporting.
+    """
     from datetime import datetime
 
-    for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(str(text).strip(), fmt).timestamp()
-        except (ValueError, TypeError):
-            continue
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    parts = raw.split()
+    if len(parts) == 3 and parts[2].isalpha():
+        candidates.append(" ".join(parts[:2]))
+    candidates.append(raw.replace("T", " ").rstrip("Z"))
+    for cand in candidates:
+        for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(cand, fmt).timestamp()
+            except (ValueError, TypeError):
+                continue
     return None
 
 

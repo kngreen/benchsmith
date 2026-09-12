@@ -3395,7 +3395,11 @@ import datetime as _dt  # noqa: E402
 
 
 def _ev(mins_ago, typ="block", body="ok"):
-    ts = (_dt.datetime.now() - _dt.timedelta(minutes=mins_ago)).strftime("%Y-%m-%d %H:%M:%S")
+    # The real journal emits a trailing zone abbreviation. Using the platform's
+    # actual format is the whole point: the zone-less one hid a parser that
+    # failed on every live event.
+    ts = ((_dt.datetime.now() - _dt.timedelta(minutes=mins_ago))
+          .strftime("%Y-%m-%d %H:%M:%S") + " EDT")
     return {"seq": "1", "type": typ, "created": ts,
             "event": json.dumps({"block": {"text": body}})}
 
@@ -3425,6 +3429,12 @@ check("the stall threshold is generous", dsp.STALL_SECONDS >= 60 * 60, True)
 
 # Unparseable timestamps must not read as healthy: that is how a dead worker
 # holds a slot all day.
+check("the platform's own timestamp format parses",
+      dsp._stamp("2026-09-11 09:26:07 EDT") is not None, True)
+check("...as does a zone-less one", dsp._stamp("2026-09-11 09:26:07") is not None, True)
+check("...and an ISO one", dsp._stamp("2026-09-11T09:26:07Z") is not None, True)
+check("garbage is still None, never now()", dsp._stamp("garbage"), None)
+
 check("no parseable timestamp is unknown, not working",
       dsp.health("s", runner=_feed([{"seq": "1", "type": "block", "created": "???",
                                      "event": "{}"}]))["state"], "unknown")
@@ -4353,6 +4363,32 @@ _rel = _relsrc[_relsrc.index("def cmd_relieve"):_relsrc.index("def cmd_status")]
 check("relieve claims the lease before starting a successor", "RemoteLease" in _rel, True)
 check("...binds it to the new session", "lease.bind(sid)" in _rel, True)
 check("...and releases it if no worker started", "lease.release()" in _rel, True)
+
+
+# --- reviewers need a claim too ----------------------------------------------
+#
+# Reviews do not write, so a lease is not about overwrites in the tree -- it is
+# that two reviewers on one task duplicate the effort, may disagree, and the
+# second to finish silently overwrites the first's report file.
+
+_rfsrc = Path("/home/kngreen/.claude/skills/benchsmith/lib/benchsmith/cli.py").read_text()
+_rf = _rfsrc[_rfsrc.index("def cmd_reviewfleet"):_rfsrc.index("def cmd_reviewstatus")]
+check("review-fleet claims each task", "RemoteLease" in _rf, True)
+check("...batching the lease read per repo", "lease_states_for_review" in _rf, True)
+check("...binding to the reviewer's session", "lease.bind(sid)" in _rf, True)
+check("...and releasing when no reviewer started", "lease.release()" in _rf, True)
+# The flag is declared in the parser, not the handler.
+check("...with an opt-out",
+      _rfsrc.count('add_argument("--no-remote-lease"') >= 3, True)
+
+# A child reviewer invoked bare must name the dispatcher rather than waiting for
+# an identifier that is not coming. One waited three hours, then two more.
+_critic = " ".join(Path("/home/kngreen/.claude/skills/codimango-review-critic/SKILL.md")
+                   .read_text().split())
+check("the critic routes a bare invocation", "benchsmith review-fleet" in _critic, True)
+check("...and says why it cannot do the queue itself",
+      "cannot enumerate the queue" in _critic, True)
+check("...and stops rather than waiting", "Then stop." in _critic, True)
 
 
 print(f"\nbenchsmith selftest: {PASSED} passed, {FAILED} failed")

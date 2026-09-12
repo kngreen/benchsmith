@@ -809,6 +809,16 @@ def cmd_reviewfleet(args) -> int:
     items, why_not = rq_mod.build(rows)
     ready = [i for i in items if i.dispatchable][: args.workers]
 
+    _rev_lease_states: dict = {}
+
+    def lease_states_for_review(target_repo: str) -> dict:
+        if target_repo not in _rev_lease_states:
+            try:
+                _rev_lease_states[target_repo] = rlease_mod.states(target_repo)
+            except Exception as e:  # noqa: BLE001
+                _rev_lease_states[target_repo] = {"__error__": str(e)}
+        return _rev_lease_states[target_repo]
+
     plans, started = [], []
     for n, item in enumerate(ready, 1):
         try:
@@ -827,8 +837,26 @@ def cmd_reviewfleet(args) -> int:
         except dispatch_mod.DispatchRefused as e:
             plans.append({"task": item.task, "skipped": str(e)})
             continue
-        # Reviews are read-only, so a worktree is not for isolation of writes
-        # -- it is so each reviewer reads one task's tree and nothing else.
+        # Reviews do not write, but two reviewers on one task is duplicated
+        # effort and two drafts that may disagree -- and the second one to
+        # finish silently overwrites the first's report file.
+        lease = None
+        if args.apply and not args.no_remote_lease:
+            try:
+                st = lease_states_for_review(target)
+                if "__error__" in st:
+                    raise rlease_mod.LeaseLost(st["__error__"])
+                lease = rlease_mod.RemoteLease(item.task, target, known=st.get(item.task, ""))
+                got = lease.acquire()
+            except rlease_mod.LeaseLost as e:
+                plans.append({"task": item.task, "skipped": f"remote lease unreadable: {e}"})
+                continue
+            if not got.get("held"):
+                plans.append({"task": item.task,
+                              "skipped": f"already being reviewed: {got.get('reason', '')}"})
+                continue
+
+        # A worktree so each reviewer reads one task's tree and nothing else.
         work_in = target
         if args.apply and not args.shared_tree:
             try:
@@ -846,6 +874,11 @@ def cmd_reviewfleet(args) -> int:
             entry["session"] = sid
             if sid and not args.no_snooze:
                 dispatch_mod.snooze(sid)
+            if lease is not None:
+                if sid:
+                    lease.bind(sid)
+                else:
+                    lease.release()
             started.append({"task": item.task, "session": sid})
         else:
             entry["shell"] = p.shell
@@ -1278,6 +1311,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--apply", action="store_true")
     s.add_argument("--no-snooze", action="store_true")
     s.add_argument("--shared-tree", action="store_true")
+    s.add_argument("--no-remote-lease", action="store_true")
     s.set_defaults(fn=cmd_reviewfleet)
 
     s = common(sub.add_parser("review", help="what the reviewer asked for, and its closure state"))
