@@ -70,7 +70,8 @@ def take(repo, *, why: str = "", minutes: int = DEFAULT_MINUTES,
         return {"taken": False, **now}
     if now.get("held"):
         return {"taken": False, **now, "reason": "somebody else holds it"}
-    tree = _git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+    # Holds carry metadata only; embedding HEAD's tree turns each lock update into a full push.
+    tree = _git(repo, "hash-object", "-t", "tree", "-w", "/dev/null").stdout.strip()
     msg = (f"benchsmith repo hold holder={os.environ.get('USER', 'unknown')} "
            f"host={socket.gethostname()} until={int(time.time() + minutes * 60)} "
            f"why={(why or 'unstated').replace(' ', '_')}")

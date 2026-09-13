@@ -189,7 +189,8 @@ class RemoteLease:
         return parse_owner(self._git("show", "-s", "--format=%B", sha).stdout)
 
     def _token(self) -> str:
-        tree = self._git("rev-parse", "HEAD^{tree}", check=True).stdout.strip()
+        # A lease carries metadata only; embedding HEAD's tree makes lock pushes repository-sized.
+        tree = self._git("hash-object", "-t", "tree", "-w", "/dev/null", check=True).stdout.strip()
         msg = (f"benchsmith lease uuid={uuid.uuid4()} host={socket.gethostname()} "
                f"pid={os.getpid()} task={self.task} acquired={int(time.time())}"
                + (f" session={self.session_id}" if self.session_id else ""))

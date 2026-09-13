@@ -3624,6 +3624,32 @@ for _bad in ("../evil", "a/b", "", "has space"):
     except rl.LeaseLost:
         check(f"unsafe lease name refused: {_bad!r}", True, True)
 
+_meta_repo = Path(tempfile.mkdtemp()) / "lease-metadata"
+_meta_repo.mkdir()
+subprocess.run(["git", "-C", str(_meta_repo), "init", "-q", "-b", "main"], check=True)
+for _args in (("user.email", "benchsmith@test"), ("user.name", "Benchsmith Test")):
+    subprocess.run(["git", "-C", str(_meta_repo), "config", *_args], check=True)
+(_meta_repo / "payload").write_bytes(b"x" * 1024 * 1024)
+subprocess.run(["git", "-C", str(_meta_repo), "add", "payload"], check=True)
+subprocess.run(["git", "-C", str(_meta_repo), "commit", "-qm", "large tree"], check=True)
+_meta_token = rl.RemoteLease("metadata-only", _meta_repo)._token()
+_meta_token_tree = subprocess.check_output(
+    ["git", "-C", str(_meta_repo), "rev-parse", f"{_meta_token}^{{tree}}"], text=True
+).strip()
+_meta_head_tree = subprocess.check_output(
+    ["git", "-C", str(_meta_repo), "rev-parse", "HEAD^{tree}"], text=True
+).strip()
+_meta_empty_tree = subprocess.check_output(
+    ["git", "-C", str(_meta_repo), "hash-object", "-t", "tree", "/dev/null"], text=True
+).strip()
+check("lease tokens use the empty metadata tree", _meta_token_tree, _meta_empty_tree)
+check("...rather than embedding the checkout tree", _meta_token_tree == _meta_head_tree, False)
+_meta_token_parents = subprocess.check_output(
+    ["git", "-C", str(_meta_repo), "rev-list", "--parents", "-n", "1", _meta_token],
+    text=True,
+).split()
+check("...and remain parentless", len(_meta_token_parents), 1)
+
 _seen = []
 
 
@@ -3637,8 +3663,8 @@ def _lease_git(state):
             stderr = ""
         if args[0] == "ls-remote":
             R.stdout = f"{state['ref']}\trefs/heads/x" if state["ref"] else ""
-        elif args[0] == "rev-parse":
-            R.stdout = "treeish"
+        elif args[0] == "hash-object":
+            R.stdout = "empty-tree"
         elif args[0] == "commit-tree":
             state["n"] = state.get("n", 0) + 1
             R.stdout = f"token{state['n']}"
@@ -3658,6 +3684,9 @@ _st = {"ref": ""}
 _l = rl.RemoteLease("mytask", "/tmp", runner=_lease_git(_st))
 check("an unheld task can be claimed", _l.acquire()["held"], True)
 check("...and the lease is remembered", bool(_l.sha), True)
+_token_command = next(args for args in _seen if args[0] == "commit-tree")
+check("...and its commit uses the metadata-only tree", _token_command[1], "empty-tree")
+check("...without a reachable parent", "-p" in _token_command, False)
 
 # assert_owned is the whole point: fail closed right before a mutation.
 _l.assert_owned()
@@ -3905,7 +3934,7 @@ def _no_lsremote(args):
     _probe.append(args[0])
     class R:
         returncode = 0
-        stdout = "treeish" if args[0] in ("rev-parse", "commit-tree") else ""
+        stdout = "empty-tree" if args[0] == "hash-object" else ("treeish" if args[0] == "commit-tree" else "")
         stderr = ""
     return R
 
@@ -3963,7 +3992,9 @@ def _bind_git(state):
             stderr = ""
         if args[0] == "ls-remote":
             R.stdout = f"{state['ref']}\trefs/heads/x" if state["ref"] else ""
-        elif args[0] in ("rev-parse", "commit-tree"):
+        elif args[0] == "hash-object":
+            R.stdout = "empty-tree"
+        elif args[0] == "commit-tree":
             state["n"] = state.get("n", 0) + 1
             R.stdout = f"tok{state['n']}"
         elif args[0] == "show":
@@ -4316,6 +4347,33 @@ check("a parsed hold carries who and until",
       hld._parse("holder=kngreen host=box until=99 why=landing_stack"),
       {"holder": "kngreen", "host": "box", "until": "99", "why": "landing_stack"})
 
+_saved_hold_current = hld.current
+_saved_hold_update = hld.remote_ref.update
+_hold_token = {}
+try:
+    hld.current = lambda repo, remote="origin": {"readable": True, "held": False}
+
+    def _capture_hold(repo, remote, ref, target, **kwargs):
+        _hold_token["sha"] = target
+        return {"state": hld.remote_ref.CONFIRMED, "attempts": 0, "sha": target,
+                "detail": "fixture"}
+
+    hld.remote_ref.update = _capture_hold
+    check("a metadata-only repository hold can be taken", hld.take(_meta_repo)["taken"], True)
+    _hold_tree = subprocess.check_output(
+        ["git", "-C", str(_meta_repo), "rev-parse", f"{_hold_token['sha']}^{{tree}}"],
+        text=True,
+    ).strip()
+    check("...and its token uses the empty tree", _hold_tree, _meta_empty_tree)
+    _hold_parents = subprocess.check_output(
+        ["git", "-C", str(_meta_repo), "rev-list", "--parents", "-n", "1", _hold_token["sha"]],
+        text=True,
+    ).split()
+    check("...and remains parentless", len(_hold_parents), 1)
+finally:
+    hld.current = _saved_hold_current
+    hld.remote_ref.update = _saved_hold_update
+
 # publish must refuse into a held branch, and must refuse when it cannot tell.
 _hh3 = {"state": "ready_to_publish", "commit_sha": "b" * 40, "base_sha": "b" * 40,
         "gate_receipt": "r"}
@@ -4498,7 +4556,9 @@ def _timeout_push(lands: bool):
             stderr = ""
         if args[0] == "ls-remote":
             R.stdout = f"{state['ref']}\tref" if state["ref"] else ""
-        elif args[0] in ("rev-parse", "commit-tree"):
+        elif args[0] == "hash-object":
+            R.stdout = "empty-tree"
+        elif args[0] == "commit-tree":
             state["n"] += 1
             R.stdout = f"tok{state['n']}"
         elif args[0] == "push":
