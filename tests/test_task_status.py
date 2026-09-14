@@ -9,6 +9,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from benchsmith import cli
 from benchsmith import dispatch
@@ -478,7 +479,8 @@ class TaskStatusTableTest(unittest.TestCase):
         self.assertFalse(payload["taskStatus"]["rowChanged"])
         self.assertEqual(status.read(self.root), before)
 
-    def test_handoff_and_collect_do_not_repost_an_unchanged_table(self):
+    @patch("benchsmith.dispatch.candidate_mod.verify_handoff")
+    def test_handoff_and_collect_do_not_repost_an_unchanged_table(self, _verify):
         dispatch.write_assignment(
             self.root,
             "task-one",

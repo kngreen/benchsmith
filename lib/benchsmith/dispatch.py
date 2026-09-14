@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import candidate as candidate_mod
+
 # Probed against the live API, not assumed: `--harness` accepts `codex` and
 # `native`; `claude` and `metacode` are rejected by agentcloud\wire\HarnessKind.
 # So the 1P delegation hop cannot be an agentcloud session -- it runs locally.
@@ -55,8 +57,8 @@ PROXY_PREAMBLE = (
 # at 550-724K input tokens per call, most of it spent waiting.
 HANDOFF_FIELDS = (
     "work_item", "state", "base_sha", "commit_sha", "gate_receipt", "next_action", "note",
-    "lease_token", "lease_task", "session", "finalization", "submission_id", "validation",
-    "review", "evidence_url", "status_repo",
+    "source_base_sha", "carried_from_sha", "lease_token", "lease_task", "session",
+    "finalization", "submission_id", "validation", "review", "evidence_url", "status_repo",
 )
 
 # Where a worker also writes its answer. Stdout is not durable: a launcher that
@@ -97,6 +99,14 @@ PLACEHOLDERS = frozenset({
 
 class DispatchRefused(Exception):
     """The dispatch is not safe or not possible. The message is the reason."""
+
+
+class CandidateHandoffRefused(DispatchRefused):
+    """A ready handoff whose full candidate stack is not publication-safe."""
+
+    def __init__(self, reason: str, handoff: dict | None = None):
+        super().__init__(reason)
+        self.handoff = dict(handoff or {})
 
 
 @dataclass
@@ -233,6 +243,8 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
         "```json\n"
         '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
+        '"source_base_sha":"optional old base for a carried rebase",'
+        '"carried_from_sha":"optional old candidate for a carried rebase",'
         '"note":"<=200 chars","validation":"...","review":"...","evidence_url":"https://..."}\n'
         "```\n\n"
         "Then say what happened in **one plain sentence**. A person reads this session, and a wall "
@@ -327,6 +339,8 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
         "```json\n"
         '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
+        '"source_base_sha":"optional old base for a carried rebase",'
+        '"carried_from_sha":"optional old candidate for a carried rebase",'
         '"note":"<=200 chars","validation":"...","review":"...","evidence_url":"https://..."}\n'
         "```\n\n"
         "Then say what happened in **one plain sentence**. A person reads this session, and a wall "
@@ -684,6 +698,24 @@ def relieve(sid: str, *, runner=None, poller=None, sleeper=time.sleep,
             "attempts": len(delays), "reason": "termination was not confirmed"}
 
 
+def _blocked_candidate_result(
+    sid: str, error: CandidateHandoffRefused, *, source: str
+) -> dict:
+    reason = f"publication safety rejected the candidate: {error}"
+    handoff = {
+        key: value for key, value in error.handoff.items() if key in HANDOFF_FIELDS
+    }
+    handoff.update(state="blocked", note=reason)
+    return {
+        "session": sid,
+        "state": "blocked",
+        "reason": reason,
+        "handoff": handoff,
+        "source": source,
+        "candidateRejected": True,
+    }
+
+
 def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
     """Everything a supervisor needs from one worker, in one call."""
     # The handoff file first: it is what the worker was told to write, it
@@ -697,6 +729,8 @@ def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
             durable = parse_handoff(path.read_text())
             return {"session": sid, "state": "done", "handoff": durable, "source": "file",
                     "finalization": final}
+        except CandidateHandoffRefused as error:
+            return _blocked_candidate_result(sid, error, source="file")
         except (OSError, DispatchRefused):
             pass
 
@@ -738,6 +772,8 @@ def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
                 return {"session": sid, "state": "done", "handoff": durable,
                         "source": "session", "finalization": final}
             return {"session": sid, "state": "done", "handoff": doc, "source": "session"}
+        except CandidateHandoffRefused as error:
+            return _blocked_candidate_result(sid, error, source="session")
         except DispatchRefused:
             continue
     return {"session": sid,
@@ -766,10 +802,18 @@ def parse_handoff(text: str) -> dict:
     state = str(doc.get("state") or "")
     if state not in HANDOFF_STATES:
         raise DispatchRefused(f"unknown handoff state {state!r}; expected one of {sorted(HANDOFF_STATES)}")
-    if state == "ready_to_publish" and not doc.get("commit_sha"):
-        # The one claim a coordinator acts on, so it is the one that must not be
-        # takeable on trust.
-        raise DispatchRefused("state=ready_to_publish with no commit_sha")
+    if state == "ready_to_publish":
+        # This is the one claim a coordinator acts on, so neither half of its
+        # ancestry range may be guessed.
+        if not doc.get("commit_sha"):
+            raise CandidateHandoffRefused(
+                "state=ready_to_publish with no commit_sha", doc
+            )
+        if not doc.get("base_sha"):
+            raise CandidateHandoffRefused(
+                "state=ready_to_publish with no base_sha; unknown ancestry blocks publication",
+                doc,
+            )
     return {k: doc.get(k) for k in HANDOFF_FIELDS if k in doc}
 
 
@@ -818,8 +862,15 @@ def write_assignment(
     return path
 
 
-def finalize_handoff(repo: str | Path, task: str, document: dict, *, remote: str = "origin",
-                     lease_runner=None) -> dict:
+def finalize_handoff(
+    repo: str | Path,
+    task: str,
+    document: dict,
+    *,
+    remote: str = "origin",
+    branch: str = "main",
+    lease_runner=None,
+) -> dict:
     """Persist a terminal handoff, then release its exact lease by CAS.
 
     The two operations cannot be atomic across a filesystem and a Git remote.
@@ -847,6 +898,14 @@ def finalize_handoff(repo: str | Path, task: str, document: dict, *, remote: str
             # These choose where shared state is written and which submission is
             # linked. They are coordinator metadata, not worker-authored claims.
             parsed.pop(field, None)
+
+    if state == "ready_to_publish":
+        try:
+            candidate_mod.verify_handoff(
+                Path(repo), task, parsed, remote=remote, branch=branch
+            )
+        except candidate_mod.CandidateRejected as error:
+            raise CandidateHandoffRefused(str(error), parsed) from error
 
     finalization = dict(parsed.get("finalization") or {})
     finalization["phase"] = "durable"

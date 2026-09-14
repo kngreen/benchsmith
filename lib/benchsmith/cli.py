@@ -1496,11 +1496,38 @@ def cmd_config(args) -> int:
 def cmd_handoff(args) -> int:
     """Durably record a terminal handoff, then release its exact task lease."""
     repo = Path(args.repo).resolve()
+    document: dict = {}
     try:
         document = _load(args)
         result = dispatch_mod.finalize_handoff(
-            repo, args.task, document, remote=args.remote
+            repo,
+            args.task,
+            document,
+            remote=args.remote,
+            branch=getattr(args, "branch", "main"),
         )
+    except dispatch_mod.CandidateHandoffRefused as error:
+        handoff = error.handoff or document
+        result = {
+            "ok": False,
+            "phase": "not-written",
+            "reason": str(error),
+            "candidateRejected": True,
+        }
+        result["taskStatus"] = _status_transition(
+            repo,
+            "handoff",
+            args.task,
+            status_repo=handoff.get("status_repo") or None,
+            state="blocked",
+            detail=f"publication safety rejected the candidate: {error}",
+            submission_id=str(handoff.get("submission_id") or "") or None,
+            session=str(handoff.get("session") or "") or None,
+            sha=str(handoff.get("commit_sha") or "") or None,
+            announce=False,
+        )
+        _out(result)
+        return 2
     except (OSError, ValueError, dispatch_mod.DispatchRefused) as error:
         _out({"ok": False, "phase": "not-written", "reason": str(error)})
         return 2
@@ -1999,6 +2026,7 @@ def main(argv: list[str] | None = None) -> int:
     s = common(sub.add_parser("handoff", help="persist a terminal handoff and release its lease"))
     s.add_argument("input", nargs="?", default="-")
     s.add_argument("--remote", default="origin")
+    s.add_argument("--branch", default="main")
     s.set_defaults(fn=cmd_handoff)
 
     s = sub.add_parser("resolve", help="task name, id, or submissions URL -> a bound task")

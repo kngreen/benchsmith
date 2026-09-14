@@ -21,6 +21,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import candidate as candidate_mod
+
 LANE_TTL = 3600
 
 LANDED = "landed"
@@ -183,7 +185,6 @@ def publish(
             f"handoff state is {handoff.get('state')!r}, not ready_to_publish"
         )
     commit_sha = str(handoff.get("commit_sha") or "")
-    base_sha = str(handoff.get("base_sha") or "")
     if not commit_sha:
         raise PublishRefused("no commit_sha; nothing to publish")
     if not handoff.get("gate_receipt"):
@@ -210,6 +211,11 @@ def publish(
         if marker not in accepted:
             raise PublishRefused(
                 "handoff gate_receipt does not identify the verified receipt"
+            )
+        carried_from = str(handoff.get("carried_from_sha") or "")
+        if carried_from and str(body.get("derivedFrom") or "") != carried_from:
+            raise PublishRefused(
+                "gate receipt was not derived from the handoff's carried candidate"
             )
         current = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
         if current != commit_sha:
@@ -276,31 +282,28 @@ def publish(
         )
 
     try:
-        r = git(repo_root, "ls-remote", remote, branch)
-        if r.returncode != 0:
-            raise PublishRefused(f"cannot read the remote: {r.stderr.strip()[:160]}")
-        head = (r.stdout.split() or [""])[0]
-        if base_sha and head and head != base_sha:
-            # A sibling publishing a DIFFERENT task is the common case, and
-            # refusing outright turned it into a dead end that stopped the whole
-            # loop. Whether it is safe is answerable: if our task's graded and
-            # agent-visible surfaces are unchanged between our base and the new
-            # head, nobody touched our task and rebasing onto it is sound.
-            from .coverage import attribute
-
-            att = attribute(repo_root, task, base_sha, head)
-            if not att.covers:
-                raise PublishRefused(
-                    f"the remote moved to {head[:8]} and {att.verdict} — {att.reason}. "
-                    "Someone changed this task; reconcile by hand rather than rebasing over them."
-                )
+        try:
+            proof = candidate_mod.verify_handoff(
+                repo_root, task, handoff, remote=remote, branch=branch, git=git
+            )
+        except candidate_mod.CandidateRejected as error:
+            raise PublishRefused(f"candidate stack is not publication-safe: {error}") from error
+        head = proof.remote_base_sha
+        if proof.needs_rebase:
             if not rebase:
                 raise PublishRefused(
-                    f"the remote moved to {head[:8]}, but this task is untouched between the two. "
-                    "Re-run with rebase=True to move the commit onto it and re-gate."
+                    f"the remote moved to {head[:8]}, but the candidate stack is task-only and "
+                    "the old and current remote task trees are byte-identical. Re-run with "
+                    "rebase=True to move the commit onto it and carry only proven evidence."
                 )
             rb = git(
-                repo_root, "rebase", "--onto", head, base_sha, commit_sha, timeout=600
+                repo_root,
+                "rebase",
+                "--onto",
+                head,
+                proof.declared_base_sha,
+                proof.candidate_sha,
+                timeout=600,
             )
             if rb.returncode != 0:
                 git(repo_root, "rebase", "--abort")
@@ -312,67 +315,80 @@ def publish(
             moved = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
             git(repo_root, "checkout", "--detach", moved)
 
-            # A rebase produces a different commit. Byte-identical task bytes
-            # allow only whitelisted tree-invariant evidence to carry; checks
-            # whose meaning depends on the commit or diff rerun below.
-            #
-            # This is what ends the ping-pong. The coordinator cannot regate
-            # (it has no task oracle), so it returned every rebase to a worker;
-            # by the time that worker answered, main had moved again. One task
-            # went round four times before landing.
-            before = (
-                git(repo_root, "rev-parse", f"{commit_sha}:{task}").stdout.split()
-                or [""]
-            )[0]
-            after = (
-                git(repo_root, "rev-parse", f"{moved}:{task}").stdout.split() or [""]
-            )[0]
-            if before and after and before == after:
-                from . import gate as gate_mod
-
-                carried = gate_mod.carry_receipt(repo_root, task, moved)
-                if not carried.get("ok"):
-                    return {
-                        "state": "rebased",
-                        "task": task,
-                        "from": commit_sha,
-                        "newSha": moved,
-                        "onto": head,
-                        "needsRegate": True,
-                        "detail": f"task tree is unchanged, but candidate receipt failed: "
-                        f"{carried.get('reason', 'unknown')}",
-                    }
+            # Carrying evidence across a rewritten commit requires two independent
+            # byte proofs: the old base task equals the current remote task, and
+            # the old candidate task equals the rebased candidate task. Scope is
+            # checked over both stacks, not just over either tip commit.
+            try:
+                carry_proof = candidate_mod.prove_carry(
+                    repo_root,
+                    task,
+                    source_base=proof.declared_base_sha,
+                    source_candidate=proof.candidate_sha,
+                    target_base=head,
+                    target_candidate=moved,
+                    git=git,
+                )
+            except candidate_mod.CandidateTreeChanged:
                 return {
                     "state": "rebased",
                     "task": task,
                     "from": commit_sha,
                     "newSha": moved,
                     "onto": head,
-                    "needsRegate": False,
-                    "taskTree": before,
-                    "gateReceipt": carried["receipt"]["digest"],
+                    "needsRegate": True,
                     "detail": (
-                        f"rebased onto {head[:8]}; the task tree is byte-identical "
-                        f"({before[:12]}). Tree-invariant evidence was carried and "
-                        "commit-relative controls reran for the new SHA."
+                        "rebased onto the new head and the task tree changed, so the "
+                        "receipt no longer describes it. Re-gate this SHA."
                     ),
                 }
+            except candidate_mod.CandidateRejected as error:
+                raise PublishRefused(
+                    f"rebased candidate stack is not publication-safe: {error}"
+                ) from error
+
+            from . import gate as gate_mod
+
+            carried = gate_mod.carry_receipt(repo_root, task, moved)
+            if not carried.get("ok"):
+                return {
+                    "state": "rebased",
+                    "task": task,
+                    "from": commit_sha,
+                    "newSha": moved,
+                    "onto": head,
+                    "needsRegate": True,
+                    "detail": f"task tree is unchanged, but candidate receipt failed: "
+                    f"{carried.get('reason', 'unknown')}",
+                }
+            receipt = carried["receipt"]["digest"]
             return {
                 "state": "rebased",
                 "task": task,
                 "from": commit_sha,
                 "newSha": moved,
                 "onto": head,
-                "needsRegate": True,
+                "needsRegate": False,
+                "taskTree": carry_proof.task_tree,
+                "gateReceipt": receipt,
+                "stackProof": carry_proof.as_dict(),
+                "handoffPatch": {
+                    "base_sha": head,
+                    "commit_sha": moved,
+                    "source_base_sha": proof.declared_base_sha,
+                    "carried_from_sha": proof.candidate_sha,
+                    "gate_receipt": receipt,
+                },
                 "detail": (
-                    "rebased onto the new head and the task tree changed, so the "
-                    "receipt no longer describes it. Re-gate this SHA."
+                    f"rebased onto {head[:8]}; old and current base task trees match, "
+                    f"and the carried task tree is byte-identical ({carry_proof.task_tree[:12]}). "
+                    "Tree-invariant evidence was carried and commit-relative controls reran."
                 ),
             }
 
         intent = Intent(
             task=task,
-            base_sha=base_sha or head,
+            base_sha=head,
             commit_sha=commit_sha,
             remote=remote,
             branch=branch,

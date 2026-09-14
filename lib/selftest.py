@@ -1252,7 +1252,8 @@ _MUTANTS = [
     ("harness allowlist", 'if harness and harness not in AGENTCLOUD_HARNESSES:', 'if False:'),
     ("apply guard", 'if not apply:', 'if False:'),
     ("publishing guard", 'if p.publishing:', 'if False:'),
-    ("commit_sha requirement", 'if state == "ready_to_publish" and not doc.get("commit_sha"):', 'if False:'),
+    ("commit_sha requirement", 'if not doc.get("commit_sha"):', 'if False:'),
+    ("base_sha requirement", 'if not doc.get("base_sha"):', 'if False:'),
     ("state allowlist", 'if state not in HANDOFF_STATES:', 'if False:'),
     ("size cap", 'if len(text) > HANDOFF_LIMIT * 4:', 'if False:'),
 ]
@@ -1271,7 +1272,12 @@ def _survives(old, new) -> bool:
             # the probe silently stops testing anything.
             lambda: m.run(m.plan("t1", _REPO),
                           runner=lambda _p: {"ok": True, "stdout": "{}"}),
-            lambda: m.parse_handoff('{"state":"ready_to_publish"}'),
+            lambda: m.parse_handoff(
+                '{"state":"ready_to_publish","base_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+            ),
+            lambda: m.parse_handoff(
+                '{"state":"ready_to_publish","commit_sha":"cccccccccccccccccccccccccccccccccccccccc"}'
+            ),
             lambda: m.parse_handoff('{"state":"kinda_done"}'),
             lambda: m.parse_handoff(_oversized()),
         ]
@@ -1771,9 +1777,27 @@ def _fake_remote(head):
     def g(repo, *args, **kw):
         class R:
             returncode = 0
-            stdout = f"{head}\trefs/heads/main"
+            stdout = ""
             stderr = ""
-        return R()
+
+        result = R()
+        if args and args[0] == "ls-remote":
+            result.stdout = f"{head}\trefs/heads/main\n"
+        elif args and args[0] == "rev-parse":
+            value = str(args[-1]).removesuffix("^{commit}")
+            if value == "HEAD":
+                value = head
+            if value == "9" * 40:
+                result.returncode = 128
+                result.stderr = "unknown revision"
+            else:
+                result.stdout = value + "\n"
+        elif args and args[0] == "merge-base":
+            result.returncode = 0
+        elif args and args[0] == "ls-tree":
+            task = str(args[-1])
+            result.stdout = f"040000 tree {'e' * 40}\t{task}\0"
+        return result
     return g
 
 
@@ -2864,7 +2888,12 @@ def _never_polled(argv):
     raise AssertionError("the journal must not be walked when the file is present")
 
 
-_c = dsp.collect("s1", repo=str(_hf), task="mytask", runner=_never_polled)
+_saved_candidate_verify = dsp.candidate_mod.verify_handoff
+dsp.candidate_mod.verify_handoff = lambda *args, **kwargs: None
+try:
+    _c = dsp.collect("s1", repo=str(_hf), task="mytask", runner=_never_polled)
+finally:
+    dsp.candidate_mod.verify_handoff = _saved_candidate_verify
 check("the handoff is read from disk", _c["source"], "file")
 check("...without walking the journal", _c["handoff"]["commit_sha"], "abc")
 
@@ -3378,10 +3407,22 @@ except pub.PublishRefused as e:
     check("a moved remote is refused without rebase", "rebase=True" in str(e), True)
 
 _saved_requests = _carry_reviews.requests
-_carry_reviews.requests = lambda task, binary="codimango": {"requests": []}
-_res = pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False,
-                   check_hold=False, rebase=True)
-_carry_reviews.requests = _saved_requests
+_saved_carry_controls = gate_mod.check_control_manifest
+
+
+def _shadow_carry_controls(repo_root, task_dir, task_name, report, **kwargs):
+    report.artifacts["controlManifest"] = {"mode": "shadow"}
+    report.add("control-manifest", gate_mod.PASS, "not part of the carry fixture")
+
+
+try:
+    _carry_reviews.requests = lambda task, binary="codimango": {"requests": []}
+    gate_mod.check_control_manifest = _shadow_carry_controls
+    _res = pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False,
+                       check_hold=False, rebase=True)
+finally:
+    _carry_reviews.requests = _saved_requests
+    gate_mod.check_control_manifest = _saved_carry_controls
 check("with rebase it moves onto the new head", _res["state"], "rebased")
 check("...producing a real sha", len(_res["newSha"]) == 40 and " " not in _res["newSha"], True)
 check("...that is a descendant of the sibling's commit",
@@ -3406,9 +3447,9 @@ try:
                       check_hold=False, rebase=True)
     check("a rebase that moves our task demands a regate", _r2.get("needsRegate"), True)
 except pub.PublishRefused as e:
-    # Also acceptable: coverage refuses outright because they touched our task.
+    # Also acceptable: the full task-tree proof refuses outright.
     check("a rebase that moves our task is not carried silently",
-          "Someone changed this task" in str(e), True)
+          "task tree differs" in str(e) or "unsafe" in str(e), True)
 
 # When the sibling touched OUR task, rebasing over them would be silent.
 _rg("checkout", "-q", _BASE)
@@ -3420,7 +3461,7 @@ try:
     check("a sibling touching our task is not rebased over", "rebased", "refused")
 except pub.PublishRefused as e:
     check("a sibling touching our task is not rebased over",
-          "Someone changed this task" in str(e), True)
+          "task tree differs" in str(e) or "unsafe" in str(e), True)
 
 # --- the receipt the repo's own hook reads -----------------------------------
 

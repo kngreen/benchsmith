@@ -314,7 +314,8 @@ happens are all recoverable:
 |---|---|
 | The repo's pre-push hook rejected it | `benchsmith gate` writes that hook's receipt too; re-gate and retry |
 | `origin/main` moved | `benchsmith publish --rebase` — safe when this task is untouched between the two |
-| Scope rejected | the commit reaches outside the task directory; narrow it and re-commit |
+| Scope rejected | the whole candidate stack reaches outside the task directory; narrow it and re-commit |
+| Ancestry rejected | fetch/resolve the declared and current bases; unknown or incomparable ancestry never publishes |
 | Genuinely stuck | record it, **move to the next task**, and report it at the end |
 
 Only report a run as blocked when *every remaining item* is blocked. Otherwise keep going and list
@@ -362,12 +363,15 @@ costs you nothing. A session is put back in the inbox exactly when a person beco
 turns this off.
 
 `collect` reads `<repo>/.benchsmith/handoff/<task>.json` first and falls back to the session
-journal. The file is the contract: it survives a launcher that loses its pipe, and it means the
-worker's visible last word can be a plain sentence instead of a wire format. Workers finalize with
-`benchsmith handoff`: it atomically renames a handoff containing the exact session and lease token,
-then releases that token with compare-and-swap. A crash after the rename leaves phase `durable` and
-is safe to replay; phase `released` is terminal. Existing handoffs without lease fields remain
-readable but are not allowed to guess which lease to release.
+journal. A `ready_to_publish` handoff is re-proved against the current remote before it is accepted:
+every commit in the candidate stack must be task-only, and unknown ancestry blocks. A rejected
+candidate is surfaced as `blocked`, never copied into the live table as ready. The file is the
+contract: it survives a launcher that loses its pipe, and it means the worker's visible last word
+can be a plain sentence instead of a wire format. Workers finalize with `benchsmith handoff`: it
+atomically renames a handoff containing the exact session and lease token, then releases that token
+with compare-and-swap. A crash after the rename leaves phase `durable` and is safe to replay; phase
+`released` is terminal. Existing handoffs without lease fields remain readable but are not allowed
+to guess which lease to release.
 
 | Handoff state | What you do |
 |---|---|
