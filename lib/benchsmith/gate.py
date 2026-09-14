@@ -651,9 +651,10 @@ def check_structural(task_dir: Path, report: Report, binary: str = "codimango") 
         report.add("structural", NOT_RUN, f"could not parse structural JSON: {e}")
         return
 
-    failed, exempted = [], []
+    failed, warned, exempted = [], [], []
     for c in checks:
-        if str(c.get("status", "")).lower() in ("pass", "ok", "passed"):
+        status = str(c.get("status", "")).lower()
+        if status in ("pass", "ok", "passed"):
             continue
         detail = str(c.get("details") or "")
         # A macOS VM task has no Dockerfile by design -- the environment is
@@ -664,11 +665,24 @@ def check_structural(task_dir: Path, report: Report, binary: str = "codimango") 
         if is_vm and "Dockerfile" in detail and "missing" in detail.lower():
             exempted.append(f"{c.get('name')} (VM task: no Dockerfile by design)")
             continue
-        failed.append(f"{c.get('name')}: {detail[:100]}")
-    note = f"; exempted: {', '.join(exempted)}" if exempted else ""
-    report.add("structural", FAIL if failed else PASS,
-               ("; ".join(failed[:4]) + note) if failed
-               else f"{len(checks)} upstream check(s) pass{note}")
+        item = f"{c.get('name')}: {detail[:100]}"
+        if status in ("warn", "warning"):
+            warned.append(item)
+            continue
+        failed.append(item)
+    notes = []
+    if warned:
+        notes.append("warnings: " + "; ".join(warned[:4]))
+    if exempted:
+        notes.append("exempted: " + ", ".join(exempted))
+    suffix = "; " + "; ".join(notes) if notes else ""
+    report.add(
+        "structural",
+        FAIL if failed else PASS,
+        ("; ".join(failed[:4]) + suffix)
+        if failed
+        else f"{len(checks) - len(warned)} upstream check(s) pass{suffix}",
+    )
 
 
 def check_control_manifest(repo_root: Path, task_dir: Path, task_name: str,
