@@ -44,6 +44,7 @@ from . import worktree as wt_mod
 from . import publish as publish_mod
 from . import sources
 from . import stats as stats_mod
+from . import task_status as task_status_mod
 from .queue import (DEFAULT_WORKERS, MAX_WORKERS, Leases, build_queue, changes,
                     fingerprint, read_journals, render, render_changes)
 from .adapter import Identity, Platform, Unresolved, discover
@@ -54,6 +55,46 @@ from .snapshot import build, evidence, infra_fraction
 
 def _out(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
+
+
+def _status_transition(repo: str | Path, event: str, task: str, **fields) -> dict:
+    """Status reporting must never hide the command's primary result."""
+    status_repo = fields.pop("status_repo", None)
+    announce = fields.pop("announce", True)
+    try:
+        return task_status_mod.transition(
+            repo,
+            event,
+            task,
+            status_repo=status_repo,
+            announce=announce,
+            **fields,
+        )
+    except Exception as error:  # noqa: BLE001 - surfaced alongside the real result
+        return {
+            "changed": False,
+            "markdown": None,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _status_updates(
+    repo: str | Path,
+    patches: list[dict],
+    *,
+    status_repo=None,
+    announce: bool = True,
+) -> dict:
+    try:
+        return task_status_mod.update_many(
+            repo, patches, status_repo=status_repo, announce=announce
+        )
+    except Exception as error:  # noqa: BLE001 - surfaced alongside the real result
+        return {
+            "changed": False,
+            "markdown": None,
+            "error": f"{type(error).__name__}: {error}",
+        }
 
 
 def _identity(args) -> Identity:
@@ -106,14 +147,30 @@ def _load(args) -> dict:
     return json.loads(Path(args.input).read_text())
 
 
-def _bind_worker(lease, sid: str, worktree: str, task: str) -> dict:
+def _bind_worker(
+    lease,
+    sid: str,
+    worktree: str,
+    task: str,
+    *,
+    status_repo: str = "",
+    submission_id: str = "",
+) -> dict:
     """Bind a created worker or terminate it before reporting dispatch success."""
     if lease is None:
         return {"ok": True, "bound": False, "noRemoteLease": True}
     bound = lease.bind(sid)
     if bound.get("bound"):
         try:
-            dispatch_mod.write_assignment(worktree, task, sid, lease.sha, lease.task)
+            dispatch_mod.write_assignment(
+                worktree,
+                task,
+                sid,
+                lease.sha,
+                lease.task,
+                status_repo=status_repo,
+                submission_id=submission_id,
+            )
             return {"ok": True, **bound}
         except OSError as error:
             bound = {"bound": False, "reason": f"could not persist worker assignment: {error}"}
@@ -202,9 +259,32 @@ def cmd_record(args) -> int:
     if args.status:
         j.set_status(args.status, oracle_passing=not args.oracle_failing)
     j.save()
-    _out({"round": entry, "stop": j.stop_reason(), "status": j.data["status"],
-          "mode": j.mode, "closure": j.closure_summary(), "openFindings": j.open_findings(),
-          "journal": str(j.path)})
+    result = {
+        "round": entry,
+        "stop": j.stop_reason(),
+        "status": j.data["status"],
+        "mode": j.mode,
+        "closure": j.closure_summary(),
+        "openFindings": j.open_findings(),
+        "journal": str(j.path),
+    }
+    signals = payload.get("signals") or payload.get("task") or {}
+    result["taskStatus"] = _status_transition(
+        repo,
+        "record",
+        args.task,
+        mode=j.mode,
+        journal_status=str(j.data.get("status") or ""),
+        class_name=str(entry.get("class") or ""),
+        detail=" ".join(x for x in (args.fix, args.explain) if x),
+        sha=(args.sha or str(entry.get("sha") or "")) or None,
+        validation=(str(signals.get("validationStatus") or entry.get("cloudStatus") or "")
+                    or None),
+        review=task_status_mod.review_summary(payload.get("reviews") or []) or None,
+        evidence=task_status_mod.evidence_url(payload),
+        announce=False,
+    )
+    _out(result)
     return 0
 
 
@@ -365,7 +445,23 @@ def cmd_dispatch(args) -> int:
         _out({"planned": p.as_dict(), "applied": False,
               "hint": "re-run with --apply to actually start it"})
         return 0
-    _out(dispatch_mod.run(p, apply=True))
+    result = dispatch_mod.run(p, apply=True)
+    sid = dispatch_mod.session_id(result.get("stdout") or "")
+    started = bool(result.get("ok") and sid)
+    if sid:
+        result["session"] = sid
+    elif result.get("ok"):
+        result["warning"] = "worker start returned no session id"
+    result["taskStatus"] = _status_transition(
+        Path(args.repo).resolve(),
+        "worker-start" if started else "collect",
+        args.task,
+        mode=args.mode,
+        state="working" if started else "failed",
+        detail=result.get("error") or result.get("stderr") or "",
+        session=sid or None,
+    )
+    _out(result)
     return 0
 
 
@@ -434,7 +530,9 @@ def cmd_fleet(args) -> int:
         clamp_note = (f"asked for {workers}; clamped to {MAX_WORKERS}. Past that the limit is the "
                       "devserver and the platform's validation capacity, not benchsmith")
         workers = MAX_WORKERS
-    ready = ready[:workers]
+    all_ready = ready
+    ready = all_ready[:workers]
+    waiting = all_ready[workers:]
 
     # One ls-remote per repository, not one per task. Tasks can resolve to
     # different checkouts, so the state is keyed by the repo it came from.
@@ -451,6 +549,68 @@ def cmd_fleet(args) -> int:
     plans, started = [], []
     run_dir = repo / ".benchsmith" / "fleet"
     claimed: list = []
+    table_update = None
+    announce_status = False
+    raw_by_name = {
+        str(row.get("name") or row.get("id") or ""): row
+        for row in (raw.get("tasks") or [])
+    }
+
+    def _status_metadata(task_name: str, plan: dict | None = None) -> dict:
+        plan = plan or {}
+        source = raw_by_name.get(task_name) or {}
+        return {
+            "submission_id": str(plan.get("taskId") or source.get("id") or "") or None,
+            "sha": str(
+                plan.get("sha")
+                or source.get("validationCommitSha")
+                or source.get("commitSha")
+                or ""
+            ) or None,
+            "validation": (
+                str(plan.get("validation") or source.get("validationStatus") or "") or None
+            ),
+        }
+
+    def _fleet_status_patches() -> list[dict]:
+        patches = []
+        for item in waiting:
+            patches.append(
+                task_status_mod.transition_patch(
+                    "queued", item.task, **_status_metadata(item.task)
+                )
+            )
+        for plan in plans:
+            metadata = _status_metadata(str(plan.get("task") or ""), plan)
+            status_task = str(plan.get("workItem") or plan.get("task") or "")
+            if plan.get("session") and plan.get("ok"):
+                patches.append(
+                    task_status_mod.transition_patch(
+                        "worker-start",
+                        status_task,
+                        mode=str(plan.get("mode") or ""),
+                        session=str(plan.get("session") or ""),
+                        **metadata,
+                    )
+                )
+            elif plan.get("skipped") or plan.get("ok") is False or "session" in plan:
+                patches.append(
+                    task_status_mod.transition_patch(
+                        "collect",
+                        str(plan.get("workItem") or plan.get("task") or ""),
+                        mode=str(plan.get("mode") or ""),
+                        state=("failed" if plan.get("ok") is False or not plan.get("session")
+                               else "blocked"),
+                        detail=str(
+                            plan.get("skipped")
+                            or plan.get("error")
+                            or plan.get("warning")
+                            or ""
+                        ),
+                        **metadata,
+                    )
+                )
+        return patches
 
     def _persist() -> None:
         """Write what has happened so far, after every worker.
@@ -461,6 +621,7 @@ def cmd_fleet(args) -> int:
         """
         if not args.apply:
             return
+        nonlocal table_update
         try:
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "current.json").write_text(json.dumps(
@@ -468,11 +629,17 @@ def cmd_fleet(args) -> int:
                  "deadline": time.time() + args.max_runtime * 3600,
                  "maxRuntimeHours": args.max_runtime,
                  "plans": [{k: v for k, v in pl.items()
-                            if k in ("task", "repo", "worktree", "mode", "session",
-                                     "remoteLease", "remoteLeaseToken")}
+                            if k in ("task", "taskId", "repo", "worktree", "mode", "session",
+                                     "workItem", "sha", "validation", "statusRepo", "remoteLease",
+                                     "remoteLeaseToken")}
                            for pl in plans if "session" in pl]}, indent=1))
         except OSError:
             pass
+        update = _status_updates(
+            repo, _fleet_status_patches(), status_repo=repo, announce=announce_status
+        )
+        if table_update is None or update.get("changed") or update.get("error"):
+            table_update = update
 
     for n, item in enumerate(ready, 1):
         if args.apply:
@@ -543,9 +710,12 @@ def cmd_fleet(args) -> int:
         except dispatch_mod.DispatchRefused as e:
             plans.append({"task": item.task, "skipped": str(e)})
             continue
-        entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
+        entry = {"task": item.task, "workItem": name, "tier": item.tier,
+                 "tierName": item.as_dict()["tierName"],
+                 "taskId": str(info.get("id") or ""),
                  "repo": target, "worktree": work_in if work_in != target else None,
-                 "mode": mode}
+                 "mode": mode, "sha": str(info.get("sha") or ""),
+                 "validation": str(info.get("validation") or ""), "statusRepo": str(repo)}
         if lease is not None:
             entry["remoteLease"] = lease.ref
         if mode == "scaffold":
@@ -572,7 +742,14 @@ def cmd_fleet(args) -> int:
                   file=sys.stderr, flush=True)
             if sid:
                 if lease is not None:
-                    lifecycle = _bind_worker(lease, sid, work_in, name)
+                    lifecycle = _bind_worker(
+                        lease,
+                        sid,
+                        work_in,
+                        name,
+                        status_repo=str(repo),
+                        submission_id=str(info.get("id") or ""),
+                    )
                     entry["leaseBinding"] = lifecycle
                     if not lifecycle["ok"]:
                         entry["ok"] = False
@@ -581,14 +758,46 @@ def cmd_fleet(args) -> int:
                         _persist()
                         continue
                     entry["remoteLeaseToken"] = lease.sha
+                else:
+                    try:
+                        dispatch_mod.write_assignment(
+                            work_in,
+                            name,
+                            sid,
+                            "",
+                            status_repo=str(repo),
+                            submission_id=str(info.get("id") or ""),
+                        )
+                    except OSError as error:
+                        entry["warning"] = (
+                            "worker started but status assignment was not persisted: "
+                            f"{error}"
+                        )
+                if Path(work_in).resolve() != Path(target).resolve():
+                    try:
+                        dispatch_mod.write_assignment(
+                            target,
+                            name,
+                            sid,
+                            lease.sha if lease is not None else "",
+                            lease.task if lease is not None else name,
+                            status_repo=str(repo),
+                            submission_id=str(info.get("id") or ""),
+                        )
+                    except OSError as error:
+                        entry["warning"] = (
+                            "worker started but the canonical status assignment was not persisted: "
+                            f"{error}"
+                        )
                 claimed = [c for c in claimed if c[1] != item.task]
                 started.append({"task": item.task, "session": sid})
             elif lease is not None:
                 lease.release()
-            _persist()
         else:
             entry["shell"] = p.shell
         plans.append(entry)
+        if args.apply:
+            _persist()
 
     by_repo: dict[str, int] = {}
     for pl in plans:
@@ -608,7 +817,12 @@ def cmd_fleet(args) -> int:
         payload["clamped"] = clamp_note
     if "payload_released" in dir():
         payload["releasedUnused"] = payload_released
+    announce_status = True
     _persist()
+    if args.apply:
+        payload["taskStatus"] = table_update or _status_updates(
+            repo, _fleet_status_patches(), status_repo=repo, announce=True
+        )
     # Anything claimed but never dispatched is released. A lease and a worktree
     # held for a task nobody is working on strands that task from every other
     # host until the TTL expires.
@@ -665,6 +879,15 @@ def cmd_scaffold(args) -> int:
         res = dispatch_mod.run(p, apply=True)
         out["session"] = dispatch_mod.session_id(res.get("stdout") or "")
         out["ok"] = res.get("ok")
+        out["taskStatus"] = _status_transition(
+            Path(repo).resolve(),
+            "worker-start" if res.get("ok") else "collect",
+            name,
+            mode="scaffold",
+            state="working" if res.get("ok") else "failed",
+            detail=res.get("error") or res.get("stderr") or "",
+            session=out["session"] or None,
+        )
         # The point of scaffolding is to get a task the loop can run. Say so, so
         # nobody treats a fresh skeleton as the end of the job.
         out["thenRun"] = f"benchsmith resolve {name}   # then run the round; it will be unregistered"
@@ -749,17 +972,71 @@ def cmd_relieve(args) -> int:
         dispatch_mod.snooze(sid)
     if lease is not None:
         if sid:
-            lifecycle = _bind_worker(lease, sid, work_in, args.task)
+            lifecycle = _bind_worker(
+                lease,
+                sid,
+                work_in,
+                args.task,
+                status_repo=str(repo),
+                submission_id=str(info.get("id") or ""),
+            )
             out["leaseBinding"] = lifecycle
             if not lifecycle["ok"]:
                 _out({**out, "successor": None,
                       "reason": "successor lease binding was not confirmed"})
                 return 2
+            if Path(work_in).resolve() != Path(info.get("repo") or repo).resolve():
+                try:
+                    dispatch_mod.write_assignment(
+                        Path(info.get("repo") or repo),
+                        args.task,
+                        sid,
+                        lease.sha,
+                        lease.task,
+                        status_repo=str(repo),
+                        submission_id=str(info.get("id") or ""),
+                    )
+                except OSError as error:
+                    out["assignmentWarning"] = str(error)
         else:
             # No session means no worker; holding the claim would strand the task.
             lease.release()
-    _out({**out, "successor": sid, "applied": True,
-          "note": "the successor resumes from the journal, not from the old session"})
+    elif sid:
+        try:
+            dispatch_mod.write_assignment(
+                work_in,
+                args.task,
+                sid,
+                "",
+                status_repo=str(repo),
+                submission_id=str(info.get("id") or ""),
+            )
+            if Path(work_in).resolve() != Path(info.get("repo") or repo).resolve():
+                dispatch_mod.write_assignment(
+                    Path(info.get("repo") or repo),
+                    args.task,
+                    sid,
+                    "",
+                    status_repo=str(repo),
+                    submission_id=str(info.get("id") or ""),
+                )
+        except OSError as error:
+            out["assignmentWarning"] = str(error)
+    result = {**out, "successor": sid, "applied": True,
+              "note": "the successor resumes from the journal, not from the old session"}
+    result["taskStatus"] = _status_transition(
+        repo,
+        "worker-start" if sid else "collect",
+        args.task,
+        mode=str(info.get("mode") or ""),
+        state="working" if sid else "failed",
+        detail=str(res.get("error") or res.get("stderr") or ""),
+        submission_id=str(info.get("id") or "") or None,
+        session=sid or None,
+        sha=str(info.get("sha") or "") or None,
+        validation=str(info.get("validation") or "") or None,
+    )
+    _out(result)
     return 0
 
 
@@ -813,20 +1090,58 @@ def cmd_status(args) -> int:
     try:
         run = json.loads((repo / ".benchsmith" / "fleet" / "current.json").read_text())
     except (OSError, ValueError):
-        _out({"workers": [], "reason": "no fleet run recorded in this checkout"})
+        table_error = ""
+        try:
+            table = task_status_mod.read(repo)
+            table_path = task_status_mod.paths(repo)[1]
+        except Exception as error:  # noqa: BLE001
+            table, table_path = None, ""
+            table_error = f"{type(error).__name__}: {error}"
+        payload = {"workers": [], "reason": "no fleet run recorded in this checkout"}
+        if table is not None:
+            payload["taskStatus"] = {
+                "changed": False,
+                "markdown": None,
+                "markdownPath": str(table_path),
+                "rows": len(table.get("rows") or {}),
+            }
+        elif table_error:
+            payload["taskStatus"] = {"changed": False, "markdown": None, "error": table_error}
+        _out(payload)
         return 0
     rows = []
-    for pl in run.get("plans") or []:
+    patches = []
+    try:
+        existing_rows = (task_status_mod.read(repo).get("rows") or {})
+    except task_status_mod.StatusTableError:
+        existing_rows = {}
+    plans = run.get("plans") or []
+    needs_metadata = any(
+        not plan.get("taskId")
+        and not (existing_rows.get(str(plan.get("task") or "")) or {}).get("submissionId")
+        for plan in plans
+    )
+    platform_by_name = {}
+    if needs_metadata:
+        platform_rows, _ = sources.fetch_codimango()
+        platform_by_name = {
+            str(item.get("name") or item.get("id") or ""): item for item in platform_rows
+        }
+    for pl in plans:
         sid = pl.get("session") or ""
+        task_name = str(pl.get("workItem") or pl.get("task") or "")
         # The worker wrote its handoff inside its own worktree. Reading the
         # canonical checkout finds an older one from a previous round, which is
         # worse than finding none.
         res = dispatch_mod.collect(sid, repo=pl.get("worktree") or pl.get("repo", ""),
-                                   task=pl.get("task", ""))
+                                   task=task_name)
         hand = res.get("handoff") or {}
+        platform = platform_by_name.get(str(pl.get("task") or "")) or {}
+        stored = existing_rows.get(task_name) or {}
+        observed_state = str(hand.get("state") or res.get("state") or "")
+        detail = str(hand.get("note") or res.get("reason") or "")
         row = {"task": pl.get("task"), "mode": pl.get("mode"), "session": sid,
-               "state": hand.get("state") or res.get("state"),
-               "note": (hand.get("note") or res.get("reason") or "")[:110]}
+               "state": observed_state, "note": detail[:110]}
         # A worker with no handoff yet may be thinking or may have died twenty
         # minutes ago. Both look like silence, and only one deserves the slot.
         if not hand and sid:
@@ -838,11 +1153,81 @@ def cmd_status(args) -> int:
                 row["relieve"] = (f"benchsmith relieve --repo {args.repo} "
                                   f"--task {pl.get('task')} --session-id {sid} --apply")
                 row["why"] = ("over its wall clock" if h.get("overRuntime") else h["reason"])
+                observed_state = "needs_human" if h.get("overRuntime") else "blocked"
+                detail = row["why"]
+            elif h["state"] == "unreadable":
+                observed_state = "unreadable"
+                detail = h.get("reason") or detail
+            else:
+                observed_state = h["state"]
+                detail = h.get("reason") or detail
+        patches.append(
+            task_status_mod.transition_patch(
+                "collect",
+                task_name,
+                mode=str(pl.get("mode") or ""),
+                state=observed_state,
+                detail=detail,
+                submission_id=str(
+                    pl.get("taskId")
+                    or hand.get("submission_id")
+                    or platform.get("id")
+                    or stored.get("submissionId")
+                    or ""
+                )
+                or None,
+                session=str(sid) or None,
+                sha=str(
+                    hand.get("commit_sha")
+                    or pl.get("sha")
+                    or platform.get("validationCommitSha")
+                    or platform.get("commitSha")
+                    or stored.get("sha")
+                    or ""
+                )
+                or None,
+                validation=str(
+                    hand.get("validation")
+                    or pl.get("validation")
+                    or platform.get("validationStatus")
+                    or stored.get("validation")
+                    or ""
+                )
+                or None,
+                review=str(
+                    hand.get("review")
+                    or platform.get("agenticReviewStatus")
+                    or stored.get("review")
+                    or ""
+                )
+                or None,
+                evidence=task_status_mod.evidence_url(hand) or None,
+            )
+        )
         rows.append(row)
     done = [r for r in rows if r["state"] not in ("running", "starting")]
     stuck = [r for r in rows if r.get("relieve")]
+    table = _status_updates(repo, patches, status_repo=repo)
     _out({"workers": rows, "running": len(rows) - len(done), "finished": len(done),
-          "needRelief": len(stuck)})
+          "needRelief": len(stuck), "taskStatus": table})
+    return 0
+
+
+def cmd_task_status(args) -> int:
+    """Read the durable fleet table without changing any row."""
+    repo = Path(args.repo).resolve()
+    try:
+        # An explicit render is itself the publication of this revision; consume
+        # any pending automatic announcement so the next poll does not repeat it.
+        task_status_mod.update_many(repo, [], announce=True)
+        document = task_status_mod.read(repo)
+    except task_status_mod.StatusTableError as error:
+        _out({"ok": False, "reason": str(error)})
+        return 2
+    if args.json:
+        _out(document)
+    else:
+        print(task_status_mod.render(document), end="")
     return 0
 
 
@@ -1038,6 +1423,19 @@ def cmd_causal(args) -> int:
 def cmd_watch(args) -> int:
     """Has the wave for this exact SHA landed? One cheap read, not a held slot."""
     res = watch_mod.state(args.task, args.sha, pushed_at=args.pushed_at or None)
+    res["taskStatus"] = _status_transition(
+        Path(args.repo).resolve(),
+        "watch",
+        args.task,
+        status_repo=getattr(args, "status_repo", "") or None,
+        state=str(res.get("state") or ""),
+        detail=str(res.get("reason") or ""),
+        sha=args.sha,
+        submission_id=str(res.get("submissionId") or "") or None,
+        validation=str(res.get("validation") or "") or None,
+        review=str(res.get("review") or "") or None,
+        orphaned=bool(res.get("orphaned")),
+    )
     _out(res)
     # Only `terminal` means there is something new to act on.
     return 0 if res["state"] == watch_mod.TERMINAL else 1
@@ -1046,11 +1444,29 @@ def cmd_watch(args) -> int:
 def cmd_collect(args) -> int:
     """Read one worker's handoff — from disk first, then the session journal."""
     res = dispatch_mod.collect(args.session_id, repo=args.repo, task=args.task)
-    state = str((res.get("handoff") or {}).get("state") or "")
+    handoff = res.get("handoff") or {}
+    state = str(handoff.get("state") or "")
     # Back into the inbox exactly when a person is the next step, and not before.
     if state in dispatch_mod.NEEDS_A_HUMAN or res.get("state") == "finished-without-handoff":
         res["surfaced"] = dispatch_mod.surface(args.session_id)["surfaced"]
         res["why_surfaced"] = f"state={state or res.get('state')} needs a person"
+    task = str(args.task or handoff.get("work_item") or "")
+    if task:
+        res["taskStatus"] = _status_transition(
+            Path(args.repo or ".").resolve(),
+            "collect",
+            task,
+            status_repo=(getattr(args, "status_repo", "")
+                         or handoff.get("status_repo") or None),
+            state=state or str(res.get("state") or ""),
+            detail=str(handoff.get("note") or res.get("reason") or ""),
+            submission_id=str(handoff.get("submission_id") or "") or None,
+            session=args.session_id,
+            sha=str(handoff.get("commit_sha") or "") or None,
+            validation=str(handoff.get("validation") or "") or None,
+            review=str(handoff.get("review") or "") or None,
+            evidence=task_status_mod.evidence_url(handoff) or None,
+        )
     _out(res)
     return 0 if res.get("state") == "done" else 1
 
@@ -1078,14 +1494,36 @@ def cmd_config(args) -> int:
 
 def cmd_handoff(args) -> int:
     """Durably record a terminal handoff, then release its exact task lease."""
+    repo = Path(args.repo).resolve()
     try:
         document = _load(args)
         result = dispatch_mod.finalize_handoff(
-            Path(args.repo).resolve(), args.task, document, remote=args.remote
+            repo, args.task, document, remote=args.remote
         )
     except (OSError, ValueError, dispatch_mod.DispatchRefused) as error:
         _out({"ok": False, "phase": "not-written", "reason": str(error)})
         return 2
+    try:
+        handoff = dispatch_mod.parse_handoff(Path(result["path"]).read_text())
+    except (OSError, dispatch_mod.DispatchRefused):
+        handoff = document
+    result["taskStatus"] = _status_transition(
+        repo,
+        "handoff",
+        args.task,
+        status_repo=handoff.get("status_repo") or None,
+        state=str(handoff.get("state") or ""),
+        detail=" ".join(
+            str(handoff.get(key) or "") for key in ("note", "next_action")
+        ).strip(),
+        submission_id=str(handoff.get("submission_id") or "") or None,
+        session=str(handoff.get("session") or "") or None,
+        sha=str(handoff.get("commit_sha") or "") or None,
+        validation=str(handoff.get("validation") or "") or None,
+        review=str(handoff.get("review") or "") or None,
+        evidence=task_status_mod.evidence_url(handoff) or None,
+        announce=False,
+    )
     _out(result)
     return 0 if result["ok"] else 2
 
@@ -1180,11 +1618,41 @@ def cmd_publish(args) -> int:
                                      rebase=args.rebase,
                                      allow_review_status=args.allow_review_status,
                                      remote_lease=lease)
+        if args.apply or result.get("state") == "rebased":
+            result["taskStatus"] = _status_transition(
+                repo,
+                "publish",
+                args.task,
+                status_repo=handoff.get("status_repo") or None,
+                state=str(result.get("state") or ""),
+                detail=str(result.get("detail") or result.get("error") or ""),
+                submission_id=str(handoff.get("submission_id") or "") or None,
+                session=str(handoff.get("session") or "") or None,
+                sha=str(result.get("commit") or result.get("newSha")
+                        or handoff.get("commit_sha") or "") or None,
+                validation="pending" if result.get("ok") else None,
+                evidence=task_status_mod.evidence_url(handoff) or None,
+                ok=bool(result.get("ok")),
+                needs_regate=bool(result.get("needsRegate")),
+            )
         _out(result)
         if args.apply and result.get("ok") is False:
             return 2
     except publish_mod.PublishRefused as e:
-        _out({"ok": False, "reason": str(e)})
+        result = {"ok": False, "reason": str(e)}
+        if args.apply:
+            result["taskStatus"] = _status_transition(
+                repo,
+                "publish",
+                args.task,
+                status_repo=handoff.get("status_repo") or None,
+                detail=str(e),
+                submission_id=str(handoff.get("submission_id") or "") or None,
+                session=str(handoff.get("session") or "") or None,
+                sha=str(handoff.get("commit_sha") or "") or None,
+                ok=False,
+            )
+        _out(result)
         return 2
     finally:
         if lease is not None and lease.sha and lane.pending() is None:
@@ -1506,16 +1974,25 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--repo", default=".")
     s.set_defaults(fn=cmd_status)
 
+    s = sub.add_parser("task-status", help="render the durable Markdown task-status table")
+    s.add_argument("--repo", default=".")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_task_status)
+
     s = common(sub.add_parser("watch", help="has the wave for this SHA landed?"))
     s.add_argument("--sha", required=True)
     s.add_argument("--pushed-at", type=float, default=0.0,
                    help="unix time of the push, so a stalled import can be called orphaned")
+    s.add_argument("--status-repo", default="",
+                   help="coordinator checkout holding the shared task-status table")
     s.set_defaults(fn=cmd_watch)
 
     s = sub.add_parser("collect", help="read a worker session and return its handoff")
     s.add_argument("--session-id", required=True)
     s.add_argument("--repo", default="", help="read the handoff file from here first")
     s.add_argument("--task", default="")
+    s.add_argument("--status-repo", default="",
+                   help="coordinator checkout holding the shared task-status table")
     s.set_defaults(fn=cmd_collect)
 
     s = common(sub.add_parser("handoff", help="persist a terminal handoff and release its lease"))

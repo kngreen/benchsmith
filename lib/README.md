@@ -14,6 +14,7 @@ run from a skill directory on whatever a devserver happens to have.
 | `benchsmith/adapter.py` | done | CLI discovery, uncached reads, identity verification |
 | `benchsmith/snapshot.py` | done | platform records → measurement, evidence, review manifest |
 | `benchsmith/journal.py` | done | rounds, streaks, excursions, surface hashes, budget |
+| `benchsmith/task_status.py` | done | atomic task rows, lifecycle normalization, Markdown rendering |
 | `benchsmith/gate.py` | done | the pre-push gate and hook installation |
 | `benchsmith/cli.py` | done | `bin/benchsmith` |
 | `selftest.py` | done | 112 fixtures, mutation-verified |

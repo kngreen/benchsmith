@@ -159,12 +159,20 @@ done to what.
 **Report as you go.** You are the only place the operator can see any of this, so narrate it.
 Silence for twenty minutes while eight workers run is indistinguishable from a hang.
 
-Post two things, and nothing else unprompted:
+Use two reporting surfaces — the queue and worker/task status — and nothing else unprompted:
 
 ```bash
 benchsmith queue --repo REPO --fetch --json     # .brief and .changeBrief
-benchsmith status --repo REPO                   # every dispatched worker
+benchsmith status --repo REPO                   # concise workers + .taskStatus
+benchsmith task-status --repo REPO              # current table, on explicit request
 ```
+
+`status` preserves its concise worker rows and also returns `taskStatus`. Post
+`taskStatus.markdown` only when `taskStatus.changed` is true; it is `null` after that revision has
+already been reported. Worker-side writes leave a new revision pending for the next coordinator
+poll. The same bytes are durable at `.benchsmith/fleet/task-status.md`, backed by the versioned
+JSON row store beside it. Never reconstruct the table from prose or repost the file merely because
+you polled again.
 
 **The queue, when you first read it and whenever it changes.** `queue` returns a `brief` — tasks
 grouped by tier, in priority order, with reviewer-held ones counted at the end — and a `changed`
@@ -181,7 +189,9 @@ Queue changed
 identical queue on every poll is noise, and noise is how a real change gets missed. A task leaving
 the queue is not a loss — it was submitted, accepted, or converged.
 
-**Worker states, as they change.** One line each, not a transcript.
+**Worker states, as they change.** Use the linked Markdown task table, not a transcript. Its row
+changes cover dispatch, handoff, publish, validation, review waiting, blockers and terminal states;
+the existing concise `workers` list remains available for diagnostics.
 
 **Announce, then go.** Before the first worker's first round, say plainly which tasks you picked
 and why each is on the list — "I'm going to start iterating on these three: X (needs revision),

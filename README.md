@@ -39,7 +39,13 @@ benchsmith ideas init --repo . --apply
 benchsmith ideas harvest --repo . --limit 25
 benchsmith ideas harvest --repo . --idea-id 252 --apply
 benchsmith queue --repo . --fetch
+benchsmith status --repo .                         # concise workers; table only when a row changed
+benchsmith task-status --repo .                    # render the durable Markdown table explicitly
 ```
+
+Fleet lifecycle commands maintain `.benchsmith/fleet/task-status.json` and the generated
+`task-status.md`. Their `taskStatus.markdown` value is populated only for a new, not-yet-reported
+table revision, so a coordinator can publish the table without reposting identical polls.
 
 `benchsmith --help` lists everything. `BENCHSMITH_TARGET`, `BENCHSMITH_HARDENING_BUDGET`, `BENCHSMITH_TASK_ID`,
 `BENCHSMITH_SOURCE_REPO` and `BENCHSMITH_ORACLE` are read from the environment when the flags are omitted.

@@ -42,6 +42,18 @@ def _read(task: str, binary: str = "codimango") -> tuple[dict, str]:
     return (doc.get("task") or doc), ""
 
 
+def _context(record: dict) -> dict:
+    review = record.get("agenticReviewStatus") or record.get("agenticReview") or ""
+    if isinstance(review, dict):
+        state = str(review.get("state") or review.get("status") or "")
+        verdict = str(review.get("verdict") or "")
+        review = state + (f"/{verdict}" if verdict else "")
+    return {
+        "submissionId": str(record.get("id") or ""),
+        "review": str(review or ""),
+    }
+
+
 def state(task: str, sha: str, *, binary: str = "codimango", pushed_at: float | None = None,
           orphan_after: int = 45 * 60) -> dict:
     """Where the platform is with this exact commit."""
@@ -51,6 +63,7 @@ def state(task: str, sha: str, *, binary: str = "codimango", pushed_at: float | 
         # forever; treating it as terminal acts on evidence that does not exist.
         return {"state": UNKNOWN, "sha": sha, "reason": f"could not read the task: {why}"}
 
+    context = _context(rec)
     seen = str(rec.get("validationCommitSha") or "")
     validation = str(rec.get("validationStatus") or "").lower()
 
@@ -61,13 +74,14 @@ def state(task: str, sha: str, *, binary: str = "codimango", pushed_at: float | 
                 "waitedSeconds": int(waited) if waited else None, "orphaned": orphaned,
                 "reason": ("the platform has not imported this commit"
                            + (f"; {int(waited / 60)}m with no progress, which is orphaned"
-                              if orphaned else ""))}
+                              if orphaned else "")), **context}
 
     if validation in PENDING_STATES:
         return {"state": RUNNING, "sha": sha, "validation": validation,
-                "reason": f"validation is {validation}"}
+                "reason": f"validation is {validation}", **context}
     if validation in TERMINAL_STATES:
         return {"state": TERMINAL, "sha": sha, "validation": validation,
-                "reason": f"validation is {validation}; re-read every signal"}
+                "reason": f"validation is {validation}; re-read every signal", **context}
     return {"state": UNKNOWN, "sha": sha, "validation": validation or None,
-            "reason": f"unrecognised validation status {validation!r}; treat as unresolved"}
+            "reason": f"unrecognised validation status {validation!r}; treat as unresolved",
+            **context}

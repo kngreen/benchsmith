@@ -141,12 +141,53 @@ absent, and the worker improvises without a gate.
 ### Handoff
 
 A worker returns **one JSON object under 4 KiB** and nothing else — `work_item`, `state`,
-`base_sha`, `commit_sha`, `gate_receipt`, `next_action`, `note`. A worker that returns its
+`base_sha`, `commit_sha`, `gate_receipt`, `next_action`, `note`, plus optional exact
+`validation`, `review`, and `evidence_url` fields for the live table. A worker that returns its
 transcript instead is refused: a supervisor holding N transcripts runs out of context before the
 queue drains, which is the failure this design exists to prevent.
 
 `state=ready_to_publish` **requires a `commit_sha`**. It is the single claim the supervisor acts
-on, so it is the one claim that may not be taken on trust.
+on, so it is the one claim that may not be taken on trust. `evidence_url`, when present, must be a
+reachable HTTP(S) or Agentcloud artifact URL; a path on the worker host is not a handoff link.
+
+### Live task-status table
+
+The coordinator keeps a versioned source at `.benchsmith/fleet/task-status.json` and its generated
+Markdown projection at `.benchsmith/fleet/task-status.md`. `benchsmith task-status --repo REPO`
+renders the current projection. The JSON envelope is `schemaVersion: 1`, a monotonic `revision`,
+and `rows` keyed by task name. Each row has this schema:
+
+| Field | Meaning |
+|---|---|
+| `task`, `submissionId`, `submissionUrl` | task identity and canonical Codimango submission link |
+| `status` | normalized operator-facing lifecycle state |
+| `workerSession`, `workerUrl` | current or most recent worker and its Agentcloud link |
+| `sha` | full exact commit SHA; never abbreviated in the table |
+| `validation`, `review` | observed validation state and exact review-state summary |
+| `evidenceUrl`, `evidenceLabel` | reachable handoff or evidence artifact |
+| `updatedAt` | UTC timestamp of the last semantic change to this row |
+
+The stable status vocabulary includes `next in queue`, `revision: hardening`,
+`revision: documentation`, `revision: review findings`, `ready to publish`,
+`validating`, `awaiting agentic review`, `awaiting human review`,
+`ready to submit / green`, `blocked: infra`, `blocked: needs human`, and truthful
+terminal or exceptional equivalents. A documentation status is selected only from an explicit
+mode or documentation/README/prose evidence; a generic repair is `revision: review findings`.
+
+Every update takes an exclusive lock and atomically replaces each file. A row comparison excludes
+`updatedAt`: observing identical task state preserves the old timestamp and performs no table
+rewrite. `taskStatus.rowChanged` reports that durable mutation; `taskStatus.changed` means the
+current table revision has not yet been emitted to a coordinator, and only then is
+`taskStatus.markdown` populated. Worker-side `record` and `handoff` writes deliberately leave that
+revision pending, so the next `collect` or `status` call emits it once rather than losing it in a
+snoozed worker session. The coordinator posts the full Markdown only when `changed` is true.
+Worker assignments carry the coordinator store path into per-task worktrees, so handoff and collect
+update the same table rather than a worktree-local copy.
+
+Transitions are wired at fleet selection/start, durable handoff and collection, applied publish,
+validation watch (including orphaned/unknown), journal review/blocked/terminal status, and worker
+replacement. Status reporting remains concise: its existing `workers` rows are unchanged, and the
+conditional table is an added `taskStatus` object.
 
 ### Resuming
 

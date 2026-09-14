@@ -55,7 +55,8 @@ PROXY_PREAMBLE = (
 # at 550-724K input tokens per call, most of it spent waiting.
 HANDOFF_FIELDS = (
     "work_item", "state", "base_sha", "commit_sha", "gate_receipt", "next_action", "note",
-    "lease_token", "lease_task", "session", "finalization",
+    "lease_token", "lease_task", "session", "finalization", "submission_id", "validation",
+    "review", "evidence_url", "status_repo",
 )
 
 # Where a worker also writes its answer. Stdout is not durable: a launcher that
@@ -232,7 +233,7 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
         "```json\n"
         '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
-        '"note":"<=200 chars"}\n'
+        '"note":"<=200 chars","validation":"...","review":"...","evidence_url":"https://..."}\n'
         "```\n\n"
         "Then say what happened in **one plain sentence**. A person reads this session, and a wall "
         "of JSON in their inbox tells them nothing. Do not print the JSON itself.\n"
@@ -326,7 +327,7 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
         "```json\n"
         '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
         '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
-        '"note":"<=200 chars"}\n'
+        '"note":"<=200 chars","validation":"...","review":"...","evidence_url":"https://..."}\n'
         "```\n\n"
         "Then say what happened in **one plain sentence**. A person reads this session, and a wall "
         "of JSON in their inbox tells them nothing. Do not print the JSON itself.\n"
@@ -792,11 +793,28 @@ def assignment_path(repo: str | Path, task: str) -> Path:
     return Path(repo) / ASSIGNMENT_DIR / f"{task}.json"
 
 
-def write_assignment(repo: str | Path, task: str, session: str, lease_token: str,
-                     lease_task: str = "") -> Path:
+def write_assignment(
+    repo: str | Path,
+    task: str,
+    session: str,
+    lease_token: str,
+    lease_task: str = "",
+    *,
+    status_repo: str = "",
+    submission_id: str = "",
+) -> Path:
     path = assignment_path(repo, task)
-    _atomic_json(path, {"task": task, "session": session, "lease_token": lease_token,
-                        "lease_task": lease_task or task})
+    _atomic_json(
+        path,
+        {
+            "task": task,
+            "session": session,
+            "lease_token": lease_token,
+            "lease_task": lease_task or task,
+            "status_repo": status_repo,
+            "submission_id": submission_id,
+        },
+    )
     return path
 
 
@@ -818,13 +836,17 @@ def finalize_handoff(repo: str | Path, task: str, document: dict, *, remote: str
         assignment = json.loads(assignment_path(repo, task).read_text())
     except (OSError, ValueError):
         pass
-    for field in ("session", "lease_token", "lease_task"):
+    for field in ("session", "lease_token", "lease_task", "status_repo", "submission_id"):
         assigned = str(assignment.get(field) or "")
         supplied = str(parsed.get(field) or "")
         if assigned and supplied and assigned != supplied:
             raise DispatchRefused(f"handoff {field} does not match the dispatched worker")
         if assigned:
             parsed[field] = assigned
+        elif field in {"status_repo", "submission_id"}:
+            # These choose where shared state is written and which submission is
+            # linked. They are coordinator metadata, not worker-authored claims.
+            parsed.pop(field, None)
 
     finalization = dict(parsed.get("finalization") or {})
     finalization["phase"] = "durable"
