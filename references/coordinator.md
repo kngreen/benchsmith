@@ -157,10 +157,11 @@ Agentcloud artifact URL; a path on the worker host is not a handoff link.
 
 ### Live task-status table
 
-The coordinator keeps a versioned source at `.benchsmith/fleet/task-status.json` and its generated
-Markdown projection at `.benchsmith/fleet/task-status.md`. `benchsmith task-status --repo REPO`
-renders the current projection. The JSON envelope is `schemaVersion: 1`, a monotonic `revision`,
-and `rows` keyed by task name. Each row has this schema:
+The coordinator keeps a versioned source at `.benchsmith/fleet/task-status.json`, its mutable
+current Markdown projection at `.benchsmith/fleet/task-status.md`, and one immutable exact
+projection per semantic revision at `.benchsmith/fleet/history/task-status-r<revision>.md`.
+`benchsmith task-status --repo REPO` renders the current projection. The JSON envelope is
+`schemaVersion: 1`, a monotonic `revision`, and `rows` keyed by task name. Each row has this schema:
 
 | Field | Meaning |
 |---|---|
@@ -179,15 +180,20 @@ The stable status vocabulary includes `next in queue`, `revision: hardening`,
 terminal or exceptional equivalents. A documentation status is selected only from an explicit
 mode or documentation/README/prose evidence; a generic repair is `revision: review findings`.
 
-Every update takes an exclusive lock and atomically replaces each file. A row comparison excludes
-`updatedAt`: observing identical task state preserves the old timestamp and performs no table
-rewrite. `taskStatus.rowChanged` reports that durable mutation; `taskStatus.changed` means the
-current table revision has not yet been emitted to a coordinator, and only then is
-`taskStatus.markdown` populated. Worker-side `record` and `handoff` writes deliberately leave that
-revision pending, so the next `collect` or `status` call emits it once rather than losing it in a
-snoozed worker session. The coordinator posts the full Markdown only when `changed` is true.
-Worker assignments carry the coordinator store path into per-task worktrees, so handoff and collect
-update the same table rather than a worktree-local copy.
+Every update takes an exclusive lock and atomically replaces each mutable file. When a semantic row
+change increments `revision`, the same lock atomically publishes that revision's snapshot before the
+JSON revision becomes visible. An existing snapshot with identical bytes is left untouched; different
+bytes at the same revision fail the entire update before current JSON or Markdown changes. A row
+comparison excludes `updatedAt`: observing identical task state preserves the old timestamp, performs
+no table rewrite, and creates no new snapshot. `taskStatus.rowChanged` reports that durable mutation;
+`taskStatus.snapshotPath` names the current revision's immutable snapshot when one exists (it is
+`null` for pre-feature revisions). `taskStatus.changed` means the current table revision has not yet
+been emitted to a coordinator, and only then is `taskStatus.markdown` populated. Worker-side `record`
+and `handoff` writes deliberately leave that revision pending, so the next `collect` or `status` call
+emits it once rather than losing it in a snoozed worker session. The coordinator posts the full
+Markdown only when `changed` is true and uses `snapshotPath` when delivery can lag behind later
+revisions. Worker assignments carry the coordinator store path into per-task worktrees, so handoff
+and collect update the same table and history rather than worktree-local copies.
 
 Transitions are wired at fleet selection/start, durable handoff and collection, applied publish,
 validation watch (including orphaned/unknown), journal review/blocked/terminal status, and worker

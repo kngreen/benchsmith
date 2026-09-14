@@ -78,6 +78,127 @@ class TaskStatusTableTest(unittest.TestCase):
         self.assertEqual(row["updatedAt"], "2026-09-15T03:04:05Z")
         self.assertEqual(row["validation"], "passing")
 
+    def test_each_semantic_revision_keeps_its_exact_markdown_snapshot(self):
+        first = status.update(
+            self.root,
+            {"task": "task-one", "status": status.NEXT_IN_QUEUE},
+            now="2026-09-14T00:00:00Z",
+        )
+        first_snapshot = Path(first["snapshotPath"])
+        first_bytes = first_snapshot.read_bytes()
+
+        second = status.update(
+            self.root,
+            {"task": "task-one", "status": status.REVISION_HARDENING},
+            now="2026-09-14T00:01:00Z",
+        )
+        second_snapshot = Path(second["snapshotPath"])
+
+        self.assertEqual(first["revision"], 1)
+        self.assertEqual(second["revision"], 2)
+        self.assertEqual(first_snapshot.name, "task-status-r1.md")
+        self.assertEqual(second_snapshot.name, "task-status-r2.md")
+        self.assertEqual(first_snapshot.read_bytes(), first_bytes)
+        self.assertEqual(first_bytes, first["markdown"].encode())
+        self.assertEqual(second_snapshot.read_text(), second["markdown"])
+        self.assertNotEqual(first_snapshot.read_bytes(), second_snapshot.read_bytes())
+
+    def test_noop_update_reuses_snapshot_without_writing_it(self):
+        first = status.update(
+            self.root,
+            {"task": "task-one", "status": status.NEXT_IN_QUEUE},
+            now="2026-09-14T00:00:00Z",
+        )
+        snapshot = Path(first["snapshotPath"])
+        before = snapshot.read_bytes()
+
+        with patch.object(status, "_write_snapshot", wraps=status._write_snapshot) as writer:
+            unchanged = status.update(
+                self.root,
+                {"task": "task-one", "status": status.NEXT_IN_QUEUE},
+                now="2026-09-15T00:00:00Z",
+            )
+
+        writer.assert_not_called()
+        self.assertFalse(unchanged["rowChanged"])
+        self.assertEqual(unchanged["revision"], 1)
+        self.assertEqual(Path(unchanged["snapshotPath"]), snapshot)
+        self.assertEqual(snapshot.read_bytes(), before)
+
+    def test_conflicting_existing_snapshot_fails_before_current_state_changes(self):
+        snapshot = status.snapshot_path(self.root, 1)
+        snapshot.parent.mkdir(parents=True)
+        snapshot.write_text("conflicting bytes\n")
+
+        with self.assertRaisesRegex(status.StatusTableError, "different content"):
+            status.update(
+                self.root,
+                {"task": "task-one", "status": status.NEXT_IN_QUEUE},
+                now="2026-09-14T00:00:00Z",
+            )
+
+        state_path, markdown_path, _ = status.paths(self.root)
+        self.assertFalse(state_path.exists())
+        self.assertFalse(markdown_path.exists())
+        self.assertEqual(snapshot.read_text(), "conflicting bytes\n")
+
+    def test_snapshots_follow_explicit_and_assignment_shared_roots(self):
+        worker = self.root / "worker"
+        worker.mkdir()
+        explicit_root = self.root / "explicit-status"
+        explicit = status.update(
+            worker,
+            {"task": "explicit-task", "status": status.NEXT_IN_QUEUE},
+            status_repo=explicit_root,
+        )
+        self.assertEqual(
+            Path(explicit["snapshotPath"]),
+            explicit_root / status.STATE_DIR / status.HISTORY_DIR / "task-status-r1.md",
+        )
+
+        assignment_root = self.root / "assignment-status"
+        assignment_dir = worker / ".benchsmith" / "assignments"
+        assignment_dir.mkdir(parents=True)
+        (assignment_dir / "assigned-task.json").write_text(
+            json.dumps({"status_repo": str(assignment_root)})
+        )
+        assigned = status.update(
+            worker,
+            {"task": "assigned-task", "status": status.NEXT_IN_QUEUE},
+        )
+        self.assertEqual(
+            Path(assigned["snapshotPath"]),
+            assignment_root
+            / status.STATE_DIR
+            / status.HISTORY_DIR
+            / "task-status-r1.md",
+        )
+        self.assertFalse((worker / status.STATE_DIR / status.HISTORY_DIR).exists())
+
+        locked_root = self.root / "locked-status"
+        rerouted_root = self.root / "rerouted-status"
+        rerouted_assignment = assignment_dir / "rerouted-task.json"
+        rerouted_assignment.write_text(json.dumps({"status_repo": str(locked_root)}))
+        original_load = status._load
+
+        def reroute_after_lock(path):
+            rerouted_assignment.write_text(json.dumps({"status_repo": str(rerouted_root)}))
+            return original_load(path)
+
+        with patch.object(status, "_load", side_effect=reroute_after_lock):
+            rerouted = status.update(
+                worker,
+                {"task": "rerouted-task", "status": status.NEXT_IN_QUEUE},
+            )
+        self.assertEqual(
+            Path(rerouted["snapshotPath"]),
+            locked_root
+            / status.STATE_DIR
+            / status.HISTORY_DIR
+            / "task-status-r1.md",
+        )
+        self.assertFalse((rerouted_root / status.STATE_DIR).exists())
+
     def test_markdown_escapes_cells_and_keeps_links_clickable(self):
         update = status.update(
             self.root,

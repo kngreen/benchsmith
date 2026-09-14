@@ -170,9 +170,11 @@ benchsmith task-status --repo REPO              # current table, on explicit req
 `status` preserves its concise worker rows and also returns `taskStatus`. Post
 `taskStatus.markdown` only when `taskStatus.changed` is true; it is `null` after that revision has
 already been reported. Worker-side writes leave a new revision pending for the next coordinator
-poll. The same bytes are durable at `.benchsmith/fleet/task-status.md`, backed by the versioned
-JSON row store beside it. Never reconstruct the table from prose or repost the file merely because
-you polled again.
+poll. The current bytes remain at `.benchsmith/fleet/task-status.md`; every semantic revision's
+exact bytes are immutable at `.benchsmith/fleet/history/task-status-r<revision>.md` and returned as
+`taskStatus.snapshotPath`. Use that snapshot for delayed or burst notifications instead of the
+mutable current path. The versioned JSON row store remains beside them. Never reconstruct the table
+from prose or repost the file merely because you polled again.
 
 **The queue, when you first read it and whenever it changes.** `queue` returns a `brief` — tasks
 grouped by tier, in priority order, with reviewer-held ones counted at the end — and a `changed`

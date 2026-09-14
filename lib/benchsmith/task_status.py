@@ -1,9 +1,9 @@
 """Durable, Markdown-friendly state for a Benchsmith fleet.
 
-The JSON document is the source of truth and the Markdown file is its projection.
-Each file is atomically replaced under one exclusive lock, and only when a semantic row field
-changes.  In particular, observing the same state twice does not churn the row's
-``updatedAt`` value or ask a coordinator to repost the table.
+The JSON document is the source of truth and the current Markdown file is its projection.
+Each mutable file is atomically replaced under one exclusive lock, and every semantic revision
+also publishes an immutable Markdown snapshot. Observing the same state twice does not churn the
+row's ``updatedAt`` value or ask a coordinator to repost the table.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ SCHEMA_VERSION = 1
 STATE_DIR = Path(".benchsmith") / "fleet"
 STATE_FILE = "task-status.json"
 MARKDOWN_FILE = "task-status.md"
+HISTORY_DIR = "history"
 LOCK_FILE = ".task-status.lock"
 ANNOUNCED_FILE = ".task-status.announced"
 
@@ -175,6 +177,21 @@ def paths(
     return directory / STATE_FILE, directory / MARKDOWN_FILE, directory / LOCK_FILE
 
 
+def _snapshot_path(state_path: Path, revision: int) -> Path:
+    return state_path.parent / HISTORY_DIR / f"task-status-r{revision}.md"
+
+
+def snapshot_path(
+    repo: str | Path,
+    revision: int,
+    *,
+    task: str = "",
+    status_repo: str | Path | None = None,
+) -> Path:
+    state_path, _, _ = paths(repo, task=task, status_repo=status_repo)
+    return _snapshot_path(state_path, revision)
+
+
 @contextmanager
 def _locked(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,6 +212,54 @@ def _atomic_write(path: Path, text: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_snapshot(path: Path, text: str) -> None:
+    data = text.encode("utf-8")
+    try:
+        existing = path.read_bytes()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise StatusTableError(f"cannot read revision snapshot {path}: {error}") from error
+    else:
+        if existing != data:
+            raise StatusTableError(
+                f"revision snapshot {path} already exists with different content"
+            )
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.tmp.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            try:
+                existing = path.read_bytes()
+            except OSError as error:
+                raise StatusTableError(
+                    f"cannot read revision snapshot {path}: {error}"
+                ) from error
+            if existing != data:
+                raise StatusTableError(
+                    f"revision snapshot {path} already exists with different content"
+                )
+            return
         directory = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory)
@@ -438,12 +503,20 @@ def update_many(
             document["schemaVersion"] = SCHEMA_VERSION
             document["revision"] = int(document.get("revision") or 0) + 1
             table_markdown = render(document)
-            # Commit the JSON source of truth last. A crash between the two writes
-            # leaves Markdown ahead of state, so replaying the same row repairs it;
-            # the reverse order could leave a stale projection forever.
+            revision_snapshot_path = _snapshot_path(
+                state_path, document["revision"]
+            )
+            # Publish the immutable snapshot before the mutable pointers. A watcher
+            # cannot observe the new JSON revision until its exact Markdown exists;
+            # any interrupted retry that disagrees with it fails closed.
+            _write_snapshot(revision_snapshot_path, table_markdown)
             _atomic_write(markdown_path, table_markdown)
             _atomic_write(
                 state_path, json.dumps(document, indent=2, sort_keys=True) + "\n"
+            )
+        else:
+            revision_snapshot_path = _snapshot_path(
+                state_path, document["revision"]
             )
 
         should_announce = False
@@ -468,6 +541,9 @@ def update_many(
         "changedRows": changed_rows,
         "statePath": str(state_path),
         "markdownPath": str(markdown_path),
+        "snapshotPath": (
+            str(revision_snapshot_path) if revision_snapshot_path.is_file() else None
+        ),
         "announcementPath": str(announced_path),
         "markdown": table_markdown if should_announce else None,
     }

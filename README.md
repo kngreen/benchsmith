@@ -44,8 +44,11 @@ benchsmith task-status --repo .                    # render the durable Markdown
 ```
 
 Fleet lifecycle commands maintain `.benchsmith/fleet/task-status.json` and the generated
-`task-status.md`. Their `taskStatus.markdown` value is populated only for a new, not-yet-reported
-table revision, so a coordinator can publish the table without reposting identical polls.
+`task-status.md`. Every semantic revision also creates an immutable exact projection at
+`.benchsmith/fleet/history/task-status-r<revision>.md`; update results expose it as
+`taskStatus.snapshotPath`. Existing snapshots are never replaced, and conflicting bytes fail the
+update. `taskStatus.markdown` is populated only for a new, not-yet-reported table revision, so a
+coordinator can publish the table without reposting identical polls.
 
 `benchsmith --help` lists everything. `BENCHSMITH_TARGET`, `BENCHSMITH_HARDENING_BUDGET`, `BENCHSMITH_TASK_ID`,
 `BENCHSMITH_SOURCE_REPO` and `BENCHSMITH_ORACLE` are read from the environment when the flags are omitted.

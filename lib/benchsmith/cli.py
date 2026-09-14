@@ -1095,15 +1095,24 @@ def cmd_status(args) -> int:
         try:
             table = task_status_mod.read(repo)
             table_path = task_status_mod.paths(repo)[1]
+            table_snapshot = task_status_mod.snapshot_path(
+                repo, int(table.get("revision") or 0)
+            )
         except Exception as error:  # noqa: BLE001
-            table, table_path = None, ""
+            table, table_path, table_snapshot = None, "", None
             table_error = f"{type(error).__name__}: {error}"
         payload = {"workers": [], "reason": "no fleet run recorded in this checkout"}
         if table is not None:
             payload["taskStatus"] = {
                 "changed": False,
                 "markdown": None,
+                "revision": int(table.get("revision") or 0),
                 "markdownPath": str(table_path),
+                "snapshotPath": (
+                    str(table_snapshot)
+                    if table_snapshot is not None and table_snapshot.is_file()
+                    else None
+                ),
                 "rows": len(table.get("rows") or {}),
             }
         elif table_error:
