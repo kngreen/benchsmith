@@ -607,6 +607,7 @@ def cmd_fleet(args) -> int:
                             or plan.get("warning")
                             or ""
                         ),
+                        status_source="routing",
                         **metadata,
                     )
                 )

@@ -179,6 +179,136 @@ class TaskStatusTableTest(unittest.TestCase):
         abandoned = status.transition_patch("record", "t", journal_status="abandoned")
         self.assertEqual(abandoned["status"], "terminal: rejected")
 
+    def test_lower_authority_events_do_not_regress_exact_sha_platform_state(self):
+        status.transition(
+            self.root,
+            "watch",
+            "ollo-ios-attempt-outbox-replay",
+            state="terminal",
+            sha=SHA,
+            validation="passing",
+            review="agentic review pending",
+        )
+        state_path = status.paths(self.root)[0]
+        legacy = status.read(self.root)
+        legacy_row = legacy["rows"]["ollo-ios-attempt-outbox-replay"]
+        legacy_row.pop("statusSource")
+        legacy_row.pop("statusSha")
+        state_path.write_text(json.dumps(legacy))
+        before = status.read(self.root)
+
+        cases = (
+            ("queued", {}, status.NEXT_IN_QUEUE),
+            (
+                "collect",
+                {"state": "failed", "detail": "native-unavailable on Linux"},
+                status.BLOCKED_WORKER,
+            ),
+            (
+                "collect",
+                {"state": "failed", "detail": "worker placement failed"},
+                status.BLOCKED_WORKER,
+            ),
+        )
+        for event, fields, attempted_status in cases:
+            with self.subTest(event=event, fields=fields):
+                update = status.transition(
+                    self.root,
+                    event,
+                    "ollo-ios-attempt-outbox-replay",
+                    sha=SHA,
+                    validation="passing",
+                    **fields,
+                )
+                self.assertFalse(update["changed"])
+                self.assertFalse(update["rowChanged"])
+                self.assertEqual(update["changedRows"], [])
+                self.assertNotEqual(
+                    status.read(self.root)["rows"]["ollo-ios-attempt-outbox-replay"][
+                        "status"
+                    ],
+                    attempted_status,
+                )
+
+        self.assertEqual(status.read(self.root), before)
+
+    def test_routing_failure_can_populate_a_new_row(self):
+        update = status.transition(
+            self.root,
+            "collect",
+            "new-ios-task",
+            state="failed",
+            detail="native-unavailable on Linux",
+            status_source="routing",
+            sha=SHA,
+            validation="passing",
+        )
+
+        self.assertTrue(update["changed"])
+        self.assertTrue(update["rowChanged"])
+        row = status.read(self.root)["rows"]["new-ios-task"]
+        self.assertEqual(row["status"], status.BLOCKED_WORKER)
+        self.assertEqual(row["statusSource"], "routing")
+        self.assertEqual(row["statusSha"], SHA)
+
+    def test_platform_failure_replaces_same_sha_passing_evidence(self):
+        status.transition(
+            self.root,
+            "watch",
+            "task-one",
+            state="terminal",
+            sha=SHA,
+            validation="passing",
+        )
+
+        update = status.transition(
+            self.root,
+            "watch",
+            "task-one",
+            state="terminal",
+            sha=SHA,
+            validation="failed",
+        )
+
+        self.assertTrue(update["changed"])
+        self.assertTrue(update["rowChanged"])
+        row = status.read(self.root)["rows"]["task-one"]
+        self.assertEqual(row["status"], "revision: validation findings")
+        self.assertEqual(row["validation"], "failed")
+        self.assertEqual(row["review"], "")
+        self.assertEqual(row["statusSource"], "platform")
+        self.assertEqual(row["statusSha"], SHA)
+
+    def test_later_candidate_can_enter_revision_work(self):
+        next_sha = "f" * 40
+        status.transition(
+            self.root,
+            "watch",
+            "task-one",
+            state="terminal",
+            sha=SHA,
+            validation="passing",
+        )
+
+        update = status.transition(
+            self.root,
+            "worker-start",
+            "task-one",
+            mode="harden",
+            session="later-candidate-worker",
+            sha=next_sha,
+        )
+
+        self.assertTrue(update["changed"])
+        self.assertTrue(update["rowChanged"])
+        row = status.read(self.root)["rows"]["task-one"]
+        self.assertEqual(row["status"], status.REVISION_HARDENING)
+        self.assertEqual(row["sha"], next_sha)
+        self.assertEqual(row["validation"], "")
+        self.assertEqual(row["review"], "")
+        self.assertEqual(row["statusSource"], "worker")
+        self.assertEqual(row["statusSha"], next_sha)
+
     def test_review_summary_preserves_each_observed_state(self):
         self.assertEqual(
             status.review_summary(
@@ -272,6 +402,81 @@ class TaskStatusTableTest(unittest.TestCase):
         self.assertEqual(rows["active-task"]["workerSession"], "session-active")
         self.assertEqual(rows["active-task"]["submissionId"], "101")
         self.assertEqual(rows["queued-task"]["status"], "next in queue")
+
+    def test_fleet_native_skip_preserves_published_exact_sha_state(self):
+        task_name = "ollo-ios-attempt-outbox-replay"
+        (self.root / task_name).mkdir()
+        (self.root / task_name / "task.toml").write_text("[metadata]\n")
+        task_rows = [
+            {
+                "name": task_name,
+                "id": "9396",
+                "status": "draft",
+                "validationStatus": "passing",
+                "validationCommitSha": SHA,
+            }
+        ]
+        status.transition(
+            self.root,
+            "watch",
+            task_name,
+            state="terminal",
+            submission_id="9396",
+            sha=SHA,
+            validation="passing",
+        )
+        before = status.read(self.root)
+        saved_discover = cli.sources.discover
+        saved_resolve = cli.resolve_mod.resolve
+        saved_run = cli.dispatch_mod.run
+        saved_capability = cli.passatk_mod.capability
+        try:
+            cli.sources.discover = lambda **kwargs: {"tasks": task_rows, "notes": []}
+            cli.resolve_mod.resolve = lambda task, rows=None: {
+                "task": task,
+                "id": "9396",
+                "repo": str(self.root),
+                "mode": "harden",
+                "sha": SHA,
+                "validation": "passing",
+            }
+            cli.dispatch_mod.run = lambda *args, **kwargs: self.fail(
+                "native-unavailable task must not dispatch"
+            )
+            cli.passatk_mod.capability = lambda path: {
+                "applicable": True,
+                "ready": False,
+                "state": "native-unavailable",
+                "reason": "native iOS harness is unavailable on Linux",
+            }
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = cli.cmd_fleet(
+                    SimpleNamespace(
+                        repo=str(self.root),
+                        gsd_project="",
+                        workers=1,
+                        no_gsd=True,
+                        target="hard-preferred",
+                        apply=True,
+                        no_snooze=True,
+                        shared_tree=True,
+                        no_remote_lease=True,
+                        max_runtime=24.0,
+                    )
+                )
+        finally:
+            cli.sources.discover = saved_discover
+            cli.resolve_mod.resolve = saved_resolve
+            cli.dispatch_mod.run = saved_run
+            cli.passatk_mod.capability = saved_capability
+
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["plans"][0]["state"], "native-unavailable")
+        self.assertFalse(payload["taskStatus"]["changed"])
+        self.assertFalse(payload["taskStatus"]["rowChanged"])
+        self.assertEqual(status.read(self.root), before)
 
     def test_handoff_and_collect_do_not_repost_an_unchanged_table(self):
         dispatch.write_assignment(

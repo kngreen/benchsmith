@@ -54,6 +54,23 @@ ROW_FIELDS = (
     "evidenceUrl",
     "evidenceLabel",
 )
+_EVIDENCE_FIELDS = (
+    "status",
+    "sha",
+    "validation",
+    "review",
+    "evidenceUrl",
+    "evidenceLabel",
+)
+_STATE_FIELDS = ROW_FIELDS + ("statusSource", "statusSha")
+_SOURCE_PRIORITY = {
+    "routing": 10,
+    "worker": 20,
+    "publish": 30,
+    "platform": 40,
+    "journal": 40,
+    "manual": 50,
+}
 
 _STATUS_ORDER = {
     BLOCKED_INFRA: 10,
@@ -226,19 +243,83 @@ def read(
 
 
 def _semantic(row: dict) -> dict:
-    return {field: str(row.get(field) or "") for field in ROW_FIELDS}
+    return {field: str(row.get(field) or "") for field in _STATE_FIELDS}
+
+
+def _evidence_source(row: dict) -> str:
+    source = str(row.get("statusSource") or "")
+    if source in _SOURCE_PRIORITY:
+        return source
+    status = str(row.get("status") or "")
+    sha = str(row.get("statusSha") or row.get("sha") or "")
+    validation = str(row.get("validation") or "").lower()
+    if sha and (
+        validation in _PASSING_VALIDATION
+        or status
+        in {
+            AWAITING_AGENTIC_REVIEW,
+            AWAITING_HUMAN_REVIEW,
+            READY_GREEN,
+        }
+        or status.startswith("terminal:")
+        or status == "revision: validation findings"
+    ):
+        return "platform"
+    if status == VALIDATING:
+        return "publish"
+    if status == READY_TO_PUBLISH:
+        return "worker"
+    return "routing"
+
+
+def _accept_evidence(old: dict, patch: dict) -> tuple[bool, bool, str, str]:
+    """Decide whether a patch may replace the row's SHA-bound status evidence."""
+    incoming_source = str(patch.get("statusSource") or "manual")
+    old_source = _evidence_source(old)
+    old_sha = str(old.get("statusSha") or old.get("sha") or "")
+    incoming_sha = (
+        str(patch.get("sha") or "") if "sha" in patch else old_sha
+    )
+    has_old_evidence = any(str(old.get(field) or "") for field in _EVIDENCE_FIELDS)
+    if not has_old_evidence:
+        return True, False, incoming_source, incoming_sha
+
+    advances_candidate = bool(
+        patch.get("_advancesCandidate")
+        and old_sha
+        and incoming_sha
+        and incoming_sha != old_sha
+    )
+    if old_sha and incoming_sha and incoming_sha != old_sha:
+        return advances_candidate, advances_candidate, incoming_source, incoming_sha
+    accepted = _SOURCE_PRIORITY.get(incoming_source, 0) >= _SOURCE_PRIORITY.get(
+        old_source, 0
+    )
+    return accepted, False, incoming_source, incoming_sha
 
 
 def _normalise(old: dict, patch: dict) -> dict:
     task = str(patch.get("task") or old.get("task") or "").strip()
     if not task:
         raise StatusTableError("a status row needs a task name")
-    merged = {field: str(old.get(field) or "") for field in ROW_FIELDS}
+    merged = {field: str(old.get(field) or "") for field in _STATE_FIELDS}
     merged["task"] = task
+    touches_evidence = any(field in patch for field in _EVIDENCE_FIELDS)
+    accepted, advances_candidate, incoming_source, incoming_sha = _accept_evidence(
+        old, patch
+    )
+    if advances_candidate:
+        for field in _EVIDENCE_FIELDS:
+            merged[field] = ""
     for field in ROW_FIELDS:
         if field == "task" or field not in patch or patch[field] is None:
             continue
+        if field in _EVIDENCE_FIELDS and not accepted:
+            continue
         merged[field] = str(patch[field]).strip()
+    if touches_evidence and accepted:
+        merged["statusSource"] = incoming_source
+        merged["statusSha"] = incoming_sha
 
     if "submissionId" in patch and "submissionUrl" not in patch:
         submission_id = merged["submissionId"]
@@ -471,6 +552,7 @@ def transition_patch(
     validation: str | None = None,
     review: str | None = None,
     evidence: str | None = None,
+    status_source: str = "",
     ok: bool | None = None,
     orphaned: bool = False,
     needs_regate: bool = False,
@@ -493,6 +575,25 @@ def transition_patch(
     state = str(state or "")
     validation_text = str(validation or "").lower()
     detail_text = str(detail or "")
+
+    patch["statusSource"] = status_source or {
+        "queued": "routing",
+        "worker-start": "worker",
+        "handoff": "worker",
+        "collect": "worker",
+        "publish": "publish",
+        "watch": "platform",
+        "record": "journal",
+    }.get(event, "")
+    if event == "worker-start":
+        patch["_advancesCandidate"] = True
+    elif event in {"handoff", "collect"} and state in {
+        "ready_to_publish",
+        "awaiting_validation",
+    }:
+        patch["_advancesCandidate"] = True
+    elif event == "publish" and (ok or state == "rebased"):
+        patch["_advancesCandidate"] = True
 
     if event == "queued":
         patch.update(
@@ -556,7 +657,7 @@ def transition_patch(
                 review=review or "agentic review pending",
             )
         elif state == "terminal":
-            patch["status"] = "revision: validation findings"
+            patch.update(status="revision: validation findings", review="")
         elif state == "unknown":
             patch["status"] = BLOCKED_INFRA
         else:
