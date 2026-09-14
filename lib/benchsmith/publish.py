@@ -240,7 +240,7 @@ def publish(
         from .resolve import FROZEN, Unresolved, resolve as _resolve
 
         try:
-            info = _resolve(task)
+            info = _resolve(task, roots=[str(repo_root)])
         except Exception as e:  # noqa: BLE001
             raise PublishRefused(
                 f"could not read {task}'s status {when} ({type(e).__name__}); refusing to "

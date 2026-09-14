@@ -126,6 +126,28 @@ class CandidateStackSafetyTest(unittest.TestCase):
         self.assertEqual(stored["state"], "ready_to_publish")
         self.assertEqual(stored["commit_sha"], candidate_sha)
 
+    def test_unregistered_status_resolution_uses_published_worktree(self):
+        candidate_sha = self.commit(
+            "task-b/instruction.md", "task B candidate\n", "task B candidate"
+        )
+        handoff = self.handoff(candidate_sha, self.base)
+        status = {
+            "status": "unregistered",
+            "registered": False,
+            "awaitingReview": False,
+        }
+
+        with patch("benchsmith.resolve.resolve", return_value=status) as resolve_status:
+            result = publish.publish(
+                self.repo,
+                "task-b",
+                handoff,
+                check_hold=False,
+            )
+
+        resolve_status.assert_called_once_with("task-b", roots=[str(self.repo)])
+        self.assertFalse(result["applied"])
+
     def test_byte_identical_rebase_carries_receipt_with_explicit_tree_proof(self):
         self.git("checkout", "-qb", "candidate", self.base)
         source_candidate = self.commit(
