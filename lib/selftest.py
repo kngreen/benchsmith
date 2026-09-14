@@ -2071,6 +2071,46 @@ check("graded test files are recognised", bool(dc.GRADED.search("mytask/tests/te
 check("steps/ spelling is recognised", bool(dc.GRADED.search("t/steps/2/tests/test_a.py")), True)
 check("non-test python is not graded", bool(dc.GRADED.search("mytask/solution/fix.py")), False)
 
+_shell_heredoc = """#!/bin/bash
+set -euo pipefail
+if ! python3 - <<'PY'
+print('checked')
+PY
+then
+    exit 1
+fi
+"""
+check(
+    "shell verifier heredocs are parsed as one graded unit",
+    dc._metrics("mytask/tests/test.sh", _shell_heredoc),
+    ({"<shell-script>"}, 1),
+)
+try:
+    dc._metrics("mytask/tests/test.sh", "#!/bin/bash\nif true; then\n")
+    check("invalid shell verifier syntax is rejected", "accepted", "rejected")
+except SyntaxError:
+    check("invalid shell verifier syntax is rejected", "rejected", "rejected")
+check(
+    "moving an existing shell fail-open token is not a new weakening",
+    dc._weakening_findings(
+        "mytask/tests/test.sh",
+        "mytask/tests/test.sh",
+        "cp old output || true\n",
+        "cp new output || true\n",
+    ),
+    [],
+)
+check(
+    "adding another shell fail-open token is caught",
+    dc._weakening_findings(
+        "mytask/tests/test.sh",
+        "mytask/tests/test.sh",
+        "cp old output || true\n",
+        "cp new output || true\ncleanup || true\n",
+    )[0].what,
+    "|| true added",
+)
+
 # Deleting a test without saying why.
 _TF.write_text("def test_one():\n    assert 1 == 1\n    assert 2 == 2\n")
 _dgit("add", "-A")

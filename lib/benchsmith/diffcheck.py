@@ -49,7 +49,7 @@ TYPESCRIPT_SUFFIXES = frozenset({".ts", ".mts", ".cts", ".tsx"})
 CODE_SUFFIXES = SCRIPT_SUFFIXES | frozenset({
     ".c", ".cc", ".cpp", ".cs", ".ex", ".exs", ".go", ".java", ".kt", ".kts",
     ".lua", ".m", ".mm", ".php", ".pl", ".pm", ".py", ".rb", ".rs", ".scala",
-    ".swift",
+    ".sh", ".swift",
 })
 PATCH_DATA_SUFFIXES = frozenset({
     ".css", ".csv", ".diff", ".golden", ".html", ".json", ".md", ".out",
@@ -564,9 +564,34 @@ def _swift_metrics(text: str) -> tuple[set[str], int]:
     return set(SWIFT_TEST.findall(text)), len(SWIFT_ASSERT.findall(text))
 
 
+def _shell_metrics(text: str) -> tuple[set[str], int]:
+    try:
+        parsed = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-n"],
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SyntaxError(f"Shell parser unavailable: {error}") from error
+    if parsed.returncode:
+        detail = (parsed.stderr or parsed.stdout).strip().splitlines()
+        raise SyntaxError(
+            "Shell source does not parse: "
+            + (detail[0][:160] if detail else "unknown parser error")
+        )
+    executable = any(
+        line.strip() and not line.lstrip().startswith("#")
+        for line in text.splitlines()
+    )
+    return ({"<shell-script>"} if executable else set(), int(executable))
+
+
 LANGUAGES = {
     ".py": Language("Python", _python_metrics),
     ".go": Language("Go", _go_metrics),
+    ".sh": Language("Shell", _shell_metrics),
     ".swift": Language("Swift", _swift_metrics),
     **{
         suffix: Language(
@@ -964,6 +989,26 @@ def _weakening_findings(
     container: str, source_path: str, old: str, new: str
 ) -> list[Finding]:
     display_path = _source_label(container, source_path)
+    if Path(source_path).suffix == ".sh":
+        findings: list[Finding] = []
+        old_counts = Counter(
+            label
+            for line in old.splitlines()
+            for pattern, label in WEAKEN_TOKENS
+            if pattern.search(line)
+        )
+        new_lines = [
+            (label, line.strip())
+            for line in new.splitlines()
+            for pattern, label in WEAKEN_TOKENS
+            if pattern.search(line)
+        ]
+        seen: Counter[str] = Counter()
+        for label, line in new_lines:
+            seen[label] += 1
+            if seen[label] > old_counts[label]:
+                findings.append(Finding(display_path, label, line))
+        return findings
     if Path(source_path).suffix in SCRIPT_SUFFIXES:
         old_events = _script_weakening_events(old)
         new_events = _script_weakening_events(new)
