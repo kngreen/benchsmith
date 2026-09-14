@@ -18,7 +18,8 @@ These compare the **staged index against HEAD**, or a clean committed `HEAD` aga
 | `diff-ratchet` | a graded test deleted; a test removed with no recorded reason; assertion count falling with no test removed |
 | `diff-weakening` | `or True`, `\|\| true`, `pytest.skip`, `# noqa`; an assertion broadened with a **new** `or`; a widened numeric tolerance |
 
-Both are **push-required**, because a check that did not run is how these got through before.
+Both are **push-required whenever a graded path changed**, because a check that did not run is how
+these got through before. A commit with no graded path is inapplicable rather than unsafe.
 
 A removal is allowed when the *same commit* records why, in `.benchsmith/removals.jsonl`:
 
@@ -34,10 +35,13 @@ finding, not a skip** (a line-based check would happily "examine" it and report 
 silent-inert shape these exist to catch), and **nothing examined is `NOT_RUN`**, reported and never
 printed as a pass.
 
-Python files are parsed with `ast`; Go is parsed with `gofmt`; Swift test/assertion forms receive a
-structural balance check. For SWE-Bench tasks, code embedded in `tests/config.json.test_patch` is
-extracted and examined too. Unsupported syntax, parse failure, or tests with zero examined assertions block.
-An empty input is `NOT_RUN`, never clean.
+Python files are parsed with `ast`; Go is parsed with `gofmt`; JavaScript and TypeScript are
+validated with Node/TypeScript parsers and inspected as tokenized test/assertion calls; Swift
+receives a structural balance check. Code embedded in either `tests/config.json.test_patch` or
+`tests/test.patch` is extracted and examined too. Unsupported syntax, parse failure, tests with
+zero examined assertions, or a changed graded container with zero examined files blocks. A diff
+with no graded path is explicitly inapplicable (`NOT_RUN`) and does not prevent an otherwise valid
+receipt.
 
 Cost: pure Python plus a couple of `git show` calls, scoped to graded files. Sub-millisecond when
 the diff has no supported graded source in it.

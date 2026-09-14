@@ -2133,8 +2133,8 @@ _dgit("reset", "-q", "--hard")
 (_dr / "README.md").write_text("docs\n")
 _dgit("add", "-A")
 check("a docs-only change examines nothing", dc.run(_dr)["diff-ratchet"]["state"], "NOT_RUN")
-check("...and does not claim clean",
-      "no supported graded source" in dc.run(_dr)["diff-ratchet"]["detail"], True)
+check("...and is explicitly inapplicable",
+      "not applicable" in dc.run(_dr)["diff-ratchet"]["detail"], True)
 _dgit("reset", "-q", "--hard"); _dgit("clean", "-qfd")
 
 # Adding coverage must not be mistaken for removing it.

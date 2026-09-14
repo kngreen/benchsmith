@@ -44,6 +44,7 @@ PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags",
                  "review-findings")
 CONTROL_REQUIRED = ("control-manifest", "obligation-witnesses", "mutation-adequacy",
                     "metamorphic-variation", "verifier-closure")
+INAPPLICABLE_PUSH_CHECKS = frozenset({"diff-ratchet", "diff-weakening"})
 
 
 @dataclass
@@ -81,10 +82,10 @@ class Report:
         self.checks.append(Check(*a, **kw))
 
     def require(self, names) -> None:
-        """Mark checks whose NOT_RUN must block. Names that ran are unaffected."""
+        """Mark applicable checks whose NOT_RUN must block."""
         wanted = set(names or ())
         for c in self.checks:
-            if c.name in wanted:
+            if c.name in wanted and c.blocking:
                 c.required = True
         missing = wanted - {c.name for c in self.checks}
         for name in sorted(missing):
@@ -743,7 +744,12 @@ def check_diff(repo_root: Path, report: Report) -> None:
     from . import diffcheck
 
     for name, res in diffcheck.run(Path(repo_root)).items():
-        report.add(name, res["state"], res["detail"])
+        report.add(
+            name,
+            res["state"],
+            res["detail"],
+            blocking=res.get("applicable", True),
+        )
 
 
 def check_formatting(repo_root: Path, report: Report, specs=None) -> None:
@@ -873,19 +879,58 @@ def canonical_receipt(repo_root: Path) -> Path | None:
 HOOK_RECEIPT = "/tmp/gate-receipt-{task}.json"
 
 
-def _emit_hook_receipt(repo_root: Path, task_name: str, report: Report,
-                       head: str, dirty: bool) -> str:
+def _push_policy(artifacts: dict) -> list[str]:
+    required = list(PUSH_REQUIRED)
+    if (artifacts.get("controlManifest") or {}).get("mode") == "enforce":
+        required.extend(CONTROL_REQUIRED)
+    return required
+
+
+def _receipt_requirements(report: Report) -> tuple[list[str], list[str]]:
+    by_name = {check.name: check for check in report.checks}
+    required: list[str] = []
+    inapplicable: list[str] = []
+    for name in _push_policy(report.artifacts):
+        check = by_name.get(name)
+        if (
+            check is not None
+            and check.state == NOT_RUN
+            and not check.blocking
+            and name in INAPPLICABLE_PUSH_CHECKS
+        ):
+            inapplicable.append(name)
+        else:
+            required.append(name)
+    return required, inapplicable
+
+
+def _emit_hook_receipt(
+    repo_root: Path,
+    task_name: str,
+    report: Report,
+    head: str,
+    dirty: bool,
+    required_checks: list[str],
+    inapplicable_checks: list[str],
+) -> str:
     """Also write the receipt the repo's own pre-push hook reads."""
     path = Path(os.environ.get("GATE_RECEIPT") or HOOK_RECEIPT.format(task=task_name))
+    by_name = {check.name: check for check in report.checks}
     gates = {}
-    for c in report.checks:
-        if not c.required:
+    for name in required_checks:
+        check = by_name.get(name)
+        if check is None:
             continue
-        gates[c.name] = {PASS: "pass", FAIL: "fail",
-                         NOT_RUN: "not_run", TIMEOUT: "timeout"}.get(c.state, c.state.lower())
+        gates[name] = {
+            PASS: "pass",
+            FAIL: "fail",
+            NOT_RUN: "not_run",
+            TIMEOUT: "timeout",
+        }.get(check.state, check.state.lower())
     try:
         path.write_text(json.dumps({
             "task": task_name, "commit": head, "dirty": dirty, "gates": gates,
+            "inapplicable": inapplicable_checks,
             "source": "benchsmith",
             "note": "gate names are benchsmith's checks, not the repo's G1-G5; "
                     "not_run and timeout are not pass",
@@ -913,9 +958,7 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
     if not report.ok:
         return {"state": "not_written", "reason": "gate did not pass"}
     by_name = {c.name: c for c in report.checks}
-    required_checks = list(PUSH_REQUIRED)
-    if (report.artifacts.get("controlManifest") or {}).get("mode") == "enforce":
-        required_checks.extend(CONTROL_REQUIRED)
+    required_checks, inapplicable_checks = _receipt_requirements(report)
     unsafe = [name for name in required_checks
               if name not in by_name or by_name[name].state != PASS]
     if unsafe:
@@ -932,7 +975,15 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
     # The emitted gates are benchsmith's own check names, not the repo's G1-G5.
     # Renaming them to match would claim checks that did not run; a reader of
     # this receipt sees exactly what was verified.
-    _emit_hook_receipt(repo_root, task_name, report, head.strip(), dirty)
+    _emit_hook_receipt(
+        repo_root,
+        task_name,
+        report,
+        head.strip(),
+        dirty,
+        required_checks,
+        inapplicable_checks,
+    )
 
     body = {
         "task": task_name,
@@ -941,6 +992,8 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
         "clean": True,
         "ok": True,
         "checks": {c.name: c.state for c in report.checks},
+        "requiredChecks": required_checks,
+        "inapplicableChecks": inapplicable_checks,
         "notRun": [c.name for c in report.checks if c.state == NOT_RUN],
         "artifacts": report.artifacts,
         "source": "canonical" if canonical_receipt(repo_root) else "benchsmith-native-fallback",
@@ -978,10 +1031,44 @@ def _receipt_body(repo_root: Path, task_name: str) -> tuple[dict | None, str]:
         return None, "receipt digest does not match its contents"
     if not body.get("ok"):
         return None, "receipt records a failing gate"
-    required_checks = list(PUSH_REQUIRED)
-    if ((body.get("artifacts") or {}).get("controlManifest") or {}).get("mode") == "enforce":
-        required_checks.extend(CONTROL_REQUIRED)
-    unsafe = [name for name in required_checks if (body.get("checks") or {}).get(name) != PASS]
+    policy = set(_push_policy(body.get("artifacts") or {}))
+    if "requiredChecks" in body:
+        required_checks = body.get("requiredChecks")
+        inapplicable_checks = body.get("inapplicableChecks")
+        if not isinstance(required_checks, list) or not all(
+            isinstance(name, str) for name in required_checks
+        ):
+            return None, "receipt required-check list is malformed"
+        if not isinstance(inapplicable_checks, list) or not all(
+            isinstance(name, str) for name in inapplicable_checks
+        ):
+            return None, "receipt applicability list is malformed"
+        required_set = set(required_checks)
+        inapplicable_set = set(inapplicable_checks)
+        if (
+            len(required_set) != len(required_checks)
+            or len(inapplicable_set) != len(inapplicable_checks)
+            or required_set & inapplicable_set
+            or required_set | inapplicable_set != policy
+            or not inapplicable_set <= INAPPLICABLE_PUSH_CHECKS
+        ):
+            return None, "receipt applicability does not cover the current push policy"
+        checks = body.get("checks") or {}
+        wrongly_exempted = sorted(
+            name for name in inapplicable_set if checks.get(name) != NOT_RUN
+        )
+        if wrongly_exempted:
+            return (
+                None,
+                "receipt marks a completed check inapplicable: "
+                + ", ".join(wrongly_exempted),
+            )
+    else:
+        # Receipts written before applicability was recorded remain valid only
+        # under the old, stricter rule that every policy check passed.
+        required_checks = sorted(policy)
+    checks = body.get("checks") or {}
+    unsafe = [name for name in required_checks if checks.get(name) != PASS]
     if unsafe:
         return None, "receipt lacks passing push-required checks: " + ", ".join(unsafe)
     try:
