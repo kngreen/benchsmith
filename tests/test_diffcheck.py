@@ -297,6 +297,24 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
         self.assertEqual(result["diff-weakening"]["state"], "NOT_RUN")
         self.assertFalse(result["diff-ratchet"]["applicable"])
 
+    def test_task_local_qa_fixture_is_not_a_graded_test_source(self) -> None:
+        for relative in (
+            "task/qa/negative/n23-replace-graded-binary-between-tests.sh",
+            "task/qa/positive/compatible-tests.py",
+            "task/qa/variants/alternate_test.go",
+        ):
+            with self.subTest(relative=relative):
+                source = self.repo / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("assert true\n")
+                self._git("add", "-A")
+                result = diffcheck.run(self.repo)
+                self.assertEqual(result["diff-ratchet"]["state"], "NOT_RUN")
+                self.assertEqual(result["diff-weakening"]["state"], "NOT_RUN")
+                self.assertFalse(result["diff-ratchet"]["applicable"])
+                self._git("reset", "-q", "--hard")
+                self._git("clean", "-qfd")
+
     def test_direct_unsupported_test_source_is_not_misclassified_as_docs(self) -> None:
         for relative in (
             "task/tests/AuthSpec.scala",

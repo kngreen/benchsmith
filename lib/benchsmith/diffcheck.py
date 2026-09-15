@@ -678,10 +678,18 @@ def _test_named_source(path: str) -> bool:
     )
 
 
+def _task_control_fixture(path: Path) -> bool:
+    parts = path.parts
+    return ".benchsmith" in parts or any(
+        part == "qa" and index + 1 < len(parts) and parts[index + 1] in {"negative", "positive", "variants"}
+        for index, part in enumerate(parts)
+    )
+
+
 def _looks_like_test_source(path: str) -> bool:
     candidate = Path(path)
     if (
-        ".benchsmith" in candidate.parts
+        _task_control_fixture(candidate)
         or candidate.name.lower() in DIRECT_TEST_ASSET_NAMES
         or candidate.suffix.lower() in PATCH_DATA_SUFFIXES
     ):
