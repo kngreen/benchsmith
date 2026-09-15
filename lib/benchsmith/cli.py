@@ -522,6 +522,25 @@ def cmd_resolve(args) -> int:
     return 0
 
 
+def _active_table_leases(repo: Path, status_repo: Path) -> dict[str, str]:
+    """Treat canonical active-owner rows as claims, even after a lease was lost."""
+    document = task_status_mod.read(repo, status_repo=status_repo)
+    claims: dict[str, str] = {}
+    for task, row in (document.get("rows") or {}).items():
+        status = str(row.get("status") or "")
+        session = str(row.get("workerSession") or "")
+        if session and (
+            status.startswith("revision:")
+            or status in {
+                task_status_mod.VALIDATING,
+                task_status_mod.READY_TO_PUBLISH,
+                task_status_mod.READY_GREEN,
+            }
+        ):
+            claims[str(task)] = f"session:{session}"
+    return claims
+
+
 def cmd_fleet(args) -> int:
     """Plan freely; apply only inside one verified controller epoch."""
     repo = Path(args.repo).resolve() if args.repo else Path.cwd().resolve()
@@ -578,7 +597,10 @@ def _cmd_fleet(
 ) -> int:
     """Discover, dispatch, bind, and persist while the caller holds the fence."""
     cfg = config_mod.load(repo, project_id=args.gsd_project)
-    journals, leases = read_journals(repo), Leases(repo).active()
+    journals = read_journals(repo)
+    leases = Leases(repo).active()
+    for task, owner in _active_table_leases(repo, status_repo).items():
+        leases.setdefault(task, owner)
 
     # The board is the THIRD source, not a co-equal one. Platform tasks are work
     # that demonstrably exists; a board card is a claim that some does. So the

@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from benchsmith import cli
 from benchsmith import controller
+from benchsmith import task_status
 
 
 class ControllerTest(unittest.TestCase):
@@ -382,6 +383,52 @@ class ControllerTest(unittest.TestCase):
             no_remote_lease=True,
             max_runtime=24.0,
         )
+
+    def test_fleet_active_status_owner_blocks_redispatch_without_lease(self) -> None:
+        task = "task-owned"
+        (self.repo / task).mkdir()
+        task_status.update(
+            self.repo,
+            {
+                "task": task,
+                "status": task_status.REVISION_HARDENING,
+                "workerSession": "existing-session",
+            },
+            status_repo=self.status,
+        )
+        args = self.fleet_args(self.repo, str(self.status))
+        row = {
+            "name": task,
+            "id": "105",
+            "status": "draft",
+            "validationStatus": "failed",
+            "validationCommitSha": "e" * 40,
+        }
+        output = io.StringIO()
+        with (
+            patch.object(cli.controller_mod, "admit", return_value={"ok": True}),
+            patch.object(
+                cli.controller_mod,
+                "write_fence",
+                return_value=nullcontext({"ok": True}),
+            ),
+            patch.object(
+                cli.sources, "discover", return_value={"tasks": [row], "notes": []}
+            ),
+            patch.object(
+                cli.dispatch_mod,
+                "run",
+                side_effect=AssertionError("owned task must not dispatch"),
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli.cmd_fleet(args), 0)
+
+        payload = __import__("json").loads(output.getvalue())
+        self.assertEqual(payload["dispatchable"], 0)
+        self.assertEqual(payload["plans"], [])
+        stored = task_status.read(self.repo, status_repo=self.status)["rows"][task]
+        self.assertEqual(stored["workerSession"], "existing-session")
 
     def test_fleet_requires_canonical_status_root_before_discovery(self) -> None:
         args = self.fleet_args(self.repo)
