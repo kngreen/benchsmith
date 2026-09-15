@@ -43,7 +43,9 @@ class TaskStatusTableTest(unittest.TestCase):
             "[task-one](https://codimango.internalmeta.com/submissions/210976)",
             first["markdown"],
         )
-        self.assertIn(f"`{SHA}`", first["markdown"])
+        self.assertNotIn("Exact SHA", first["markdown"])
+        self.assertNotIn(SHA, first["markdown"])
+        self.assertEqual(json.loads(Path(first["statePath"]).read_text())["rows"]["task-one"]["sha"], SHA)
         state_path = Path(first["statePath"])
         markdown_path = Path(first["markdownPath"])
         before_state = state_path.read_bytes()

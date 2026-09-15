@@ -425,8 +425,8 @@ def render(document: dict) -> str:
         return "_No Benchsmith task status has been recorded._\n"
 
     lines = [
-        "| Task | Status | Worker | Exact SHA | Validation | Review | Handoff / evidence | Updated (UTC) |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Task | Status | Worker | Validation | Review | Handoff / evidence | Updated (UTC) |",
+        "|---|---|---|---|---|---|---|",
     ]
     for row in rows:
         task = _link(str(row.get("task") or ""), str(row.get("submissionUrl") or ""))
@@ -436,8 +436,6 @@ def render(document: dict) -> str:
             if session
             else "—"
         )
-        sha = str(row.get("sha") or "")
-        exact_sha = f"`{_cell(sha)}`" if sha else "—"
         evidence_url = str(row.get("evidenceUrl") or "")
         evidence_label = str(row.get("evidenceLabel") or "evidence")
         if evidence_url:
@@ -455,7 +453,6 @@ def render(document: dict) -> str:
                     task,
                     _cell(row.get("status")),
                     worker,
-                    exact_sha,
                     _cell(row.get("validation")),
                     _cell(row.get("review")),
                     evidence,
