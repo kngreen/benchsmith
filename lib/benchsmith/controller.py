@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Callable
 
 from . import hold
+from . import safety
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATE_DIR = Path(".benchsmith") / "fleet"
 STATE_FILE = "controller.json"
 LOCK_FILE = ".controller.lock"
@@ -36,6 +37,13 @@ class ControllerRefused(ValueError):
 
 class ControllerIndeterminate(ControllerRefused):
     """A durable write may have committed even though its sync failed."""
+
+
+def implementation() -> dict:
+    try:
+        return safety.snapshot("controller_dispatch")
+    except safety.SafetyRefused as error:
+        raise ControllerRefused(str(error)) from error
 
 
 def _root(path: str | Path) -> Path:
@@ -65,7 +73,7 @@ def _load(path: Path) -> dict:
         return {}
     except (OSError, ValueError) as error:
         raise ControllerRefused(f"controller record is unreadable: {error}") from error
-    if not isinstance(value, dict) or value.get("schemaVersion") != SCHEMA_VERSION:
+    if not isinstance(value, dict) or value.get("schemaVersion") not in {1, SCHEMA_VERSION}:
         raise ControllerRefused("controller record has an unsupported schema")
     return value
 
@@ -163,11 +171,13 @@ def acquire(
     canonical_repo, canonical_status, session = _identity(
         repo, status_root, session_id
     )
+    source_identity = implementation()
     state_path, lock_path = paths(canonical_status)
     timestamp = time.time() if now is None else float(now)
     inspect = inspector or (lambda owner: _run_inspect(owner))
     make_epoch = epoch_factory or (lambda: uuid.uuid4().hex)
 
+    replacing_legacy = False
     with _locked(lock_path):
         current = _load(state_path)
         if current:
@@ -181,7 +191,11 @@ def acquire(
                 )
             owner = str(current.get("sessionId") or "")
             expires = float(current.get("expiresAt") or 0)
-            if expires > timestamp:
+            replacing_legacy = bool(
+                owner == session
+                and not current.get("controllerDispatchFingerprint")
+            )
+            if expires > timestamp and not replacing_legacy:
                 if owner != session:
                     raise ControllerRefused(
                         f"controller is owned by live epoch session {owner}"
@@ -192,7 +206,7 @@ def acquire(
         snapshot = dict(current)
 
     owner = str(snapshot.get("sessionId") or "")
-    if owner:
+    if owner and not replacing_legacy:
         running = inspect(owner)
         if running is True:
             raise ControllerRefused(
@@ -218,6 +232,8 @@ def acquire(
             "statusRoot": canonical_status,
             "sessionId": session,
             "epoch": epoch,
+            "controllerDispatchFingerprint": source_identity["digest"],
+            "controllerDispatchSourceHead": source_identity["sourceHead"],
             "acquiredAt": committed_at,
             "renewedAt": committed_at,
             "expiresAt": committed_at + ttl_seconds,
@@ -234,6 +250,7 @@ def _verify_locked(
     session: str,
     epoch: str,
     now: float,
+    controller_digest: str,
     allow_expired: bool = False,
 ) -> dict:
     current = _load(state_path)
@@ -248,6 +265,13 @@ def _verify_locked(
     for field, value in expected.items():
         if not value or str(current.get(field) or "") != value:
             raise ControllerRefused(f"stale or foreign controller {field}")
+    recorded_digest = str(current.get("controllerDispatchFingerprint") or "")
+    if not recorded_digest:
+        raise ControllerRefused("controller record has no safety fingerprint; reacquire controller")
+    if recorded_digest != controller_digest:
+        raise ControllerRefused(
+            "controller/dispatch implementation changed; reacquire controller"
+        )
     if not allow_expired and float(current.get("expiresAt") or 0) <= now:
         raise ControllerRefused("controller epoch has expired")
     return current
@@ -264,6 +288,7 @@ def verify(
     canonical_repo, canonical_status, session = _identity(
         repo, status_root, session_id
     )
+    controller_digest = implementation()["digest"]
     state_path, lock_path = paths(canonical_status)
     with _locked(lock_path):
         current = _verify_locked(
@@ -273,6 +298,7 @@ def verify(
             session=session,
             epoch=epoch,
             now=time.time() if now is None else float(now),
+            controller_digest=controller_digest,
         )
     return {"verified": True, **current}
 
@@ -291,6 +317,7 @@ def renew(
     canonical_repo, canonical_status, session = _identity(
         repo, status_root, session_id
     )
+    controller_digest = implementation()["digest"]
     state_path, lock_path = paths(canonical_status)
     timestamp = time.time() if now is None else float(now)
     with _locked(lock_path):
@@ -301,6 +328,7 @@ def renew(
             session=session,
             epoch=epoch,
             now=timestamp,
+            controller_digest=controller_digest,
             allow_expired=True,
         )
         current["renewedAt"] = timestamp
@@ -320,6 +348,7 @@ def release(
     canonical_repo, canonical_status, session = _identity(
         repo, status_root, session_id
     )
+    controller_digest = implementation()["digest"]
     state_path, lock_path = paths(canonical_status)
     with _locked(lock_path):
         current = _verify_locked(
@@ -329,6 +358,7 @@ def release(
             session=session,
             epoch=epoch,
             now=time.time() if now is None else float(now),
+            controller_digest=controller_digest,
             allow_expired=True,
         )
         state_path.unlink()
@@ -386,6 +416,7 @@ def write_fence(
     canonical_repo, canonical_status, session = _identity(
         repo, status_root, session_id
     )
+    controller_digest = implementation()["digest"]
     state_path, lock_path = paths(canonical_status)
     with _locked(lock_path):
         current = _verify_locked(
@@ -395,6 +426,7 @@ def write_fence(
             session=session,
             epoch=epoch,
             now=time.time() if now is None else float(now),
+            controller_digest=controller_digest,
         )
         hold_state = _verify_hold(_root(repo), hold_reader=hold_reader)
         yield {"controller": current, "hold": hold_state}
@@ -501,6 +533,7 @@ def admit(
         "statusRoot": str(_root(status_root)),
         "sessionId": session_id,
         "epoch": epoch,
+        "controllerDispatchFingerprint": checked["controller"]["controllerDispatchFingerprint"],
         "freeBytes": min(free_by_path.values()),
         "freeBytesByPath": free_by_path,
         "minimumFreeBytes": required_bytes,

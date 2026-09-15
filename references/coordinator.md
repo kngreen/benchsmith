@@ -111,13 +111,14 @@ Three things are surfaced rather than swallowed:
 ### Dispatch
 
 ```bash
-benchsmith dispatch --repo <path> --task <name>            # plan only; writes nothing
-benchsmith dispatch --repo <path> --task <name> --apply    # actually start it
+benchsmith dispatch --repo <path> --task <name>            # inspect a plan only
+benchsmith fleet --repo <path> --workers 1 --apply         # fenced execution path
 ```
 
 Planning is the default so a plan can always be inspected, but **you are not waiting for anyone to
-read it.** Dispatch, then supervise. The safety is structural — workers cannot push, publishing
-needs a gate receipt, one lane per repository — not a confirmation step.
+read it.** Dispatch, then supervise. Workers are instructed not to push; the technical publication
+boundary is the exact receipt plus the coordinator's single lane. The worker credential itself is
+not read-only, so this remains a behavioral contract backed by coordinator verification.
 
 Three backends, and the choice is a capability question, not a preference:
 
@@ -130,13 +131,15 @@ Three backends, and the choice is a capability question, not a preference:
 be an agentcloud session, and benchsmith refuses that combination when the plan is built rather
 than letting the API fail after a fan-out has already started.
 
-**`--skills` cannot deliver benchsmith, and is off by default.** SkillsService serves a skill's
-`SKILL.md` body only; nested files are withheld from remote nodes unless `--skill-materialization`
-is on, and it is off by default and not exposed on the session CLI. benchsmith is a package, so a
-body-only delivery produces a worker with the judgement and none of the commands. Remote workers
-therefore **clone benchsmith themselves** as the first step of their prompt. Passing an alias that
-resolves to nothing would be worse than passing none: the session starts, the skill is silently
-absent, and the worker improvises without a gate.
+**Task workers run on the installed Benchsmith host.** The coordinator pins AgentCloud creation to
+that existing host and passes the exact selected checkout. If the host or checkout cannot be bound,
+no authoring session is created; that is a hold, not a reason to clone Benchsmith into a fresh
+runtime. `--skills` still cannot deliver the package because SkillsService supplies only the
+Skillbook body.
+
+This does not prohibit `review-fleet` from fetching isolated task-repository evidence copies into
+`~/.benchsmith-review-checkouts/`. Their read-only treatment is a behavioral review contract; the
+copies are not Benchsmith installations and never enter author checkout discovery.
 
 ### Handoff
 
@@ -214,7 +217,9 @@ doing anything. A fresh worker continues the history; it does not restart the ta
 
 ### Publishing
 
-**Workers do not push.** They prepare a commit, run `benchsmith gate`, and stop.
+**Workers must not push.** This is an instruction enforced again when the coordinator accepts the
+handoff; it is not a reduced-credential sandbox. Workers prepare a commit, run `benchsmith gate`,
+and stop.
 
 ```bash
 benchsmith publish --repo . --task <name> --handoff h.json          # plan

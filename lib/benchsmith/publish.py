@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import candidate as candidate_mod
+from . import safety
 
 LANE_TTL = 3600
 
@@ -32,7 +33,14 @@ UNKNOWN = "unknown"
 
 
 class PublishRefused(Exception):
-    """Not safe to push. The message is the reason."""
+    """Not safe to push. The message says why."""
+
+
+def _policy_identity() -> dict:
+    try:
+        return safety.snapshot("publish_policy")
+    except safety.SafetyRefused as error:
+        raise PublishRefused(str(error)) from error
 
 
 def _git(repo: Path, *args, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -51,6 +59,7 @@ class Intent:
     key: str
     at: float
     lease_sha: str = ""
+    publish_policy_fingerprint: str = ""
 
     def as_dict(self) -> dict:
         return self.__dict__.copy()
@@ -130,6 +139,22 @@ class Lane:
         intent = self.pending()
         if intent is None:
             return {"state": "clean", "detail": "no pending push"}
+        try:
+            current_policy = _policy_identity()["digest"]
+        except PublishRefused as error:
+            return {"state": UNKNOWN, "intent": intent.as_dict(), "detail": str(error)}
+        if not intent.publish_policy_fingerprint:
+            return {
+                "state": UNKNOWN,
+                "intent": intent.as_dict(),
+                "detail": "pending intent has no publish-policy fingerprint",
+            }
+        if intent.publish_policy_fingerprint != current_policy:
+            return {
+                "state": UNKNOWN,
+                "intent": intent.as_dict(),
+                "detail": "publish policy changed after the intent was recorded",
+            }
         r = git(Path(repo_root), "ls-remote", intent.remote, intent.branch)
         if r.returncode != 0:
             # Not knowing is not the same as not landed. Pushing again here is
@@ -160,6 +185,71 @@ class Lane:
         }
 
 
+def inspect_candidate(
+    repo_root: Path,
+    task: str,
+    handoff: dict,
+    *,
+    remote: str = "origin",
+    branch: str = "main",
+    git=_git,
+) -> dict:
+    """Prove candidate scope and classify exact-tip publication without mutation."""
+    if str(handoff.get("state")) != "ready_to_publish":
+        raise PublishRefused(
+            f"handoff state is {handoff.get('state')!r}, not ready_to_publish"
+        )
+    commit_sha = str(handoff.get("commit_sha") or "")
+    if not commit_sha:
+        raise PublishRefused("no commit_sha; nothing to publish")
+    try:
+        proof = candidate_mod.verify_handoff(
+            Path(repo_root), task, handoff, remote=remote, branch=branch, git=git
+        )
+    except candidate_mod.CandidateRejected as error:
+        raise PublishRefused(f"candidate stack is not publication-safe: {error}") from error
+    return {
+        "proof": proof,
+        "alreadyPublished": proof.remote_base_sha == proof.candidate_sha,
+        "commit": proof.candidate_sha,
+    }
+
+
+def confirm_already_published(
+    repo_root: Path,
+    task: str,
+    handoff: dict,
+    *,
+    remote: str = "origin",
+    branch: str = "main",
+    lane: Lane | None = None,
+    git=_git,
+) -> dict:
+    """Re-prove an exact-tip no-op and never fall through to a push."""
+    repo_root = Path(repo_root)
+    policy = _policy_identity()
+    inspection = inspect_candidate(
+        repo_root, task, handoff, remote=remote, branch=branch, git=git
+    )
+    if not inspection["alreadyPublished"]:
+        raise PublishRefused(
+            "remote tip changed after exact-tip classification; reclassify before publication"
+        )
+    active_lane = lane or Lane(repo_root)
+    pending = active_lane.pending()
+    if pending and pending.task == task and pending.commit_sha == inspection["commit"]:
+        active_lane.clear_intent()
+    return {
+        "ok": True,
+        "state": "already-published",
+        "task": task,
+        "commit": inspection["commit"],
+        "stackProof": inspection["proof"].as_dict(),
+        "publishPolicyFingerprint": policy["digest"],
+        "nextAction": "watch-exact-sha",
+    }
+
+
 def publish(
     repo_root: Path,
     task: str,
@@ -180,17 +270,22 @@ def publish(
     repo_root = Path(repo_root)
     lane = lane or Lane(repo_root)
 
-    if str(handoff.get("state")) != "ready_to_publish":
-        raise PublishRefused(
-            f"handoff state is {handoff.get('state')!r}, not ready_to_publish"
+    policy = _policy_identity()
+    inspection = inspect_candidate(
+        repo_root, task, handoff, remote=remote, branch=branch, git=git
+    )
+    commit_sha = inspection["commit"]
+    if inspection["alreadyPublished"]:
+        return confirm_already_published(
+            repo_root,
+            task,
+            handoff,
+            remote=remote,
+            branch=branch,
+            lane=lane,
+            git=git,
         )
-    commit_sha = str(handoff.get("commit_sha") or "")
-    if not commit_sha:
-        raise PublishRefused("no commit_sha; nothing to publish")
     if not handoff.get("gate_receipt"):
-        # The receipt is the evidence the gate ran on this exact tree. Publishing
-        # without it means the lane's one job -- only gated work reaches the
-        # remote -- was never actually done.
         raise PublishRefused("no gate_receipt; an ungated commit may not be published")
 
     def _verify_candidate_receipt() -> None:
@@ -237,7 +332,7 @@ def publish(
         """
         if not check_review:
             return
-        from .resolve import FROZEN, Unresolved, resolve as _resolve
+        from .resolve import publication_eligibility, resolve as _resolve
 
         try:
             info = _resolve(task, roots=[str(repo_root)])
@@ -248,22 +343,11 @@ def publish(
                 "minute, a push onto an accepted task cannot be undone."
             ) from e
         status = str(info.get("status") or "")
-        if status in FROZEN:
-            raise PublishRefused(
-                f"{task} is {status}: frozen. There is no override — it is finished, and "
-                "changing it now corrupts data that has already shipped."
-            )
-        if info.get("awaitingReview"):
-            # An override must NAME the status it is overriding, so it cannot
-            # silently keep applying after the state moves on.
-            if allow_review_status and allow_review_status == status:
-                return
-            raise PublishRefused(
-                f"{task} is {info.get('awaitingReason')}. Pushing now changes what the reviewer "
-                "is looking at. Wait for their verdict; if they ask for changes the status "
-                f"becomes needs_revision and the loop resumes on its own. To override "
-                f"deliberately, pass allow_review_status={status!r}."
-            )
+        decision = publication_eligibility(
+            status, allow_review_status=allow_review_status
+        )
+        if not decision.eligible:
+            raise PublishRefused(f"{task} is not publication-eligible: {decision.reason}")
 
     _freeze_check("before publishing")
     review_note = ""
@@ -282,12 +366,20 @@ def publish(
         )
 
     try:
-        try:
-            proof = candidate_mod.verify_handoff(
-                repo_root, task, handoff, remote=remote, branch=branch, git=git
-            )
-        except candidate_mod.CandidateRejected as error:
-            raise PublishRefused(f"candidate stack is not publication-safe: {error}") from error
+        inspection = inspect_candidate(
+            repo_root, task, handoff, remote=remote, branch=branch, git=git
+        )
+        proof = inspection["proof"]
+        if inspection["alreadyPublished"]:
+            return {
+                "ok": True,
+                "state": "already-published",
+                "task": task,
+                "commit": proof.candidate_sha,
+                "stackProof": proof.as_dict(),
+                "publishPolicyFingerprint": policy["digest"],
+                "nextAction": "watch-exact-sha",
+            }
         head = proof.remote_base_sha
         if proof.needs_rebase:
             if not rebase:
@@ -395,6 +487,7 @@ def publish(
             key=lane.key(task, commit_sha),
             at=time.time(),
             lease_sha=str(getattr(remote_lease, "sha", "")),
+            publish_policy_fingerprint=policy["digest"],
         )
         if not apply:
             return {
@@ -404,6 +497,11 @@ def publish(
                 "hint": "re-run with apply=True to actually push",
             }
 
+        current_policy = _policy_identity()["digest"]
+        if current_policy != policy["digest"]:
+            raise PublishRefused(
+                "publish policy changed during this attempt; reclassify the candidate"
+            )
         _verify_candidate_receipt()
 
         # Written before the push, so a crash between here and the next line is

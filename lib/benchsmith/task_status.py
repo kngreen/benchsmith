@@ -322,6 +322,17 @@ def read(
         return _load(state_path)
 
 
+def peek(
+    repo: str | Path,
+    *,
+    task: str = "",
+    status_repo: str | Path | None = None,
+) -> dict:
+    """Read the table without creating lock files; callers must tolerate races."""
+    state_path, _, _ = paths(repo, task=task, status_repo=status_repo)
+    return _load(state_path)
+
+
 def _semantic(row: dict) -> dict:
     return {field: str(row.get(field) or "") for field in _STATE_FIELDS}
 

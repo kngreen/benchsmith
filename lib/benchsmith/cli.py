@@ -15,6 +15,7 @@ import shlex
 import subprocess
 import time
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import fixtures as fixtures_mod
@@ -192,10 +193,30 @@ def _bind_worker(
     *,
     status_repo: str = "",
     submission_id: str = "",
+    controller_fingerprint: str = "",
 ) -> dict:
     """Bind a created worker or terminate it before reporting dispatch success."""
     if lease is None:
-        return {"ok": True, "bound": False, "noRemoteLease": True}
+        try:
+            dispatch_mod.write_assignment(
+                worktree,
+                task,
+                sid,
+                "",
+                status_repo=status_repo,
+                submission_id=submission_id,
+                controller_fingerprint=controller_fingerprint,
+            )
+            return {"ok": True, "bound": False, "noRemoteLease": True}
+        except Exception as error:  # noqa: BLE001 - session cleanup is mandatory
+            stopped = dispatch_mod.relieve(sid)
+            return {
+                "ok": False,
+                "bound": False,
+                "noRemoteLease": True,
+                "reason": f"could not persist worker assignment: {error}",
+                "termination": stopped,
+            }
     bound = lease.bind(sid)
     if bound.get("bound"):
         try:
@@ -207,6 +228,7 @@ def _bind_worker(
                 lease.task,
                 status_repo=status_repo,
                 submission_id=submission_id,
+                controller_fingerprint=controller_fingerprint,
             )
             return {"ok": True, **bound}
         except OSError as error:
@@ -478,27 +500,17 @@ def cmd_dispatch(args) -> int:
     except dispatch_mod.DispatchRefused as e:
         _out({"ok": False, "reason": str(e)})
         return 2
-    if not args.apply:
-        _out({"planned": p.as_dict(), "applied": False,
-              "hint": "re-run with --apply to actually start it"})
-        return 0
-    result = dispatch_mod.run(p, apply=True)
-    sid = dispatch_mod.session_id(result.get("stdout") or "")
-    started = bool(result.get("ok") and sid)
-    if sid:
-        result["session"] = sid
-    elif result.get("ok"):
-        result["warning"] = "worker start returned no session id"
-    result["taskStatus"] = _status_transition(
-        Path(args.repo).resolve(),
-        "worker-start" if started else "collect",
-        args.task,
-        mode=args.mode,
-        state="working" if started else "failed",
-        detail=result.get("error") or result.get("stderr") or "",
-        session=sid or None,
-    )
-    _out(result)
+    if args.apply:
+        _out({
+            "ok": False,
+            "reason": (
+                "standalone dispatch cannot prove ownership, work eligibility, leases, or the "
+                "controller fence; use `benchsmith fleet --workers 1 --apply`"
+            ),
+        })
+        return 2
+    _out({"planned": p.as_dict(), "applied": False,
+          "hint": "run the task through `benchsmith fleet --workers 1 --apply`"})
     return 0
 
 
@@ -522,23 +534,162 @@ def cmd_resolve(args) -> int:
     return 0
 
 
-def _active_table_leases(repo: Path, status_repo: Path) -> dict[str, str]:
+def _active_table_leases(
+    repo: Path, status_repo: Path, *, read_only: bool = False
+) -> dict[str, str]:
     """Treat canonical active-owner rows as claims, even after a lease was lost."""
-    document = task_status_mod.read(repo, status_repo=status_repo)
+    reader = task_status_mod.peek if read_only else task_status_mod.read
+    document = reader(repo, status_repo=status_repo)
     claims: dict[str, str] = {}
     for task, row in (document.get("rows") or {}).items():
         status = str(row.get("status") or "")
+        source = str(row.get("statusSource") or "")
         session = str(row.get("workerSession") or "")
-        if session and (
-            status.startswith("revision:")
-            or status in {
-                task_status_mod.VALIDATING,
-                task_status_mod.READY_TO_PUBLISH,
-                task_status_mod.READY_GREEN,
-            }
-        ):
+        if session and source == "worker" and status.startswith("revision:"):
             claims[str(task)] = f"session:{session}"
     return claims
+
+
+@dataclass
+class FleetSnapshot:
+    raw: dict
+    items: list
+    ready: list
+    waiting: list
+    watches: list[dict]
+    publications: list[dict]
+    needs_board: dict | None
+    workers: int
+    clamp_note: str | None
+    source_ok: bool
+    source_error: str
+
+    @property
+    def actionable(self) -> bool:
+        return bool(self.ready or self.watches or self.publications)
+
+
+def _discover_fleet(
+    args,
+    repo: Path,
+    status_repo: Path,
+    *,
+    reap_expired_leases: bool,
+) -> FleetSnapshot:
+    """Read and classify the fleet without admission or semantic writes."""
+    cfg = config_mod.load(repo, project_id=args.gsd_project)
+    journals = read_journals(repo)
+    leases = Leases(repo).active(reap_expired=reap_expired_leases)
+    for task, owner in _active_table_leases(
+        repo, status_repo, read_only=not reap_expired_leases
+    ).items():
+        leases.setdefault(task, owner)
+
+    def classify(raw: dict) -> tuple[list, list[dict], list[dict]]:
+        items = build_queue(
+            raw.get("tasks") or [],
+            journals=journals,
+            leases=leases,
+            ideas=raw.get("ideas") or [],
+        )
+        status_reader = (
+            task_status_mod.read if reap_expired_leases else task_status_mod.peek
+        )
+        status_rows = (
+            status_reader(repo, status_repo=status_repo).get("rows") or {}
+        )
+        raw_by_name = {
+            str(row.get("name") or row.get("id") or ""): row
+            for row in (raw.get("tasks") or [])
+        }
+        raw_by_id = {
+            str(row.get("id") or ""): row
+            for row in (raw.get("tasks") or [])
+            if row.get("id")
+        }
+        watches: list[dict] = []
+        publications: list[dict] = []
+        for item in items:
+            row = status_rows.get(item.task) or {}
+            status = str(row.get("status") or "")
+            sha = str(row.get("sha") or "")
+            source = raw_by_id.get(str(row.get("submissionId") or "")) or raw_by_name.get(item.task) or {}
+            if status == task_status_mod.VALIDATING and sha:
+                watched = watch_mod.classify(source, sha)
+                watched["task"] = item.task
+                if watched.get("state") != watch_mod.TERMINAL:
+                    item.skip = f"exact-SHA watch: {watched.get('reason') or watched.get('state')}"
+                    watches.append(watched)
+            elif status == task_status_mod.READY_TO_PUBLISH:
+                item.skip = "candidate is ready for coordinator publication"
+                publications.append({"task": item.task, "sha": sha, "state": "ready"})
+            elif status == task_status_mod.READY_GREEN:
+                item.skip = "task is ready to submit"
+        return items, watches, publications
+
+    raw = sources.discover(cfg=cfg, with_gsd=False)
+    source = (raw.get("sourceStatus") or {}).get("codimango")
+    source_ok = True if source is None else bool(source.get("ok"))
+    source_error = "" if source_ok else str(source.get("reason") or "Codimango source is unreadable")
+    items, watches, publications = classify(raw)
+    ready = [item for item in items if item.dispatchable]
+    needs_board = None
+
+    if source_ok and len(ready) < args.workers and not args.no_gsd:
+        if cfg.configured:
+            raw = sources.discover(cfg=cfg, with_gsd=True)
+            source = (raw.get("sourceStatus") or {}).get("codimango")
+            source_ok = True if source is None else bool(source.get("ok"))
+            source_error = "" if source_ok else str(source.get("reason") or "Codimango source is unreadable")
+            items, watches, publications = classify(raw)
+            ready = [item for item in items if item.dispatchable]
+        else:
+            needs_board = {
+                "why": (f"only {len(ready)} platform task(s) are dispatchable and "
+                        f"{args.workers} workers were asked for; the GSD board is the next source "
+                        "and it is not configured"),
+                "ask": ("Which GSD board holds your task cards? Paste the URL or the project id — "
+                        "it is the number in https://www.internalfb.com/tasks/project/<ID>/list"),
+                "thenRun": f"benchsmith fleet --gsd-project <id> --workers {args.workers} --apply",
+            }
+
+    workers = args.workers
+    clamp_note = None
+    if workers > MAX_WORKERS:
+        clamp_note = (
+            f"asked for {workers}; clamped to {MAX_WORKERS}. Past that the limit is the "
+            "devserver and the platform's validation capacity, not benchsmith"
+        )
+        workers = MAX_WORKERS
+    return FleetSnapshot(
+        raw=raw,
+        items=items,
+        ready=ready[:workers],
+        waiting=ready[workers:],
+        watches=watches,
+        publications=publications,
+        needs_board=needs_board,
+        workers=workers,
+        clamp_note=clamp_note,
+        source_ok=source_ok,
+        source_error=source_error,
+    )
+
+
+def _idle_fleet_payload(snapshot: FleetSnapshot) -> dict:
+    return {
+        "discovered": len(snapshot.items),
+        "dispatchable": len(snapshot.ready),
+        "actionable": snapshot.actionable,
+        "workers": snapshot.workers,
+        "applied": False,
+        "admission": {"skipped": True, "reason": "no worker-dispatch action"},
+        "watches": snapshot.watches,
+        "publicationReady": snapshot.publications,
+        "plans": [],
+        "started": [],
+        "notes": snapshot.raw.get("notes") or [],
+    }
 
 
 def cmd_fleet(args) -> int:
@@ -553,12 +704,24 @@ def cmd_fleet(args) -> int:
         if status_repo_value
         else repo
     )
-    if not args.apply:
-        return _cmd_fleet(args, repo, status_repo, None, 0.0)
-    if not status_repo_value:
+    if args.apply and not status_repo_value:
         raise controller_mod.ControllerRefused(
             "fleet --apply requires --status-repo or BENCHSMITH_STATUS_ROOT"
         )
+    if args.apply:
+        controller_mod.implementation()
+    preview = _discover_fleet(
+        args, repo, status_repo, reap_expired_leases=False
+    )
+    if not preview.source_ok:
+        raise controller_mod.ControllerRefused(
+            f"fleet source is unreadable: {preview.source_error}"
+        )
+    if not args.apply:
+        return _cmd_fleet(args, repo, status_repo, None, 0.0, preview)
+    if not preview.ready:
+        _out(_idle_fleet_payload(preview))
+        return 0
     session_id = str(
         getattr(args, "session_id", "")
         or os.environ.get("BENCHSMITH_CONTROLLER_SESSION", "")
@@ -585,7 +748,19 @@ def cmd_fleet(args) -> int:
     with controller_mod.write_fence(
         repo, status_repo, session_id, controller_epoch
     ):
-        return _cmd_fleet(args, repo, status_repo, admission, min_free_gb)
+        authoritative = _discover_fleet(
+            args, repo, status_repo, reap_expired_leases=True
+        )
+        if not authoritative.source_ok:
+            raise controller_mod.ControllerRefused(
+                f"fenced fleet source is unreadable: {authoritative.source_error}"
+            )
+        if not authoritative.ready:
+            _out(_idle_fleet_payload(authoritative))
+            return 0
+        return _cmd_fleet(
+            args, repo, status_repo, admission, min_free_gb, authoritative
+        )
 
 
 def _cmd_fleet(
@@ -594,52 +769,19 @@ def _cmd_fleet(
     status_repo: Path,
     admission: dict | None,
     min_free_gb: float,
+    snapshot: FleetSnapshot,
 ) -> int:
-    """Discover, dispatch, bind, and persist while the caller holds the fence."""
-    cfg = config_mod.load(repo, project_id=args.gsd_project)
-    journals = read_journals(repo)
-    leases = Leases(repo).active()
-    for task, owner in _active_table_leases(repo, status_repo).items():
-        leases.setdefault(task, owner)
-
-    # The board is the THIRD source, not a co-equal one. Platform tasks are work
-    # that demonstrably exists; a board card is a claim that some does. So the
-    # board is not even fetched until the platform cannot fill the slots -- which
-    # also means an unconfigured board is invisible on a normal day instead of
-    # being a standing complaint.
-    raw = sources.discover(cfg=cfg, with_gsd=False)
-    items = build_queue(raw.get("tasks") or [], journals=journals, leases=leases)
-    ready = [i for i in items if i.dispatchable]
-    needs_board = None
-
-    if len(ready) < args.workers and not args.no_gsd:
-        if cfg.configured:
-            raw = sources.discover(cfg=cfg, with_gsd=True)
-            items = build_queue(raw.get("tasks") or [], journals=journals, leases=leases,
-                                ideas=raw.get("ideas") or [])
-            ready = [i for i in items if i.dispatchable]
-        else:
-            # Asked for only when it would actually change what happens next,
-            # and asked for concretely -- "configure GSD" is not a question
-            # anyone can answer without going and finding the number.
-            needs_board = {
-                "why": (f"only {len(ready)} platform task(s) are dispatchable and "
-                        f"{args.workers} workers were asked for; the GSD board is the next source "
-                        "and it is not configured"),
-                "ask": ("Which GSD board holds your task cards? Paste the URL or the project id — "
-                        "it is the number in https://www.internalfb.com/tasks/project/<ID>/list"),
-                "thenRun": "benchsmith fleet --gsd-project <id> --workers "
-                           f"{args.workers} --apply",
-            }
-
-    workers, clamp_note = args.workers, None
-    if workers > MAX_WORKERS:
-        clamp_note = (f"asked for {workers}; clamped to {MAX_WORKERS}. Past that the limit is the "
-                      "devserver and the platform's validation capacity, not benchsmith")
-        workers = MAX_WORKERS
-    all_ready = ready
-    ready = all_ready[:workers]
-    waiting = all_ready[workers:]
+    """Dispatch and persist only from an authoritative classified snapshot."""
+    raw = snapshot.raw
+    items = snapshot.items
+    ready = snapshot.ready
+    waiting = snapshot.waiting
+    needs_board = snapshot.needs_board
+    workers = snapshot.workers
+    clamp_note = snapshot.clamp_note
+    controller_fingerprint = str(
+        (admission or {}).get("controllerDispatchFingerprint") or ""
+    )
 
     # One ls-remote per repository, not one per task. Tasks can resolve to
     # different checkouts, so the state is keyed by the repo it came from.
@@ -886,6 +1028,7 @@ def _cmd_fleet(
                         name,
                         status_repo=str(status_repo),
                         submission_id=str(info.get("id") or ""),
+                        controller_fingerprint=controller_fingerprint,
                     )
                     entry["leaseBinding"] = lifecycle
                     if not lifecycle["ok"]:
@@ -904,6 +1047,7 @@ def _cmd_fleet(
                             "",
                             status_repo=str(status_repo),
                             submission_id=str(info.get("id") or ""),
+                            controller_fingerprint=controller_fingerprint,
                         )
                     except OSError as error:
                         entry["warning"] = (
@@ -920,6 +1064,7 @@ def _cmd_fleet(
                             lease.task if lease is not None else name,
                             status_repo=str(status_repo),
                             submission_id=str(info.get("id") or ""),
+                            controller_fingerprint=controller_fingerprint,
                         )
                     except OSError as error:
                         entry["warning"] = (
@@ -944,6 +1089,9 @@ def _cmd_fleet(
         if "repo" in pl:
             by_repo[pl["repo"]] = by_repo.get(pl["repo"], 0) + 1
     payload = {"discovered": len(items), "dispatchable": sum(1 for i in items if i.dispatchable),
+               "actionable": snapshot.actionable,
+               "watches": snapshot.watches,
+               "publicationReady": snapshot.publications,
                "workers": workers, "applied": bool(args.apply),
                # Named because it is the only thing that serialises: one publish
                # lane per repository. It is held for a push and released before
@@ -1022,15 +1170,30 @@ def cmd_scaffold(args) -> int:
            "repo": repo, "proposedName": name, "applied": bool(args.apply)}
     if args.apply:
         res = dispatch_mod.run(p, apply=True)
-        out["session"] = dispatch_mod.session_id(res.get("stdout") or "")
-        out["ok"] = res.get("ok")
+        sid = dispatch_mod.session_id(res.get("stdout") or "")
+        out["session"] = sid
+        out["ok"] = bool(res.get("ok") and sid)
+        if res.get("ok") and sid:
+            lifecycle = _bind_worker(
+                None,
+                sid,
+                repo,
+                name,
+                status_repo=str(Path(repo).resolve()),
+            )
+            out["assignment"] = lifecycle
+            if not lifecycle["ok"]:
+                out["ok"] = False
+                out["reason"] = lifecycle["reason"]
+        elif res.get("ok"):
+            out["reason"] = "worker creation returned no session id; assignment is unknown"
         out["taskStatus"] = _status_transition(
             Path(repo).resolve(),
-            "worker-start" if res.get("ok") else "collect",
+            "worker-start" if out["ok"] else "collect",
             name,
             mode="scaffold",
-            state="working" if res.get("ok") else "failed",
-            detail=res.get("error") or res.get("stderr") or "",
+            state="working" if out["ok"] else "failed",
+            detail=out.get("reason") or res.get("error") or res.get("stderr") or "",
             session=out["session"] or None,
         )
         # The point of scaffolding is to get a task the loop can run. Say so, so
@@ -1040,7 +1203,7 @@ def cmd_scaffold(args) -> int:
         out["shell"] = p.shell
         out["hint"] = "re-run with --apply to start it"
     _out(out)
-    return 0
+    return 0 if not args.apply or out.get("ok") else 2
 
 
 def cmd_relieve(args) -> int:
@@ -1436,6 +1599,31 @@ def cmd_reviewfleet(args) -> int:
         return _rev_lease_states[target_repo]
 
     plans, started = [], []
+
+    def cleanup_review_resources(target: str, work_in: str, lease, task: str) -> list[str]:
+        errors = []
+        lease_released = lease is None
+        if lease is not None:
+            try:
+                released = lease.release()
+                lease_released = bool(released.get("released"))
+                if not lease_released:
+                    errors.append(
+                        "lease cleanup refused: " + str(released.get("reason") or "unknown")
+                    )
+            except Exception as error:  # noqa: BLE001 - cleanup reports, never masks
+                errors.append(f"lease cleanup failed: {error}")
+        if lease_released and Path(work_in).resolve() != Path(target).resolve():
+            try:
+                removed = wt_mod.release(Path(target), task)
+                if not removed.get("removed"):
+                    errors.append(
+                        "worktree cleanup refused: " + str(removed.get("reason") or "unknown")
+                    )
+            except Exception as error:  # noqa: BLE001 - cleanup reports, never masks
+                errors.append(f"worktree cleanup failed: {error}")
+        return errors
+
     for n, item in enumerate(ready, 1):
         try:
             info = resolve_mod.resolve(item.task, rows=rows)
@@ -1461,12 +1649,6 @@ def cmd_reviewfleet(args) -> int:
             entry_fetched = got.get("reused") is False
         else:
             entry_fetched = False
-        try:
-            p = dispatch_mod.plan(item.task, target, mode="review",
-                                  idea={"track": item.track, "due": item.due})
-        except dispatch_mod.DispatchRefused as e:
-            plans.append({"task": item.task, "skipped": str(e)})
-            continue
         # Reviews do not write, but two reviewers on one task is duplicated
         # effort and two drafts that may disagree -- and the second one to
         # finish silently overwrites the first's report file.
@@ -1492,32 +1674,63 @@ def cmd_reviewfleet(args) -> int:
             try:
                 work_in = wt_mod.ensure(Path(target), item.task).path
             except wt_mod.WorktreeRefused as e:
-                plans.append({"task": item.task, "skipped": f"worktree: {e}"})
+                errors = cleanup_review_resources(target, work_in, lease, item.task)
+                detail = f"worktree: {e}"
+                if errors:
+                    detail += "; " + "; ".join(errors)
+                plans.append({"task": item.task, "skipped": detail})
                 continue
+        try:
+            p = dispatch_mod.plan(
+                item.task,
+                work_in,
+                mode="review",
+                idea={"track": item.track, "due": item.due},
+            )
+        except dispatch_mod.DispatchRefused as e:
+            errors = cleanup_review_resources(target, work_in, lease, item.task)
+            detail = str(e)
+            if errors:
+                detail += "; " + "; ".join(errors)
+            plans.append({"task": item.task, "skipped": detail})
+            continue
         entry = {"task": item.task, "tier": item.tier, "tierName": item.as_dict()["tierName"],
                  "repo": target, "worktree": work_in if work_in != target else None,
                  "track": item.track, "due": item.due, "clonedForReview": entry_fetched}
         if args.apply:
             print(f"[{n}/{len(ready)}] review {item.task}…", file=sys.stderr, flush=True)
-            res = dispatch_mod.run(p, apply=True)
+            try:
+                res = dispatch_mod.run(p, apply=True)
+            except Exception:
+                cleanup_review_resources(target, work_in, lease, item.task)
+                raise
             sid = dispatch_mod.session_id(res.get("stdout") or "")
             entry["session"] = sid
             if sid and not args.no_snooze:
                 dispatch_mod.snooze(sid)
-            if lease is not None:
-                if sid:
-                    lifecycle = _bind_worker(lease, sid, work_in, item.task)
-                    entry["leaseBinding"] = lifecycle
-                    if not lifecycle["ok"]:
-                        entry["skipped"] = "reviewer terminated because lease binding was not confirmed"
-                        plans.append(entry)
-                        continue
+            if sid:
+                lifecycle = _bind_worker(
+                    lease,
+                    sid,
+                    work_in,
+                    item.task,
+                    status_repo=str(repo),
+                    submission_id=str(info.get("id") or ""),
+                )
+                entry["leaseBinding"] = lifecycle
+                if not lifecycle["ok"]:
+                    cleanup_review_resources(target, work_in, None, item.task)
+                    entry["skipped"] = (
+                        "reviewer terminated because assignment or lease binding was not confirmed"
+                    )
+                    plans.append(entry)
+                    continue
+                if lease is not None:
                     entry["remoteLease"] = lease.ref
                     entry["remoteLeaseToken"] = lease.sha
-                else:
-                    lease.release()
-            if sid:
                 started.append({"task": item.task, "session": sid})
+            else:
+                cleanup_review_resources(target, work_in, lease, item.task)
         else:
             entry["shell"] = p.shell
         plans.append(entry)
@@ -1652,6 +1865,8 @@ def cmd_handoff(args) -> int:
     document: dict = {}
     try:
         document = _load(args)
+        if not document.get("session"):
+            document["session"] = os.environ.get("AGENTCLOUD_SESSION_ID", "")
         result = dispatch_mod.finalize_handoff(
             repo,
             args.task,
@@ -1786,6 +2001,37 @@ def cmd_publish(args) -> int:
     lane = publish_mod.Lane(repo, run_id=args.run_id)
     lease = None
     try:
+        inspection = publish_mod.inspect_candidate(
+            repo, args.task, handoff, remote=args.remote, branch=args.branch
+        )
+        if inspection["alreadyPublished"]:
+            result = publish_mod.confirm_already_published(
+                repo,
+                args.task,
+                handoff,
+                remote=args.remote,
+                branch=args.branch,
+                lane=lane,
+            )
+            if args.apply:
+                watched = watch_mod.state(args.task, result["commit"])
+                result["watch"] = watched
+                result["taskStatus"] = _status_transition(
+                    repo,
+                    "watch",
+                    args.task,
+                    status_repo=handoff.get("status_repo") or None,
+                    state=str(watched.get("state") or ""),
+                    detail=str(watched.get("reason") or ""),
+                    submission_id=str(handoff.get("submission_id") or "") or None,
+                    session=str(handoff.get("session") or "") or None,
+                    sha=result["commit"],
+                    validation=str(watched.get("validation") or "") or None,
+                    review=str(watched.get("review") or "") or None,
+                    orphaned=bool(watched.get("orphaned")),
+                )
+            _out(result)
+            return 0
         if args.apply and not args.no_remote_lease:
             lease = rlease_mod.RemoteLease(args.task, repo, remote=args.remote)
             claim = lease.acquire()

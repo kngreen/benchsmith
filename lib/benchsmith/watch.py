@@ -54,18 +54,17 @@ def _context(record: dict) -> dict:
     }
 
 
-def state(task: str, sha: str, *, binary: str = "codimango", pushed_at: float | None = None,
-          orphan_after: int = 45 * 60) -> dict:
-    """Where the platform is with this exact commit."""
-    rec, why = _read(task, binary)
-    if why:
-        # Not knowing is its own state. Treating it as "still running" waits
-        # forever; treating it as terminal acts on evidence that does not exist.
-        return {"state": UNKNOWN, "sha": sha, "reason": f"could not read the task: {why}"}
-
-    context = _context(rec)
-    seen = str(rec.get("validationCommitSha") or "")
-    validation = str(rec.get("validationStatus") or "").lower()
+def classify(
+    record: dict,
+    sha: str,
+    *,
+    pushed_at: float | None = None,
+    orphan_after: int = 45 * 60,
+) -> dict:
+    """Classify one already-fetched platform row against an exact SHA."""
+    context = _context(record)
+    seen = str(record.get("validationCommitSha") or "")
+    validation = str(record.get("validationStatus") or "").lower()
 
     if seen != sha:
         waited = (time.time() - pushed_at) if pushed_at else None
@@ -85,3 +84,12 @@ def state(task: str, sha: str, *, binary: str = "codimango", pushed_at: float | 
     return {"state": UNKNOWN, "sha": sha, "validation": validation or None,
             "reason": f"unrecognised validation status {validation!r}; treat as unresolved",
             **context}
+
+
+def state(task: str, sha: str, *, binary: str = "codimango", pushed_at: float | None = None,
+          orphan_after: int = 45 * 60) -> dict:
+    """Where the platform is with this exact commit."""
+    rec, why = _read(task, binary)
+    if why:
+        return {"state": UNKNOWN, "sha": sha, "reason": f"could not read the task: {why}"}
+    return classify(rec, sha, pushed_at=pushed_at, orphan_after=orphan_after)

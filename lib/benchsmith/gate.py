@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import safety
 from .journal import Journal, surface_hashes
 
 REQUIRED_TAGS = ("benchsmith-v1", "aai-labs", "semi-synthetic", "private_repos_1p")
@@ -979,6 +980,16 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
         return {"state": "not_written",
                 "reason": "push-required checks are not PASS: " + ", ".join(unsafe)}
 
+    hook_path = Path(
+        os.environ.get("GATE_RECEIPT") or HOOK_RECEIPT.format(task=task_name)
+    )
+    hook_path.unlink(missing_ok=True)
+    try:
+        gate_fingerprint = safety.snapshot("gate")["digest"]
+        publish_fingerprint = safety.snapshot("publish_policy")["digest"]
+    except safety.SafetyRefused as error:
+        return {"state": "not_written", "reason": str(error)}
+
     # The task repos ship their own pre-push hook, and it reads a receipt at
     # $GATE_RECEIPT (default /tmp/gate-receipt-<task>.json) with `commit`,
     # `dirty` and a `gates` map that must be all-pass. Benchsmith wrote its
@@ -1005,6 +1016,8 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
         "tree": tree,
         "clean": True,
         "ok": True,
+        "gateFingerprint": gate_fingerprint,
+        "publishPolicyFingerprint": publish_fingerprint,
         "checks": {c.name: c.state for c in report.checks},
         "requiredChecks": required_checks,
         "inapplicableChecks": inapplicable_checks,
@@ -1043,6 +1056,19 @@ def _receipt_body(repo_root: Path, task_name: str) -> tuple[dict | None, str]:
         return None, f"unreadable receipt: {error}"
     if body.get("digest") != _receipt_digest(body):
         return None, "receipt digest does not match its contents"
+    gate_fingerprint = str(body.get("gateFingerprint") or "")
+    publish_fingerprint = str(body.get("publishPolicyFingerprint") or "")
+    if not gate_fingerprint or not publish_fingerprint:
+        return None, "receipt predates safety fingerprints; re-run the gate"
+    try:
+        current_gate = safety.snapshot("gate")["digest"]
+        current_publish = safety.snapshot("publish_policy")["digest"]
+    except safety.SafetyRefused as error:
+        return None, str(error)
+    if gate_fingerprint != current_gate:
+        return None, "gate implementation changed; re-run the gate"
+    if publish_fingerprint != current_publish:
+        return None, "publish policy changed; re-run the gate"
     if not body.get("ok"):
         return None, "receipt records a failing gate"
     policy = set(_push_policy(body.get("artifacts") or {}))

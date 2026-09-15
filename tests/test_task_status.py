@@ -22,6 +22,18 @@ SHA = "0123456789abcdef0123456789abcdef01234567"
 
 class TaskStatusTableTest(unittest.TestCase):
     def setUp(self):
+        self.safety = patch.object(
+            dispatch.safety,
+            "snapshot",
+            side_effect=lambda component: {
+                "component": component,
+                "digest": f"sha256:{component}-test",
+                "sourceHead": "a" * 40,
+                "clean": True,
+            },
+        )
+        self.safety.start()
+        self.addCleanup(self.safety.stop)
         self.root = Path(tempfile.mkdtemp())
 
     def test_row_is_written_once_and_only_changes_semantically(self):
@@ -739,6 +751,7 @@ class TaskStatusTableTest(unittest.TestCase):
                     "next_action": "publish",
                     "note": "gated and ready",
                     "evidence_url": "https://www.internalfb.com/intern/paste/P1/",
+                    "session": "session-one",
                 }
             )
         )
@@ -837,6 +850,117 @@ class TaskStatusTableTest(unittest.TestCase):
         finally:
             cli.watch_mod.state = saved_state
 
+    def test_already_published_routes_to_watch_without_remote_lease(self):
+        handoff_path = self.root / "published-handoff.json"
+        handoff_path.write_text(
+            json.dumps(
+                {
+                    "work_item": "task-one",
+                    "state": "ready_to_publish",
+                    "base_sha": "b" * 40,
+                    "commit_sha": SHA,
+                    "gate_receipt": "receipt",
+                    "submission_id": "210976",
+                }
+            )
+        )
+        args = SimpleNamespace(
+            repo=str(self.root),
+            task="task-one",
+            handoff=str(handoff_path),
+            remote="origin",
+            branch="main",
+            run_id="test",
+            apply=True,
+            rebase=False,
+            allow_review_status="",
+            no_remote_lease=False,
+        )
+        output = io.StringIO()
+        with (
+            patch.object(
+                cli.publish_mod,
+                "inspect_candidate",
+                return_value={"alreadyPublished": True, "commit": SHA},
+            ),
+            patch.object(
+                cli.publish_mod,
+                "confirm_already_published",
+                return_value={
+                    "ok": True,
+                    "state": "already-published",
+                    "commit": SHA,
+                    "nextAction": "watch-exact-sha",
+                },
+            ),
+            patch.object(
+                cli.rlease_mod,
+                "RemoteLease",
+                side_effect=AssertionError("already-published must not acquire a lease"),
+            ),
+            patch.object(
+                cli.watch_mod,
+                "state",
+                return_value={
+                    "state": "running",
+                    "sha": SHA,
+                    "validation": "running",
+                    "reason": "validation is running",
+                },
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli.cmd_publish(args), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["state"], "already-published")
+        self.assertEqual(result["watch"]["sha"], SHA)
+        row = status.read(self.root)["rows"]["task-one"]
+        self.assertEqual(row["status"], status.VALIDATING)
+        self.assertEqual(row["statusSource"], "platform")
+
+    def test_exact_tip_change_refuses_without_lease_or_push(self):
+        handoff_path = self.root / "moved-tip-handoff.json"
+        handoff_path.write_text(
+            json.dumps(
+                {
+                    "state": "ready_to_publish",
+                    "base_sha": "b" * 40,
+                    "commit_sha": SHA,
+                    "gate_receipt": "receipt",
+                }
+            )
+        )
+        args = SimpleNamespace(
+            repo=str(self.root), task="task-one", handoff=str(handoff_path),
+            remote="origin", branch="main", run_id="test", apply=True,
+            rebase=False, allow_review_status="", no_remote_lease=False,
+        )
+        with (
+            patch.object(
+                cli.publish_mod,
+                "inspect_candidate",
+                return_value={"alreadyPublished": True, "commit": SHA},
+            ),
+            patch.object(
+                cli.publish_mod,
+                "confirm_already_published",
+                side_effect=cli.publish_mod.PublishRefused("remote tip changed"),
+            ),
+            patch.object(
+                cli.publish_mod,
+                "publish",
+                side_effect=AssertionError("exact-tip retry must not push"),
+            ),
+            patch.object(
+                cli.rlease_mod,
+                "RemoteLease",
+                side_effect=AssertionError("exact-tip retry must not acquire a lease"),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.cmd_publish(args), 2)
+
     def test_publish_and_record_drive_validation_and_review_waiting(self):
         handoff_path = self.root / "publish-handoff.json"
         handoff_path.write_text(
@@ -852,7 +976,12 @@ class TaskStatusTableTest(unittest.TestCase):
             )
         )
         saved_publish = cli.publish_mod.publish
+        saved_inspect = cli.publish_mod.inspect_candidate
         try:
+            cli.publish_mod.inspect_candidate = lambda *args, **kwargs: {
+                "alreadyPublished": False,
+                "commit": SHA,
+            }
             cli.publish_mod.publish = lambda *args, **kwargs: {
                 "ok": True,
                 "commit": SHA,
@@ -876,6 +1005,7 @@ class TaskStatusTableTest(unittest.TestCase):
                 )
         finally:
             cli.publish_mod.publish = saved_publish
+            cli.publish_mod.inspect_candidate = saved_inspect
         self.assertEqual(publish_code, 0)
         published = json.loads(publish_output.getvalue())
         self.assertEqual(

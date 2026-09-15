@@ -391,19 +391,22 @@ to guess which lease to release.
 | `starting` | the session has not emitted yet; poll again, do not abandon it |
 | `unreadable` | the poll itself failed; that is not the same as no answer |
 
-**Workers run only on this host.** benchsmith is a package installed here, it is not delivered with
-this skill, and it cannot be fetched — the repository is private, so a fresh AgentCloud runtime's
-clone returns HTTP 403. A worker that lands off-host reports `blocked`; that is the finding, not
-something to route around. If AgentCloud gives you a fresh runtime, attach the devserver, or
-dispatch with `--backend codex`, which runs locally against the installed package.
+**Authoring and task workers run only on this host.** benchsmith is a package installed here and is
+not delivered with this skill. AgentCloud dispatch pins the existing host and exact selected
+checkout before session creation; if either cannot be bound, create no worker and report the hold.
+Do not provision, transfer, or clone Benchsmith into a fresh runtime. Local `--backend codex`
+remains valid because it runs against this installation. `review-fleet` may still fetch isolated
+task-repository evidence copies under `~/.benchsmith-review-checkouts/`; their read-only treatment
+is a behavioral review contract, and they never become authoring checkouts or Benchsmith transfers.
 
 When a worker finishes, dispatch the next queue item into the free slot. Keep going until the queue
 drains or every remaining item needs a human, then report once: what published, what is blocked,
 and why.
 
-**Do not ask permission to start workers.** The safety is structural, not conversational — workers
-cannot push, publishing requires a gate receipt, and one lane per repository is enforced in code.
-A confirmation round-trip buys nothing those do not already guarantee.
+**Do not ask permission to start workers.** Workers are instructed not to push and their handoffs
+are accepted only through the coordinator, but this is a behavioral contract, not an OS-level
+credential boundary. Publication still requires an exact receipt and one code-enforced lane per
+repository. A confirmation round-trip adds no safety to those controls.
 
 **Publishing is yours alone.** Workers prepare and stop; see `references/coordinator.md`.
 
@@ -447,9 +450,10 @@ A task whose validation is still pending is held: a review of moving evidence ci
 change under it.
 
 **Most of a review queue is somebody else's repository.** Ten assigned reviews here span three,
-none of them checked out locally. A missing tree is fetched — shallow, read-only, into
-`~/.benchsmith-review-checkouts/`, kept apart from the repositories you author in so nobody's
-review copy ends up in the pool a hardening worker is dispatched to. A fetch that fails is
+none of them checked out locally. A missing tree is fetched shallowly into an isolated evidence
+copy under `~/.benchsmith-review-checkouts/`, kept apart from the repositories you author in so
+nobody's review copy ends up in the pool a hardening worker is dispatched to. Its read-only use is
+the behavioral contract described below. A fetch that fails is
 reported; the review is not silently dropped.
 
 Each worker runs the canonical track reviewer, then `codimango-review-critic` as the second pass.
@@ -457,8 +461,9 @@ Where a track has **no** canonical reviewer — iOS today — that is reported, 
 another track's rubric assumes a different task shape and produces confident findings about the
 wrong thing.
 
-**The repository is read-only and the review is never submitted.** A worker drafts every field;
-submitting stays a human decision, exactly as publishing does.
+**Review work treats its checkout as read-only and never submits.** The filesystem and worker
+credential are not technically read-only; the prompt and handoff contract prohibit edits, commits,
+pushes, reruns, and author contact. A worker drafts every field; submitting stays a human decision.
 
 ### Gathering the drafts back
 

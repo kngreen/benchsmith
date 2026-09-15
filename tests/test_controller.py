@@ -19,6 +19,18 @@ from benchsmith import task_status
 
 class ControllerTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.safety = patch.object(
+            controller.safety,
+            "snapshot",
+            return_value={
+                "component": "controller_dispatch",
+                "digest": "sha256:controller-test",
+                "sourceHead": "a" * 40,
+                "clean": True,
+            },
+        )
+        self.safety_mock = self.safety.start()
+        self.addCleanup(self.safety.stop)
         root = Path(tempfile.mkdtemp())
         self.repo = root / "repo"
         self.status = root / "status"
@@ -176,6 +188,52 @@ class ControllerTest(unittest.TestCase):
                     self.repo, self.status, "session-a", "epoch-a", now=101
                 )
         self.assertFalse(state_path.exists())
+
+    def test_controller_digest_drift_requires_reacquire(self) -> None:
+        self.acquire()
+        self.safety_mock.return_value = {
+            "component": "controller_dispatch",
+            "digest": "sha256:controller-changed",
+            "sourceHead": "b" * 40,
+            "clean": True,
+        }
+
+        with self.assertRaisesRegex(controller.ControllerRefused, "implementation changed"):
+            controller.verify(
+                self.repo, self.status, "session-a", "epoch-a", now=101
+            )
+
+    def test_same_owner_can_replace_legacy_epoch_without_fingerprint(self) -> None:
+        state_path, _ = controller.paths(self.status)
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            __import__("json").dumps(
+                {
+                    "schemaVersion": 1,
+                    "canonicalRepo": str(self.repo.resolve()),
+                    "statusRoot": str(self.status.resolve()),
+                    "sessionId": "session-a",
+                    "epoch": "legacy",
+                    "acquiredAt": 100,
+                    "renewedAt": 100,
+                    "expiresAt": 220,
+                }
+            )
+        )
+
+        result = controller.acquire(
+            self.repo,
+            self.status,
+            "session-a",
+            ttl_seconds=120,
+            now=110,
+            epoch_factory=lambda: "epoch-new",
+        )
+
+        self.assertEqual(result["epoch"], "epoch-new")
+        self.assertEqual(
+            result["controllerDispatchFingerprint"], "sha256:controller-test"
+        )
 
     def test_canonical_repo_and_status_root_are_fenced(self) -> None:
         self.acquire()
@@ -393,6 +451,7 @@ class ControllerTest(unittest.TestCase):
                 "task": task,
                 "status": task_status.REVISION_HARDENING,
                 "workerSession": "existing-session",
+                "statusSource": "worker",
             },
             status_repo=self.status,
         )
@@ -430,6 +489,19 @@ class ControllerTest(unittest.TestCase):
         stored = task_status.read(self.repo, status_repo=self.status)["rows"][task]
         self.assertEqual(stored["workerSession"], "existing-session")
 
+    def test_synthetic_owner_requires_worker_status_source(self) -> None:
+        task_status.update(
+            self.repo,
+            {
+                "task": "task-stale",
+                "status": task_status.REVISION_HARDENING,
+                "workerSession": "historical-session",
+                "statusSource": "platform",
+            },
+            status_repo=self.status,
+        )
+        self.assertEqual(cli._active_table_leases(self.repo, self.status), {})
+
     def test_fleet_requires_canonical_status_root_before_discovery(self) -> None:
         args = self.fleet_args(self.repo)
         with patch.object(
@@ -440,13 +512,22 @@ class ControllerTest(unittest.TestCase):
             with self.assertRaisesRegex(controller.ControllerRefused, "status-repo"):
                 cli.cmd_fleet(args)
 
-    def test_fleet_admission_precedes_discovery_and_persists_canonically(self) -> None:
+    def test_fleet_previews_before_admission_then_rereads_inside_fence(self) -> None:
         args = self.fleet_args(self.repo, str(self.status))
         order: list[str] = []
+        row = {
+            "name": "task-one",
+            "id": "101",
+            "status": "draft",
+            "validationStatus": "failed",
+        }
 
         def admit(*_args, **_kwargs):
             order.append("admit")
-            return {"ok": True}
+            return {
+                "ok": True,
+                "controllerDispatchFingerprint": "sha256:controller-test",
+            }
 
         @contextmanager
         def fence(*_args, **_kwargs):
@@ -455,25 +536,345 @@ class ControllerTest(unittest.TestCase):
 
         def discover(**_kwargs):
             order.append("discover")
-            return {"tasks": [], "notes": []}
+            return {"tasks": [row], "notes": [], "sourceStatus": {"codimango": {"ok": True}}}
 
-        output = io.StringIO()
         with (
             patch.object(cli.controller_mod, "admit", side_effect=admit),
             patch.object(cli.controller_mod, "write_fence", side_effect=fence),
             patch.object(cli.sources, "discover", side_effect=discover),
+            patch.object(cli, "_cmd_fleet", return_value=0),
+        ):
+            self.assertEqual(cli.cmd_fleet(args), 0)
+
+        self.assertEqual(order, ["discover", "admit", "fence", "discover"])
+
+    def test_empty_preview_skips_heavy_admission_and_writes(self) -> None:
+        args = self.fleet_args(self.repo, str(self.status))
+        output = io.StringIO()
+        with (
+            patch.object(
+                cli.sources,
+                "discover",
+                return_value={"tasks": [], "notes": [], "sourceStatus": {"codimango": {"ok": True}}},
+            ),
+            patch.object(
+                cli.controller_mod,
+                "admit",
+                side_effect=AssertionError("empty preview must not admit"),
+            ),
+            patch.object(
+                cli.controller_mod,
+                "write_fence",
+                side_effect=AssertionError("empty preview must not fence"),
+            ),
             redirect_stdout(output),
         ):
             self.assertEqual(cli.cmd_fleet(args), 0)
 
-        self.assertEqual(order[0:3], ["admit", "fence", "discover"])
         payload = __import__("json").loads(output.getvalue())
-        self.assertEqual(payload["admission"], {"ok": True})
-        self.assertTrue(
-            str(Path(payload["taskStatus"]["statePath"])).startswith(
-                str(self.status)
-            )
+        self.assertFalse(payload["actionable"])
+        self.assertTrue(payload["admission"]["skipped"])
+        self.assertFalse((self.status / ".benchsmith").exists())
+        self.assertFalse((self.repo / ".benchsmith").exists())
+
+    def test_scaffold_worker_gets_durable_assignment(self) -> None:
+        args = SimpleNamespace(
+            ref="T1",
+            name="new-task",
+            repo=str(self.repo),
+            backend="agentcloud",
+            apply=True,
         )
+        session = "11111111-1111-4111-8111-111111111111"
+        idea = {
+            "kind": "idea",
+            "gsd": "T1",
+            "title": "New task",
+            "track": "swe-bench",
+            "suggestedSlug": "new-task",
+            "repo": str(self.repo),
+        }
+        with (
+            patch.object(cli.resolve_mod, "resolve", return_value=idea),
+            patch.object(
+                cli.dispatch_mod,
+                "run",
+                return_value={"ok": True, "stdout": session, "stderr": ""},
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.cmd_scaffold(args), 0)
+
+        assignment = __import__("json").loads(
+            cli.dispatch_mod.assignment_path(self.repo, "new-task").read_text()
+        )
+        self.assertEqual(assignment["session"], session)
+        self.assertTrue(assignment["controller_dispatch_fingerprint"])
+
+    def test_scaffold_assignment_failure_is_recorded_as_failed(self) -> None:
+        args = SimpleNamespace(
+            ref="T1", name="new-task", repo=str(self.repo),
+            backend="agentcloud", apply=True,
+        )
+        idea = {
+            "kind": "idea", "gsd": "T1", "title": "New task",
+            "track": "swe-bench", "suggestedSlug": "new-task",
+            "repo": str(self.repo),
+        }
+        output = io.StringIO()
+        with (
+            patch.object(cli.resolve_mod, "resolve", return_value=idea),
+            patch.object(
+                cli.dispatch_mod,
+                "run",
+                return_value={
+                    "ok": True,
+                    "stdout": "33333333-3333-4333-8333-333333333333",
+                    "stderr": "",
+                },
+            ),
+            patch.object(
+                cli,
+                "_bind_worker",
+                return_value={
+                    "ok": False,
+                    "reason": "could not persist worker assignment",
+                    "termination": {"terminated": True},
+                },
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli.cmd_scaffold(args), 2)
+
+        result = __import__("json").loads(output.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(
+            result["taskStatus"]["changedRows"][0]["status"],
+            task_status.BLOCKED_WORKER,
+        )
+
+    def test_no_remote_lease_reviewer_gets_durable_assignment(self) -> None:
+        task = "review-task"
+        (self.repo / task).mkdir()
+        (self.repo / task / "task.toml").write_text("[metadata]\n")
+        item = SimpleNamespace(
+            task=task,
+            tier=1,
+            tierName="due",
+            track="t-bench",
+            due="",
+            dispatchable=True,
+            as_dict=lambda: {"tierName": "due"},
+        )
+        row = {"name": task, "id": "301", "status": "being_reviewed"}
+        session = "22222222-2222-4222-8222-222222222222"
+        review_worktree = self.repo.parent / "review-worktree"
+        review_worktree.mkdir()
+        seen_workspace = []
+        args = SimpleNamespace(
+            repo=str(self.repo), workers=1, apply=True, no_remote_lease=True,
+            shared_tree=False, no_snooze=True,
+        )
+
+        def start(plan, apply):
+            self.assertTrue(apply)
+            seen_workspace.append(plan.argv[plan.argv.index("--workspace") + 1])
+            return {"ok": True, "stdout": session, "stderr": ""}
+
+        with (
+            patch.object(cli.sources, "fetch_codimango_reviewing", return_value=([row], [])),
+            patch.object(cli.rq_mod, "build", return_value=([item], [])),
+            patch.object(
+                cli.resolve_mod,
+                "resolve",
+                return_value={"repo": str(self.repo), "id": "301"},
+            ),
+            patch.object(
+                cli.wt_mod,
+                "ensure",
+                return_value=SimpleNamespace(path=str(review_worktree)),
+            ),
+            patch.object(cli.dispatch_mod, "run", side_effect=start),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.cmd_reviewfleet(args), 0)
+
+        assignment = __import__("json").loads(
+            cli.dispatch_mod.assignment_path(review_worktree, task).read_text()
+        )
+        self.assertEqual(seen_workspace, [str(review_worktree.resolve())])
+        self.assertEqual(assignment["session"], session)
+        self.assertEqual(assignment["submission_id"], "301")
+
+    def test_review_plan_refusal_releases_lease_and_worktree(self) -> None:
+        task = "review-task"
+        (self.repo / task).mkdir()
+        (self.repo / task / "task.toml").write_text("[metadata]\n")
+        review_worktree = self.repo.parent / "review-refused-worktree"
+        review_worktree.mkdir()
+        item = SimpleNamespace(
+            task=task, tier=1, track="t-bench", due="", dispatchable=True,
+            as_dict=lambda: {"tierName": "due"},
+        )
+        events = []
+
+        class Lease:
+            ref = "refs/heads/benchsmith-locks/review-task"
+            sha = "lease-token"
+
+            def acquire(self):
+                events.append("acquire")
+                return {"held": True}
+
+            def release(self):
+                events.append("lease-release")
+                return {"released": True}
+
+        args = SimpleNamespace(
+            repo=str(self.repo), workers=1, apply=True, no_remote_lease=False,
+            shared_tree=False, no_snooze=True,
+        )
+        with (
+            patch.object(
+                cli.sources,
+                "fetch_codimango_reviewing",
+                return_value=([{"name": task, "id": "301"}], []),
+            ),
+            patch.object(cli.rq_mod, "build", return_value=([item], [])),
+            patch.object(
+                cli.resolve_mod,
+                "resolve",
+                return_value={"repo": str(self.repo), "id": "301"},
+            ),
+            patch.object(cli.rlease_mod, "states", return_value={}),
+            patch.object(cli.rlease_mod, "RemoteLease", return_value=Lease()),
+            patch.object(
+                cli.wt_mod,
+                "ensure",
+                return_value=SimpleNamespace(path=str(review_worktree)),
+            ),
+            patch.object(
+                cli.wt_mod,
+                "release",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("worktree-release")
+                    or {"removed": True}
+                ),
+            ),
+            patch.object(
+                cli.dispatch_mod,
+                "plan",
+                side_effect=cli.dispatch_mod.DispatchRefused("bad review plan"),
+            ),
+            patch.object(
+                cli.dispatch_mod,
+                "run",
+                side_effect=AssertionError("refused plan must not dispatch"),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.cmd_reviewfleet(args), 0)
+
+        self.assertEqual(events, ["acquire", "lease-release", "worktree-release"])
+
+    def test_fleet_includes_fetched_gsd_ideas(self) -> None:
+        args = self.fleet_args(self.repo, str(self.status))
+        args.no_gsd = False
+        config = SimpleNamespace(
+            configured=True,
+            sections={},
+            assignee="",
+            as_dict=lambda: {"configured": True},
+        )
+
+        def discover(*, with_gsd, **_kwargs):
+            return {
+                "tasks": [],
+                "ideas": ([{"name": "T1", "kind": "idea", "title": "seed"}] if with_gsd else []),
+                "notes": [],
+                "sourceStatus": {"codimango": {"ok": True}},
+            }
+
+        with (
+            patch.object(cli.config_mod, "load", return_value=config),
+            patch.object(cli.sources, "discover", side_effect=discover),
+        ):
+            snapshot = cli._discover_fleet(
+                args, self.repo, self.status, reap_expired_leases=False
+            )
+
+        self.assertEqual([item.task for item in snapshot.ready], ["T1"])
+
+    def test_preview_source_failure_fails_before_admission(self) -> None:
+        args = self.fleet_args(self.repo, str(self.status))
+        with (
+            patch.object(
+                cli.sources,
+                "discover",
+                return_value={
+                    "tasks": [],
+                    "notes": ["platform unavailable"],
+                    "sourceStatus": {
+                        "codimango": {"ok": False, "reason": "platform unavailable"}
+                    },
+                },
+            ),
+            patch.object(
+                cli.controller_mod,
+                "admit",
+                side_effect=AssertionError("unreadable source must not admit"),
+            ),
+        ):
+            with self.assertRaisesRegex(controller.ControllerRefused, "source is unreadable"):
+                cli.cmd_fleet(args)
+
+    def test_fleet_validating_row_is_watched_without_worker_admission(self) -> None:
+        task = "task-validating"
+        sha = "a" * 40
+        task_status.update(
+            self.repo,
+            {
+                "task": task,
+                "status": task_status.VALIDATING,
+                "workerSession": "historical-session",
+                "statusSource": "publish",
+                "sha": sha,
+            },
+            status_repo=self.status,
+        )
+        args = self.fleet_args(self.repo, str(self.status))
+        row = {
+            "name": task,
+            "id": "102",
+            "status": "draft",
+            "validationStatus": "running",
+            "validationCommitSha": sha,
+        }
+        output = io.StringIO()
+        with (
+            patch.object(
+                cli.sources,
+                "discover",
+                return_value={"tasks": [row], "notes": [], "sourceStatus": {"codimango": {"ok": True}}},
+            ),
+            patch.object(
+                cli.controller_mod,
+                "admit",
+                side_effect=AssertionError("watch-only work must not run heavy admission"),
+            ),
+            patch.object(
+                cli.dispatch_mod,
+                "run",
+                side_effect=AssertionError("watch-only work must not dispatch"),
+            ),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(cli.cmd_fleet(args), 0)
+
+        payload = __import__("json").loads(output.getvalue())
+        self.assertTrue(payload["actionable"])
+        self.assertEqual(payload["dispatchable"], 0)
+        self.assertEqual(payload["watches"][0]["task"], task)
 
     def test_fleet_holds_epoch_fence_through_dispatch_and_status_write(self) -> None:
         task = "task-fenced"

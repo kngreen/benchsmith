@@ -20,6 +20,18 @@ from benchsmith import task_status
 
 class CandidateStackSafetyTest(unittest.TestCase):
     def setUp(self):
+        self.safety = patch.object(
+            gate.safety,
+            "snapshot",
+            side_effect=lambda component: {
+                "component": component,
+                "digest": f"sha256:{component}-test",
+                "sourceHead": "a" * 40,
+                "clean": True,
+            },
+        )
+        self.safety_mock = self.safety.start()
+        self.addCleanup(self.safety.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.remote = self.root / "remote.git"
@@ -41,6 +53,13 @@ class CandidateStackSafetyTest(unittest.TestCase):
         self.base = self.sha("HEAD")
         self.git("remote", "add", "origin", str(self.remote))
         self.git("push", "-q", "-u", "origin", "main")
+        dispatch.write_assignment(
+            self.repo,
+            "task-b",
+            "session-test",
+            "",
+            controller_fingerprint="sha256:controller_dispatch-test",
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -264,6 +283,98 @@ class CandidateStackSafetyTest(unittest.TestCase):
             dispatch.finalize_handoff(self.repo, "task-b", handoff)
         self.assertIn("not a resolvable local commit", str(caught.exception))
 
+    def test_gate_fingerprint_drift_invalidates_receipt(self):
+        receipt = gate.write_receipt(self.repo, "task-b", self.passing_report())
+        self.assertTrue(receipt["ok"])
+        self.safety_mock.side_effect = lambda component: {
+            "component": component,
+            "digest": (
+                "sha256:gate-changed"
+                if component == "gate"
+                else f"sha256:{component}-test"
+            ),
+            "sourceHead": "b" * 40,
+            "clean": True,
+        }
+
+        ok, reason = gate.verify_receipt(self.repo, "task-b")
+
+        self.assertFalse(ok)
+        self.assertIn("gate implementation changed", reason)
+
+    def test_publish_policy_drift_blocks_real_push(self):
+        candidate_sha = self.commit(
+            "task-b/instruction.md", "task B candidate\n", "task B candidate"
+        )
+        receipt = gate.write_receipt(self.repo, "task-b", self.passing_report())
+        self.assertTrue(receipt["ok"])
+        handoff = self.handoff(candidate_sha, self.base, receipt["digest"])
+        self.safety_mock.side_effect = lambda component: {
+            "component": component,
+            "digest": (
+                "sha256:publish-policy-changed"
+                if component == "publish_policy"
+                else f"sha256:{component}-test"
+            ),
+            "sourceHead": "b" * 40,
+            "clean": True,
+        }
+        with self.assertRaisesRegex(
+            publish.PublishRefused, "publish policy changed"
+        ):
+            publish.publish(
+                self.repo,
+                "task-b",
+                handoff,
+                apply=True,
+                check_review=False,
+                check_hold=False,
+            )
+
+    def test_remote_tip_equal_candidate_returns_already_published_without_push(self):
+        candidate_sha = self.commit(
+            "task-b/instruction.md", "task B published\n", "task B published"
+        )
+        self.git("push", "-q", "origin", "HEAD:main")
+        handoff = self.handoff(candidate_sha, self.base, receipt="")
+
+        result = publish.publish(self.repo, "task-b", handoff, apply=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "already-published")
+        self.assertEqual(result["commit"], candidate_sha)
+        self.assertEqual(result["nextAction"], "watch-exact-sha")
+        self.assertFalse((self.repo / ".benchsmith" / "publish.intent.json").exists())
+
+    def test_candidate_ancestor_but_not_tip_is_not_already_published(self):
+        candidate_sha = self.commit(
+            "task-b/instruction.md", "task B candidate\n", "task B candidate"
+        )
+        self.git("push", "-q", "origin", "HEAD:main")
+        self.commit("task-a/instruction.md", "task A later\n", "task A later")
+        self.git("push", "-q", "origin", "HEAD:main")
+
+        with self.assertRaisesRegex(
+            publish.PublishRefused, "empty self-range"
+        ):
+            publish.inspect_candidate(
+                self.repo, "task-b", self.handoff(candidate_sha, candidate_sha)
+            )
+
+    def test_already_published_still_requires_task_only_scope(self):
+        task_a = self.commit("task-a/instruction.md", "task A candidate\n", "task A")
+        task_b = self.commit("task-b/instruction.md", "task B candidate\n", "task B")
+        self.git("push", "-q", "origin", "HEAD:main")
+
+        with self.assertRaisesRegex(publish.PublishRefused, "outside task-b"):
+            publish.publish(
+                self.repo,
+                "task-b",
+                self.handoff(task_b, self.base, receipt=""),
+                apply=True,
+            )
+        self.assertEqual(self.sha(f"{task_b}^"), task_a)
+
     def handoff(self, commit_sha: str, base_sha: str, receipt: str = "receipt") -> dict:
         return {
             "work_item": "task-b",
@@ -272,6 +383,7 @@ class CandidateStackSafetyTest(unittest.TestCase):
             "commit_sha": commit_sha,
             "gate_receipt": receipt,
             "next_action": "publish",
+            "session": "session-test",
         }
 
     @staticmethod

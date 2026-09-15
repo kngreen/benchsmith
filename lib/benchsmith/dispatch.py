@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import candidate as candidate_mod
+from . import safety
 
 # Probed against the live API, not assumed: `--harness` accepts `codex` and
 # `native`; `claude` and `metacode` are rejected by agentcloud\wire\HarnessKind.
@@ -37,6 +38,7 @@ AGENTCLOUD_HARNESSES = frozenset({"codex", "native"})
 DEFAULT_HARNESS = ""
 
 HANDOFF_LIMIT = 4096
+_FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 # The one host benchsmith is installed on. A worker that lands anywhere else
 # cannot run it: the repository is private, so the "just clone it" fallback
@@ -167,40 +169,37 @@ def benchsmith_root() -> str:
     return str(Path(__file__).resolve().parents[2])
 
 
-def bootstrap_block(root: str | None = None) -> str:
-    """Put benchsmith on the worker's disk.
-
-    A remote worker cannot be handed benchsmith through `--skills`. SkillsService
-    serves the SKILL.md body only -- nested files are withheld from remote nodes
-    unless --skill-materialization is on, and it is off by default and not
-    exposed on the session CLI. benchsmith is a package, not prose, so a
-    body-only delivery yields a worker that has the judgement and none of the
-    commands. It has to arrive as files.
-    """
+def bootstrap_block(root: str | None = None, checkout: str = "") -> str:
+    """Require the installed host and the exact coordinator-selected checkout."""
     root = root or benchsmith_root()
+    checkout_path = str(Path(checkout).expanduser().resolve()) if checkout else ""
+    checkout_check = (
+        f'[ -d {shlex.quote(checkout_path)} ] || {{ echo "CHECKOUT NOT ON HOST"; exit 1; }}\n'
+        if checkout_path
+        else ""
+    )
     return (
-        f"**This work runs only on `{HOST}`.** benchsmith is a package installed there. It is not "
-        "delivered with this skill and it cannot be fetched: the repository is private, so a "
-        "fresh runtime's clone returns HTTP 403. If you are not on that host, attach it first.\n\n"
+        f"**This work runs only on `{HOST}`.** benchsmith is installed there, and the selected "
+        f"checkout is `{checkout_path or 'resolved by the coordinator'}`. Attach and use that host; "
+        "do not provision or transfer to a fresh runtime.\n\n"
         "```bash\n"
         f"{PROXY_PREAMBLE}\n"
         f'for c in "$BENCHSMITH_BIN" "$HOME/.claude/skills/benchsmith/bin/benchsmith" '
         f'"$(command -v benchsmith 2>/dev/null)" "{root}/bin/benchsmith"; do\n'
         '  [ -n "$c" ] && [ -x "$c" ] && export BENCHSMITH_BIN="$c" && break\n'
-        'done\n'
+        "done\n"
+        f"{checkout_check}"
         '[ -x "$BENCHSMITH_BIN" ] || { echo "NOT ON THE HOST"; exit 1; }\n'
         '"$BENCHSMITH_BIN" preflight --json\n'
         "```\n\n"
-        f"If `$BENCHSMITH_BIN` is missing you are not on `{HOST}`. Attach that devserver and retry "
-        "once. If you still cannot reach it, report `state=blocked` saying so and stop -- being "
-        "off-host is the finding, not something to work around, and cloning from GitHub will only "
-        "produce a misleading 403.\n\n"
+        f"If the installation or checkout is unavailable on `{HOST}`, report `state=blocked` and "
+        "stop. Do not clone Benchsmith as a substitute. Review workers may use the coordinator's "
+        "isolated task checkout under a behavioral read-only review contract; that is not a "
+        "Benchsmith transfer.\n\n"
         "**Never ask for a credential.** Not a token, cookie, OIDC value, API key, or a file "
         "containing one; not to unblock yourself, not read-only, not once. A credential pasted "
         "into a session is stored in that conversation and its journal. If `codimango` cannot "
-        "authenticate you are in a fresh container rather than on the host that holds the "
-        "credential -- attach the host, or report `state=blocked` saying you are not on an "
-        "authenticated one. Do not open a login page or mint a token.\n\n"
+        "authenticate, report `state=blocked`; do not open a login page or mint a token.\n\n"
         "Never improvise a substitute for the gate: an ungated push is the failure this exists "
         "to prevent.\n\n"
     )
@@ -313,7 +312,7 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
                   bootstrap: bool = False, resume: bool = True) -> str:
     """The instruction a stage-3 worker gets. Deliberately narrow."""
     return (
-        (bootstrap_block() if bootstrap else "")
+        (bootstrap_block(checkout=repo) if bootstrap else "")
         + (resume_block(repo, task) if resume else "")
         +
         # NOT "use the benchsmith skill": agentcloud resolves a skill name
@@ -389,7 +388,7 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
         if native.get("applicable") and not native.get("ready"):
             raise DispatchRefused(native["reason"])
     if mode == "review":
-        prompt = ((bootstrap_block() if bootstrap else "")
+        prompt = ((bootstrap_block(checkout=repo) if bootstrap else "")
                   + review_prompt(task, repo, track=(idea or {}).get("track", ""),
                                   due=(idea or {}).get("due", "")))
     elif mode == "scaffold":
@@ -408,7 +407,7 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
                 f"{repo}/{task} already exists; scaffolding over a real task would overwrite it. "
                 "Choose a different name, or dispatch it as a task rather than an idea"
             )
-        prompt = ((bootstrap_block() if bootstrap else "")
+        prompt = ((bootstrap_block(checkout=repo) if bootstrap else "")
                   + scaffold_prompt(idea, repo, task))
     elif mode == "review":
         pass  # prompt already built above
@@ -424,7 +423,7 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
         prompt = worker_prompt(task, repo, mode=mode, target=target, bootstrap=bootstrap)
     notes: list[str] = []
     if bootstrap:
-        notes.append("worker clones benchsmith itself; --skills cannot deliver a package")
+        notes.append(f"worker is pinned to {HOST} and uses the installed Benchsmith checkout")
 
     if backend == "agentcloud":
         if harness and harness not in AGENTCLOUD_HARNESSES:
@@ -435,14 +434,25 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
         # Twelve identically-named sessions are unreadable in a fleet view, so
         # the title carries what tells them apart: the task, and what is being
         # done to it.
-        argv = ["meta", "agentcloud.session", "create",
-                "--title", f"[benchsmith][{mode_label(mode)}]: {task}",
-                "--message", prompt, "--output", "json"]
+        argv = [
+            "agentcloudctl",
+            "create",
+            "--node-id",
+            HOST,
+            "--workspace",
+            str(Path(repo).expanduser().resolve()),
+            "--title",
+            f"[benchsmith][{mode_label(mode)}]: {task}",
+            "--prompt",
+            prompt,
+        ]
         if harness:
-            argv[3:3] = ["--harness", harness]
+            argv[2:2] = ["--harness", harness]
         if skills:
-            argv += ["--skills", skills]
-        notes.append("poll with `meta agentcloud.session poll --session-id <id>`")
+            for skill in (part.strip() for part in skills.split(",")):
+                if skill:
+                    argv += ["--skill", skill]
+        notes.append("wait with `agentcloudctl wait -s <id> --until settle`")
     elif backend == "codex":
         argv = ["codex", "exec", prompt]
         notes.append("blocks until the worker finishes; run detached for concurrency")
@@ -488,12 +498,15 @@ def run(p: Plan, *, apply: bool = False, timeout: int = 900, runner=None) -> dic
 
 
 def session_id(stdout: str) -> str:
-    """The id `agentcloud.session create` returned, so a caller can follow it."""
+    """Extract the created session id from JSON or agentcloudctl's plain output."""
+    value = stdout.strip()
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", value):
+        return value
     try:
         doc = json.loads(stdout[stdout.index("{"):]) if "{" in stdout else {}
     except ValueError:
         return ""
-    return str(doc.get("session_id") or "")
+    return str(doc.get("session_id") or doc.get("sessionId") or "")
 
 
 def poll_session(sid: str, *, limit: int = 400, max_pages: int = 20,
@@ -802,13 +815,13 @@ def parse_handoff(text: str) -> dict:
     state = str(doc.get("state") or "")
     if state not in HANDOFF_STATES:
         raise DispatchRefused(f"unknown handoff state {state!r}; expected one of {sorted(HANDOFF_STATES)}")
-    if state == "ready_to_publish":
-        # This is the one claim a coordinator acts on, so neither half of its
-        # ancestry range may be guessed.
-        if not doc.get("commit_sha"):
+    if state in {"ready_to_publish", "awaiting_validation"}:
+        commit_sha = str(doc.get("commit_sha") or "")
+        if not _FULL_SHA.fullmatch(commit_sha):
             raise CandidateHandoffRefused(
-                "state=ready_to_publish with no commit_sha", doc
+                f"state={state} requires a full commit_sha for exact-SHA handling", doc
             )
+    if state == "ready_to_publish":
         if not doc.get("base_sha"):
             raise CandidateHandoffRefused(
                 "state=ready_to_publish with no base_sha; unknown ancestry blocks publication",
@@ -846,7 +859,9 @@ def write_assignment(
     *,
     status_repo: str = "",
     submission_id: str = "",
+    controller_fingerprint: str = "",
 ) -> Path:
+    fingerprint = controller_fingerprint or safety.snapshot("controller_dispatch")["digest"]
     path = assignment_path(repo, task)
     _atomic_json(
         path,
@@ -857,6 +872,7 @@ def write_assignment(
             "lease_task": lease_task or task,
             "status_repo": status_repo,
             "submission_id": submission_id,
+            "controller_dispatch_fingerprint": fingerprint,
         },
     )
     return path
@@ -882,11 +898,36 @@ def finalize_handoff(
     if state == "in_progress":
         raise DispatchRefused("in_progress is not a terminal handoff")
 
-    assignment = {}
     try:
         assignment = json.loads(assignment_path(repo, task).read_text())
-    except (OSError, ValueError):
-        pass
+    except FileNotFoundError as error:
+        raise DispatchRefused(
+            "worker assignment is missing; refuse an unbound or stale handoff"
+        ) from error
+    except (OSError, ValueError, TypeError) as error:
+        raise DispatchRefused(f"worker assignment is unreadable: {error}") from error
+    if not isinstance(assignment, dict):
+        raise DispatchRefused("worker assignment is malformed")
+    assigned_session = str(assignment.get("session") or "")
+    supplied_session = str(parsed.get("session") or "")
+    if not assigned_session or not supplied_session:
+        raise DispatchRefused("handoff and assignment must both name the worker session")
+    if supplied_session != assigned_session:
+        raise DispatchRefused("handoff session does not match the dispatched worker")
+    assigned_fingerprint = str(
+        assignment.get("controller_dispatch_fingerprint") or ""
+    )
+    if assignment and not assigned_fingerprint:
+        raise DispatchRefused(
+            "worker assignment has no controller/dispatch fingerprint; redispatch it"
+        )
+    if assigned_fingerprint:
+        current_fingerprint = safety.snapshot("controller_dispatch")["digest"]
+        if assigned_fingerprint != current_fingerprint:
+            raise DispatchRefused(
+                "controller/dispatch implementation changed since assignment; redispatch it"
+            )
+        parsed["controller_dispatch_fingerprint"] = assigned_fingerprint
     for field in ("session", "lease_token", "lease_task", "status_repo", "submission_id"):
         assigned = str(assignment.get(field) or "")
         supplied = str(parsed.get(field) or "")

@@ -12,6 +12,18 @@ from benchsmith import gate
 
 class ScriptPatchDiffCheckTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.safety = mock.patch.object(
+            gate.safety,
+            "snapshot",
+            side_effect=lambda component: {
+                "component": component,
+                "digest": f"sha256:{component}-test",
+                "sourceHead": "a" * 40,
+                "clean": True,
+            },
+        )
+        self.safety.start()
+        self.addCleanup(self.safety.stop)
         self.tempdir = tempfile.TemporaryDirectory()
         self.repo = Path(self.tempdir.name) / "repo"
         (self.repo / "task" / "tests").mkdir(parents=True)
@@ -382,6 +394,38 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
             emitted = json.loads(hook_receipt.read_text())
             self.assertNotIn("diff-ratchet", emitted["gates"])
             self.assertNotIn("diff-weakening", emitted["gates"])
+
+    def test_fingerprint_failure_removes_hook_receipt(self) -> None:
+        report = gate.Report()
+        for name in gate.PUSH_REQUIRED:
+            report.add(name, gate.PASS, "fixture")
+        hook_receipt = Path(self.tempdir.name) / "hook-receipt.json"
+        hook_receipt.write_text('{"stale":true}\n')
+        gate.safety.snapshot.side_effect = gate.safety.SafetyRefused("dirty install")
+        with mock.patch.dict(os.environ, {"GATE_RECEIPT": str(hook_receipt)}):
+            receipt = gate.write_receipt(self.repo, "task", report)
+
+        self.assertEqual(receipt["state"], "not_written")
+        self.assertFalse(hook_receipt.exists())
+
+    def test_legacy_receipt_without_fingerprints_requires_regate(self) -> None:
+        report = gate.Report()
+        for name in gate.PUSH_REQUIRED:
+            report.add(name, gate.PASS, "fixture")
+        receipt_dir = Path(self.tempdir.name) / "receipts"
+        with mock.patch.dict(os.environ, {"BENCHSMITH_RECEIPT_DIR": str(receipt_dir)}):
+            receipt = gate.write_receipt(self.repo, "task", report)
+            receipt.pop("gateFingerprint")
+            receipt.pop("publishPolicyFingerprint")
+            receipt["digest"] = gate._receipt_digest(receipt)
+            gate.receipt_path(self.repo, "task").write_text(
+                json.dumps(receipt, indent=2) + "\n"
+            )
+
+            ok, reason = gate.verify_receipt(self.repo, "task")
+
+        self.assertFalse(ok)
+        self.assertIn("predates safety fingerprints", reason)
 
     def test_changed_unsupported_patch_remains_required(self) -> None:
         self._write_patch("pkg/auth_test.rs", "fn test_auth() { assert!(true); }")

@@ -1155,9 +1155,9 @@ check("...and no tilde reaches the prompt", "~/" in dsp.bootstrap_block(), False
 check("dispatch is non-publishing by default", _p.publishing, False)
 # An alias that resolves to nothing is worse than no alias: the session starts,
 # the skill is silently absent, and the worker improvises without a gate.
-check("no --skills alias by default", "--skills" not in _p.argv, True)
+check("no --skill alias by default", "--skill" not in _p.argv, True)
 check("an explicit alias is still passed",
-      "--skills" in dsp.plan("t1", _REPO, skills="benchsmith").argv, True)
+      "--skill" in dsp.plan("t1", _REPO, skills="benchsmith").argv, True)
 check("agentcloud workers are told which host they need",
       any(dsp.HOST in a for a in _p.argv), True)
 check("the preamble uses the working proxy pair",
@@ -1216,8 +1216,11 @@ except dsp.DispatchRefused as e:
     check("run refuses a publishing plan", "stage 4" in str(e), True)
 
 # --- handoff parsing ---
-_good = '{"work_item":"t1","state":"ready_to_publish","commit_sha":"deadbeef","base_sha":"a1","next_action":"publish"}'
-check("valid handoff parses", dsp.parse_handoff(_good)["commit_sha"], "deadbeef")
+_good_sha = "d" * 40
+_good = json.dumps({"work_item": "t1", "state": "ready_to_publish",
+                    "commit_sha": _good_sha, "base_sha": "a" * 40,
+                    "next_action": "publish"})
+check("valid handoff parses", dsp.parse_handoff(_good)["commit_sha"], _good_sha)
 check("handoff keeps only known fields",
       set(dsp.parse_handoff(_good)) <= set(dsp.HANDOFF_FIELDS), True)
 check("prose around the JSON is tolerated",
@@ -1252,7 +1255,7 @@ _MUTANTS = [
     ("harness allowlist", 'if harness and harness not in AGENTCLOUD_HARNESSES:', 'if False:'),
     ("apply guard", 'if not apply:', 'if False:'),
     ("publishing guard", 'if p.publishing:', 'if False:'),
-    ("commit_sha requirement", 'if not doc.get("commit_sha"):', 'if False:'),
+    ("commit_sha requirement", 'if not _FULL_SHA.fullmatch(commit_sha):', 'if False:'),
     ("base_sha requirement", 'if not doc.get("base_sha"):', 'if False:'),
     ("state allowlist", 'if state not in HANDOFF_STATES:', 'if False:'),
     ("size cap", 'if len(text) > HANDOFF_LIMIT * 4:', 'if False:'),
@@ -1773,7 +1776,7 @@ check("...and distinguishes commits",
       True)
 
 # --- reconciliation: the question a crash leaves behind ---
-def _fake_remote(head):
+def _fake_remote(head, local_head=None):
     def g(repo, *args, **kw):
         class R:
             returncode = 0
@@ -1786,7 +1789,7 @@ def _fake_remote(head):
         elif args and args[0] == "rev-parse":
             value = str(args[-1]).removesuffix("^{commit}")
             if value == "HEAD":
-                value = head
+                value = local_head or head
             if value == "9" * 40:
                 result.returncode = 128
                 result.stderr = "unknown revision"
@@ -1812,7 +1815,11 @@ def _dead_remote():
 
 
 check("no intent means nothing to reconcile", _lane.reconcile(_pr)["state"], "clean")
-_lane.record_intent(pub.Intent("t1", "b" * 40, "c" * 40, "origin", "main", "k", 0.0))
+_policy_fp = pub._policy_identity()["digest"]
+_lane.record_intent(pub.Intent(
+    "t1", "b" * 40, "c" * 40, "origin", "main", "k", 0.0,
+    publish_policy_fingerprint=_policy_fp,
+))
 check("remote at our commit means it landed",
       _lane.reconcile(_pr, git=_fake_remote("c" * 40))["state"], pub.LANDED)
 check("remote at our base means it did not",
@@ -2542,21 +2549,22 @@ def _block(txt, seq=1):
     return {"seq": str(seq), "type": "block", "event": json.dumps({"block": {"text": txt}})}
 
 
-_hand = ('{"work_item":"t1","state":"ready_to_publish","commit_sha":"abc",'
-         '"base_sha":"b","gate_receipt":"r","next_action":"publish"}')
+_hand = json.dumps({"work_item": "t1", "state": "ready_to_publish",
+                    "commit_sha": "c" * 40, "base_sha": "b" * 40,
+                    "gate_receipt": "r", "next_action": "publish"})
 
 # One page looks complete and is usually the beginning.
 _r = dsp.collect("s1", runner=_pages(([_block("thinking")], True),
                                      ([_block(_hand), {"type": "run_finished"}], False)))
 check("a handoff on a later page is still found", _r["state"], "done")
-check("...and parses", _r["handoff"]["commit_sha"], "abc")
+check("...and parses", _r["handoff"]["commit_sha"], "c" * 40)
 
 # A worker often reasons about the handoff shape before emitting it; the last
 # valid one is the answer, not the first mention.
 _r2 = dsp.collect("s1", runner=_pages((
     [_block('I will emit {"state":"ready_to_publish"} when done'),
      _block(_hand), {"type": "run_finished"}], False)))
-check("the last valid handoff wins", _r2["handoff"]["commit_sha"], "abc")
+check("the last valid handoff wins", _r2["handoff"]["commit_sha"], "c" * 40)
 
 check("a still-running worker is not mistaken for a failed one",
       dsp.collect("s1", runner=_pages(([_block("working")], False)))["state"], "running")
@@ -2783,7 +2791,7 @@ _bb = dsp.bootstrap_block()
 # The "just clone it" fallback returns HTTP 403 from a fresh runtime: the repo
 # is private. Offering it wastes the session and produces a misleading error.
 check("the dead GitHub fallback is gone", "git clone" in _bb, False)
-check("...and the reason is stated", "403" in _bb, True)
+check("...and the reason is stated", "Do not clone Benchsmith" in _bb, True)
 check("the required host is named", dsp.HOST in _bb, True)
 check("being off-host is a reportable state", "state=blocked" in _bb, True)
 
@@ -3155,7 +3163,7 @@ check("...and that leaving is not a loss", "left the queue" in _r, True)
 # --- the suite may not start real workers ------------------------------------
 #
 # It did. The mutation harness removes each guard in turn and then calls run();
-# with no injection point that reached `meta agentcloud.session create`, and a
+# with no injection point that reached `agentcloudctl create`, and a
 # suite run spawned real sessions named after fixture tasks. Two defences, and a
 # check that neither rots.
 
@@ -3599,7 +3607,7 @@ try:
         pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40))
         check("an accepted task is frozen", "published", "refused")
     except pub.PublishRefused as e:
-        check("an accepted task is frozen", "no override" in str(e), True)
+        check("an accepted task is frozen", "finished tasks are frozen" in str(e), True)
     # Not even with an explicit override: frozen means finished.
     try:
         pub.publish(_pr, "t", _hh2, git=_fake_remote("b" * 40), allow_review_status="accepted")
@@ -4456,7 +4464,7 @@ finally:
     hld.remote_ref.update = _saved_hold_update
 
 # publish must refuse into a held branch, and must refuse when it cannot tell.
-_hh3 = {"state": "ready_to_publish", "commit_sha": "b" * 40, "base_sha": "b" * 40,
+_hh3 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
         "gate_receipt": "r"}
 _saved8 = rv._tasks
 _saved_verify8 = gate_mod.verify_receipt
@@ -4471,7 +4479,7 @@ try:
         "readable": True, "held": True, "holder": "someone-else", "minutesLeft": 20,
         "why": "landing a stack"}
     try:
-        pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40), apply=True)
+        pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40, "c" * 40), apply=True)
         check("publish refuses into a held branch", "pushed", "refused")
     except pub.PublishRefused as e:
         check("publish refuses into a held branch", "holds" in str(e), True)
@@ -4480,7 +4488,7 @@ try:
 
     _hmod.current = lambda repo, remote="origin": {"readable": False, "reason": "offline"}
     try:
-        pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40), apply=True)
+        pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40, "c" * 40), apply=True)
         check("an unreadable hold refuses too", "pushed", "refused")
     except pub.PublishRefused as e:
         check("an unreadable hold refuses too", "not permission" in str(e), True)
@@ -4518,7 +4526,7 @@ from benchsmith import watch as wch  # noqa: E402
 check("awaiting_validation is a handoff state",
       "awaiting_validation" in dsp.HANDOFF_STATES, True)
 check("...and parses",
-      dsp.parse_handoff('{"state":"awaiting_validation","commit_sha":"abc"}')["state"],
+      dsp.parse_handoff(json.dumps({"state": "awaiting_validation", "commit_sha": "c" * 40}))["state"],
       "awaiting_validation")
 
 _saved9 = wch._read
@@ -4835,7 +4843,7 @@ check("workers are told never to ask for a credential",
       "Never ask for a credential" in _bb2, True)
 check("...including read-only and just-once", "not read-only, not once" in _bb2, True)
 check("...and are told it is a placement problem",
-      "fresh container rather than on the host" in _bb2, True)
+      "installation or checkout is unavailable" in _bb2, True)
 check("...with blocked as the answer", "state=blocked" in _bb2, True)
 check("...and are told not to mint one", "mint a token" in _bb2, True)
 
@@ -4949,7 +4957,7 @@ finally:
 # recoverable durable phase; replay advances it to released.
 _fin = Path(tempfile.mkdtemp())
 dsp.write_assignment(_fin, "task", "session-3", "lease-token-3")
-_handoff = {"work_item": "task", "state": "blocked", "note": "done"}
+_handoff = {"work_item": "task", "state": "blocked", "note": "done", "session": "session-3"}
 
 
 def _release_race(args):
@@ -4971,9 +4979,11 @@ _phase2 = dsp.finalize_handoff(_fin, "task", _handoff,
 check("recovery advances durable rename to CAS release",
       (_phase2["ok"], _phase2["phase"]), (True, "released"))
 
-_legacy = dsp.finalize_handoff(_fin, "legacy", {"state": "no_change", "note": "old shape"})
-check("an existing handoff without lease fields remains readable",
-      (_legacy["ok"], _legacy["phase"], _legacy["released"]), (True, "durable", False))
+try:
+    dsp.finalize_handoff(_fin, "legacy", {"state": "no_change", "note": "old shape"})
+    check("an unassigned legacy handoff is refused", "accepted", "refused")
+except dsp.DispatchRefused as _legacy_error:
+    check("an unassigned legacy handoff is refused", "assignment is missing" in str(_legacy_error), True)
 
 # Existing receipt JSON remains parseable but cannot authenticate itself after
 # the digest field is removed or its contents are changed.
@@ -5346,6 +5356,7 @@ class _PublishLease:
 
 _saved_publish_lease = _cli.rlease_mod.RemoteLease
 _saved_publish_call = _cli.publish_mod.publish
+_saved_publish_inspect = _cli.publish_mod.inspect_candidate
 _handoff_path = _controls_root / "handoff.json"
 _handoff_path.write_text(json.dumps({
     "state": "ready_to_publish",
@@ -5355,6 +5366,10 @@ _handoff_path.write_text(json.dumps({
 }))
 try:
     _cli.rlease_mod.RemoteLease = _PublishLease
+    _cli.publish_mod.inspect_candidate = lambda *args, **kwargs: {
+        "alreadyPublished": False,
+        "commit": "a" * 40,
+    }
 
     def _publish_with_lease(repo, task, handoff, **kwargs):
         _lease_events.append("passed" if isinstance(kwargs.get("remote_lease"), _PublishLease)
@@ -5422,6 +5437,7 @@ try:
 finally:
     _cli.rlease_mod.RemoteLease = _saved_publish_lease
     _cli.publish_mod.publish = _saved_publish_call
+    _cli.publish_mod.inspect_candidate = _saved_publish_inspect
 
 # Critic decisions are ingested only from a terminal session transcript and
 # remain bound to its exact task SHA.

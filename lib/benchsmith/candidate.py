@@ -321,6 +321,10 @@ def verify_handoff(
         if remote_base
         else _remote_base(repo, remote, branch, git=git)
     )
+    if declared == candidate:
+        raise CandidateRejected(
+            "declared base equals the candidate; publication scope would be an empty self-range"
+        )
 
     explicit_source = str(handoff.get("source_base_sha") or "").lower()
     explicit_candidate = str(handoff.get("carried_from_sha") or "").lower()
@@ -397,7 +401,8 @@ def verify_handoff(
                 "declared base and current remote base are on incomparable histories; "
                 "base is ambiguous"
             )
-        paths = _scoped_paths(repo, task, current, candidate, git=git)
+        scope_base = declared if current == candidate else current
+        paths = _scoped_paths(repo, task, scope_base, candidate, git=git)
         return StackProof(
             task=task,
             candidate_sha=candidate,

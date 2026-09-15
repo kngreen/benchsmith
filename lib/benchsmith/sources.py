@@ -16,14 +16,7 @@ import json
 import re
 import subprocess
 
-# Statuses that are somebody else's move, not ours. Kept explicit so a new
-# platform status shows up as unrecognised rather than being quietly worked on.
-NOT_OUR_WORK = {
-    "accepted": "already accepted",
-    "used_in_training": "already in training",
-    "being_reviewed": "a reviewer holds it",
-    "needs_reviewers_assigned": "waiting on reviewer assignment, not on work",
-}
+from .resolve import work_eligibility
 
 
 def _run(argv: list[str], timeout: int = 300) -> tuple[int, str, str]:
@@ -146,14 +139,11 @@ def normalise_codimango(rows: list[dict], *, require_owner: bool = True) -> tupl
                          f"{' (you are the reviewer)' if r.get('currentUserIsReviewer') else ''}; "
                          "not queued for work")
             continue
-        if status in NOT_OUR_WORK:
-            # Named, not silent: "my task vanished from the queue" is a worse
-            # experience than one line saying a reviewer has it.
-            notes.append(f"{r.get('name') or r.get('id')}: {NOT_OUR_WORK[status]}; not queued")
-            continue
-        if status not in ("draft", "needs_revision"):
-            notes.append(f"{r.get('name') or r.get('id')}: unrecognised status {status!r}; "
-                         "not queued — check whether it needs a tier")
+        decision = work_eligibility(status)
+        if not decision.eligible:
+            notes.append(
+                f"{r.get('name') or r.get('id')}: {decision.reason}; not queued"
+            )
             continue
         keep.append(r)
     return keep, notes
@@ -234,15 +224,28 @@ def normalise_gsd(rows: list[dict], columns: dict[str, str] | None = None,
 def discover(*, binary: str = "codimango", cfg=None, with_gsd: bool = True,
              require_owner: bool = True) -> dict:
     """The payload `build_queue` already expects."""
-    tasks, notes = fetch_codimango(binary)
+    tasks, fetch_notes = fetch_codimango(binary)
+    source_status = {
+        "codimango": {
+            "ok": not fetch_notes,
+            "reason": "; ".join(fetch_notes),
+        }
+    }
+    notes = list(fetch_notes)
     tasks, n2 = normalise_codimango(tasks, require_owner=require_owner)
     notes += n2
     ideas: list[dict] = []
     if with_gsd and cfg is not None:
         rows, n3 = fetch_gsd(cfg)
+        source_status["gsd"] = {"ok": not n3, "reason": "; ".join(n3)}
         notes += n3
         ideas, n4 = normalise_gsd(rows, columns=cfg.sections, assignee=cfg.assignee,
                                   known_tasks=[str(t.get("name") or "") for t in tasks])
         notes += n4
-    return {"tasks": tasks, "ideas": ideas, "notes": notes,
-            "gsd": cfg.as_dict() if cfg is not None else None}
+    return {
+        "tasks": tasks,
+        "ideas": ideas,
+        "notes": notes,
+        "sourceStatus": source_status,
+        "gsd": cfg.as_dict() if cfg is not None else None,
+    }

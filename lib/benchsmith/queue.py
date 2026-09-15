@@ -19,6 +19,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .resolve import publication_eligibility, work_eligibility
+from .watch import PENDING_STATES, TERMINAL_STATES
+
 # Lower sorts first. Cheapest evidence first: a reviewer who already said what is
 # wrong beats a measurement you have not taken yet.
 TIER_REVISION = 10       # a human named the defect
@@ -69,6 +72,9 @@ DEFAULT_WORKERS = 8
 # warning rather than refused: the caller may know something this does not.
 MAX_WORKERS = 15
 
+PASSING_VALIDATION = frozenset({"completed", "passing", "passed"})
+FAILING_VALIDATION = frozenset(TERMINAL_STATES) - PASSING_VALIDATION
+
 
 @dataclass
 class Item:
@@ -80,10 +86,13 @@ class Item:
     journal_status: str = ""
     claimed_by: str | None = None
     skip: str = ""
+    work_eligible: bool = True
+    publication_eligible: bool = False
+    publication_reason: str = ""
 
     @property
     def dispatchable(self) -> bool:
-        return not self.skip and self.claimed_by is None
+        return self.work_eligible and not self.skip and self.claimed_by is None
 
     def as_dict(self) -> dict:
         return {
@@ -96,19 +105,31 @@ class Item:
             "journalStatus": self.journal_status,
             "claimedBy": self.claimed_by,
             "skip": self.skip,
+            "workEligibility": {
+                "eligible": self.work_eligible,
+                "reason": self.reason if self.work_eligible else self.skip,
+            },
+            "publicationEligibility": {
+                "eligible": self.publication_eligible,
+                "reason": self.publication_reason,
+            },
             "dispatchable": self.dispatchable,
         }
 
 
 def _tier(status: str, validation: str) -> tuple[int, str] | None:
+    if not work_eligibility(status).eligible:
+        return None
     if status == "needs_revision":
         return (TIER_REVISION, "a reviewer named the defect")
-    if status == "draft":
-        if validation == "failed":
-            return (TIER_DRAFT_FAILED, "validation failed; evidence is on the SHA")
-        if validation in ("pending", "", None):
-            return (TIER_DRAFT_PENDING, "no measurement yet")
-        return (TIER_DRAFT_PASSING, "green but unaccepted")
+    if status in {"draft", "unregistered"}:
+        if validation in FAILING_VALIDATION:
+            return (TIER_DRAFT_FAILED, f"validation is {validation}; evidence is on the SHA")
+        if not validation or validation in PENDING_STATES:
+            return (TIER_DRAFT_PENDING, "no terminal measurement yet")
+        if validation in PASSING_VALIDATION:
+            return (TIER_DRAFT_PASSING, "green but unaccepted")
+        return (TIER_DRAFT_PENDING, f"unrecognised validation status {validation!r}")
     return None
 
 
@@ -149,16 +170,32 @@ def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
         if tiered is None:
             continue
         tier, reason = tiered
+        work = work_eligibility(status)
+        publication = publication_eligibility(status)
+        supplied_publication = t.get("publicationEligibility")
+        if isinstance(supplied_publication, dict):
+            publication = type(publication)(
+                bool(supplied_publication.get("eligible")),
+                str(supplied_publication.get("reason") or publication.reason),
+            )
         jstatus = journals.get(name, "")
         item = Item(task=name, tier=tier, reason=reason, status=status,
                     validation=validation, journal_status=jstatus,
-                    claimed_by=leases.get(name))
+                    claimed_by=leases.get(name), work_eligible=work.eligible,
+                    publication_eligible=publication.eligible,
+                    publication_reason=publication.reason)
         if jstatus in TERMINAL:
             item.skip = f"journal says {jstatus}"
         elif jstatus in NEEDS_HUMAN:
             item.skip = f"journal says {jstatus}: needs a human before redispatch"
         elif jstatus == "unreadable":
             item.skip = "journal will not parse; counters unknown"
+        elif (
+            validation
+            and validation not in PENDING_STATES
+            and validation not in TERMINAL_STATES
+        ):
+            item.skip = f"unrecognised validation status {validation!r}; classify before acting"
         items.append(item)
 
     for idea in ideas or []:
@@ -210,18 +247,21 @@ class Leases:
     def owner(self) -> str:
         return f"{socket.gethostname()}:{os.getpid()}"
 
-    def active(self) -> dict[str, str]:
+    def active(self, *, reap_expired: bool = True) -> dict[str, str]:
         out: dict[str, str] = {}
-        for p in self.dir().glob("*.lease"):
+        directory = Path(self.root) / ".benchsmith" / "leases"
+        if not directory.is_dir():
+            if not reap_expired:
+                return out
+            directory = self.dir()
+        for p in directory.glob("*.lease"):
             try:
                 doc = json.loads(p.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
             if float(doc.get("expires", 0)) > self._now():
                 out[p.stem] = str(doc.get("owner") or "?")
-            else:
-                # An expired lease is not a claim. Reap it so a crashed worker
-                # does not park a task forever.
+            elif reap_expired:
                 p.unlink(missing_ok=True)
         return out
 

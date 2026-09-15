@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 # https://codimango.internalmeta.com/submissions/210976?jobId=...&trialId=...
@@ -28,10 +29,49 @@ FROZEN = {"accepted", "used_in_training"}
 
 AWAITING_REVIEW = {
     "needs_reviewers_assigned": "submitted; waiting for a reviewer to be assigned",
-    "being_reviewed": "a reviewer has it now",
+    "being_reviewed": "a reviewer holds it",
     "accepted": "accepted",
     "used_in_training": "accepted and already in training",
 }
+WORK_STATUSES = frozenset({"draft", "needs_revision", "unregistered"})
+
+
+@dataclass(frozen=True)
+class Decision:
+    eligible: bool
+    reason: str
+
+    def as_dict(self) -> dict:
+        return {"eligible": self.eligible, "reason": self.reason}
+
+
+def work_eligibility(status: str) -> Decision:
+    value = str(status or "")
+    if value in WORK_STATUSES:
+        return Decision(True, "task owner has remaining work")
+    if value in AWAITING_REVIEW:
+        return Decision(False, AWAITING_REVIEW[value])
+    return Decision(False, f"unrecognised status {value!r}; work eligibility is unknown")
+
+
+def publication_eligibility(
+    status: str, *, allow_review_status: str = ""
+) -> Decision:
+    value = str(status or "")
+    if value in FROZEN:
+        return Decision(False, f"{value}: finished tasks are frozen")
+    if value in AWAITING_REVIEW:
+        if allow_review_status and allow_review_status == value:
+            return Decision(True, f"explicit override names current status {value}")
+        return Decision(
+            False,
+            f"{AWAITING_REVIEW[value]}; wait for the verdict. If it becomes "
+            "needs_revision, the loop resumes on its own",
+        )
+    if value in WORK_STATUSES:
+        return Decision(True, "task status permits publication")
+    return Decision(False, f"unrecognised status {value!r}; publication is refused")
+
 
 URL_ID = re.compile(r"/submissions/(\d+)")
 BARE_ID = re.compile(r"^\d+$")
@@ -259,6 +299,8 @@ def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = No
                     "owner": "",
                     "reviewer": False,
                     "mode": "harden",
+                    "workEligibility": work_eligibility("unregistered").as_dict(),
+                    "publicationEligibility": publication_eligibility("unregistered").as_dict(),
                     "note": ("not on the platform yet: it exists only in this checkout. There are "
                              "no measurements to read — author it, gate it, and push it before "
                              "expecting a bar."),
@@ -274,10 +316,11 @@ def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = No
     # Ownership is answered here too, so a single-task invocation cannot quietly
     # start work on somebody else's task.
     owned = hit.get("currentUserIsTaskOwner")
+    status = str(hit.get("status") or "")
     return {
         "task": name,
         "id": str(hit.get("id") or ""),
-        "status": str(hit.get("status") or ""),
+        "status": status,
         "validation": str(hit.get("validationStatus") or ""),
         "sha": str(hit.get("validationCommitSha") or hit.get("commitSha") or ""),
         "repo": repos[0] if repos else None,
@@ -287,10 +330,12 @@ def resolve(ref: str, *, binary: str = "codimango", roots: list[str] | None = No
         "owned": owned is not False,
         "owner": str(hit.get("importedBy") or ""),
         "reviewer": bool(hit.get("currentUserIsReviewer")),
-        "mode": ("wait" if str(hit.get("status")) in AWAITING_REVIEW
-                 else "repair" if str(hit.get("status")) == "needs_revision" else "harden"),
-        "awaitingReview": str(hit.get("status")) in AWAITING_REVIEW,
-        "awaitingReason": AWAITING_REVIEW.get(str(hit.get("status")), ""),
+        "mode": ("wait" if status in AWAITING_REVIEW
+                 else "repair" if status == "needs_revision" else "harden"),
+        "awaitingReview": status in AWAITING_REVIEW,
+        "awaitingReason": AWAITING_REVIEW.get(status, ""),
+        "workEligibility": work_eligibility(status).as_dict(),
+        "publicationEligibility": publication_eligibility(status).as_dict(),
         "registered": True,
         "kind": "task",
     }
