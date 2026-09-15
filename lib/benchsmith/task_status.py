@@ -50,6 +50,7 @@ _HIDDEN_TABLE_STATUSES = frozenset(
         "terminal: training",
         "platform: being reviewed",
         "awaiting reviewers",
+        AWAITING_HUMAN_REVIEW,
         "held: preserved original",
         "intake: killed",
         "no change",
