@@ -176,6 +176,13 @@ exact bytes are immutable at `.benchsmith/fleet/history/task-status-r<revision>.
 mutable current path. The versioned JSON row store remains beside them. Never reconstruct the table
 from prose or repost the file merely because you polled again.
 
+**The live-table artifact is root-session-owned.** Only the coordinator/root session may create or
+version the Agentcloud artifact shown in its chat. A worker, critic, or subagent must never publish
+that artifact and return its URL to the parent: artifacts are session-scoped, so the parent can link
+a child-owned version that its own artifact dock cannot read. If an artifact must be rotated, create
+the replacement directly in the same root session; do not delegate publication or switch storage
+formats as a workaround.
+
 **The queue, when you first read it and whenever it changes.** `queue` returns a `brief` — tasks
 grouped by tier, in priority order, with reviewer-held ones counted at the end — and a `changed`
 flag with a `changeBrief` naming exactly what moved:
