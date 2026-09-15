@@ -55,7 +55,7 @@ def current(repo, *, remote: str = "origin") -> dict:
     info = _parse(_git(repo, "show", "-s", "--format=%B", sha).stdout)
     until = int(info.get("until") or 0)
     if until and time.time() > until:
-        return {"readable": True, "held": False, "expired": info,
+        return {"readable": True, "held": False, "sha": sha, "expired": info,
                 "reason": "the hold has expired"}
     return {"readable": True, "held": True, "sha": sha, "holder": info.get("holder", "?"),
             "host": info.get("host", "?"), "why": (info.get("why") or "").replace("_", " "),
@@ -78,8 +78,10 @@ def take(repo, *, why: str = "", minutes: int = DEFAULT_MINUTES,
     tok = _git(repo, "commit-tree", tree, "-m", msg).stdout.strip()
     if not tok:
         return {"taken": False, "reason": "could not create the hold token"}
-    # A hold that never expires is a hold somebody forgets to release.
-    result = remote_ref.update(repo, remote, REF, tok)
+    # A live token must not be replaced. An expired token is replaced with a
+    # compare-and-swap so another claimant cannot win between current() and push.
+    expected = str(now.get("sha") or "") or None
+    result = remote_ref.update(repo, remote, REF, tok, expected=expected)
     if result["state"] != remote_ref.CONFIRMED:
         return {"taken": False, "reason": result["detail"], "reconciliation": result}
     return {"taken": True, "minutes": minutes, "why": why, "token": tok,
