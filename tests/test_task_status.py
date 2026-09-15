@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -240,6 +241,43 @@ class TaskStatusTableTest(unittest.TestCase):
             / "task-status-r1.md",
         )
         self.assertFalse((rerouted_root / status.STATE_DIR).exists())
+
+    def test_explicit_status_root_is_independent_of_cwd(self):
+        worker = self.root / "worker-cwd"
+        worker.mkdir()
+        status_root = self.root / "canonical-status"
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        previous = Path.cwd()
+        try:
+            os.chdir(elsewhere)
+            result = status.update(
+                worker,
+                {"task": "task-cwd", "status": status.NEXT_IN_QUEUE},
+                status_repo=status_root,
+            )
+        finally:
+            os.chdir(previous)
+
+        self.assertTrue(Path(result["statePath"]).is_relative_to(status_root))
+        self.assertFalse((elsewhere / status.STATE_DIR).exists())
+        self.assertFalse((worker / status.STATE_DIR).exists())
+
+    def test_guard_refusal_prevents_status_write(self):
+        status_root = self.root / "guarded-status"
+
+        def stale():
+            raise ValueError("stale controller epoch")
+
+        with self.assertRaisesRegex(ValueError, "stale controller epoch"):
+            status.update_many(
+                self.root,
+                [{"task": "guarded", "status": status.NEXT_IN_QUEUE}],
+                status_repo=status_root,
+                guard=stale,
+            )
+
+        self.assertFalse((status_root / status.STATE_DIR / status.STATE_FILE).exists())
 
     def test_markdown_escapes_cells_and_keeps_links_clickable(self):
         update = status.update(
@@ -512,7 +550,15 @@ class TaskStatusTableTest(unittest.TestCase):
         saved_resolve = cli.resolve_mod.resolve
         saved_run = cli.dispatch_mod.run
         saved_capability = cli.passatk_mod.capability
+        saved_admit = cli.controller_mod.admit
+        saved_fence = cli.controller_mod.write_fence
+        saved_target = cli.controller_mod.verify_target
         try:
+            cli.controller_mod.admit = lambda *args, **kwargs: {"ok": True}
+            cli.controller_mod.write_fence = lambda *args, **kwargs: nullcontext(
+                {"ok": True}
+            )
+            cli.controller_mod.verify_target = lambda *args, **kwargs: {"ok": True}
             cli.sources.discover = lambda **kwargs: {"tasks": task_rows, "notes": []}
             cli.resolve_mod.resolve = lambda task, rows=None: {
                 "task": task,
@@ -542,6 +588,11 @@ class TaskStatusTableTest(unittest.TestCase):
                 code = cli.cmd_fleet(
                     SimpleNamespace(
                         repo=str(self.root),
+                        status_repo=str(self.root),
+                        session_id="controller-session",
+                        controller_epoch="controller-epoch",
+                        container_canary_image="canary",
+                        min_free_gb=25.0,
                         gsd_project="",
                         workers=1,
                         no_gsd=True,
@@ -558,6 +609,9 @@ class TaskStatusTableTest(unittest.TestCase):
             cli.resolve_mod.resolve = saved_resolve
             cli.dispatch_mod.run = saved_run
             cli.passatk_mod.capability = saved_capability
+            cli.controller_mod.admit = saved_admit
+            cli.controller_mod.write_fence = saved_fence
+            cli.controller_mod.verify_target = saved_target
         self.assertEqual(code, 0)
         payload = json.loads(output.getvalue())
         self.assertTrue(payload["taskStatus"]["changed"])
@@ -594,7 +648,15 @@ class TaskStatusTableTest(unittest.TestCase):
         saved_resolve = cli.resolve_mod.resolve
         saved_run = cli.dispatch_mod.run
         saved_capability = cli.passatk_mod.capability
+        saved_admit = cli.controller_mod.admit
+        saved_fence = cli.controller_mod.write_fence
+        saved_target = cli.controller_mod.verify_target
         try:
+            cli.controller_mod.admit = lambda *args, **kwargs: {"ok": True}
+            cli.controller_mod.write_fence = lambda *args, **kwargs: nullcontext(
+                {"ok": True}
+            )
+            cli.controller_mod.verify_target = lambda *args, **kwargs: {"ok": True}
             cli.sources.discover = lambda **kwargs: {"tasks": task_rows, "notes": []}
             cli.resolve_mod.resolve = lambda task, rows=None: {
                 "task": task,
@@ -618,6 +680,11 @@ class TaskStatusTableTest(unittest.TestCase):
                 code = cli.cmd_fleet(
                     SimpleNamespace(
                         repo=str(self.root),
+                        status_repo=str(self.root),
+                        session_id="controller-session",
+                        controller_epoch="controller-epoch",
+                        container_canary_image="canary",
+                        min_free_gb=25.0,
                         gsd_project="",
                         workers=1,
                         no_gsd=True,
@@ -634,6 +701,9 @@ class TaskStatusTableTest(unittest.TestCase):
             cli.resolve_mod.resolve = saved_resolve
             cli.dispatch_mod.run = saved_run
             cli.passatk_mod.capability = saved_capability
+            cli.controller_mod.admit = saved_admit
+            cli.controller_mod.write_fence = saved_fence
+            cli.controller_mod.verify_target = saved_target
 
         self.assertEqual(code, 0)
         payload = json.loads(output.getvalue())

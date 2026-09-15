@@ -24,6 +24,7 @@ from . import ideas as ideas_mod
 from . import preflight as preflight_mod
 from . import backoff as backoff_mod
 from . import config as config_mod
+from . import controller as controller_mod
 from . import coverage
 from . import critic_receipt as critic_mod
 from . import controls as controls_mod
@@ -84,10 +85,15 @@ def _status_updates(
     *,
     status_repo=None,
     announce: bool = True,
+    guard=None,
 ) -> dict:
     try:
         return task_status_mod.update_many(
-            repo, patches, status_repo=status_repo, announce=announce
+            repo,
+            patches,
+            status_repo=status_repo,
+            announce=announce,
+            guard=guard,
         )
     except Exception as error:  # noqa: BLE001 - surfaced alongside the real result
         return {
@@ -115,6 +121,37 @@ def cmd_preflight(args) -> int:
     else:
         print(preflight_mod.render(result))
     return 0 if result["ok"] else 1
+
+
+def cmd_controller(args) -> int:
+    """Acquire and verify the fenced fleet-controller epoch."""
+    repo = Path(args.repo).resolve()
+    status_repo = Path(args.status_repo).resolve()
+    if args.action == "acquire":
+        result = controller_mod.acquire(
+            repo,
+            status_repo,
+            args.session_id,
+            ttl_seconds=args.ttl_sec,
+        )
+    elif args.action == "renew":
+        result = controller_mod.renew(
+            repo,
+            status_repo,
+            args.session_id,
+            args.epoch,
+            ttl_seconds=args.ttl_sec,
+        )
+    elif args.action == "verify":
+        result = controller_mod.verify(
+            repo, status_repo, args.session_id, args.epoch
+        )
+    else:
+        result = controller_mod.release(
+            repo, status_repo, args.session_id, args.epoch
+        )
+    _out(result)
+    return 0
 
 
 def cmd_probe(args) -> int:
@@ -486,12 +523,60 @@ def cmd_resolve(args) -> int:
 
 
 def cmd_fleet(args) -> int:
-    """The whole coordinator in one call: discover, order, dispatch.
+    """Plan freely; apply only inside one verified controller epoch."""
+    repo = Path(args.repo).resolve() if args.repo else Path.cwd().resolve()
+    status_repo_value = str(
+        getattr(args, "status_repo", "")
+        or os.environ.get("BENCHSMITH_STATUS_ROOT", "")
+    ).strip()
+    status_repo = (
+        Path(status_repo_value).expanduser().resolve()
+        if status_repo_value
+        else repo
+    )
+    if not args.apply:
+        return _cmd_fleet(args, repo, status_repo, None, 0.0)
+    if not status_repo_value:
+        raise controller_mod.ControllerRefused(
+            "fleet --apply requires --status-repo or BENCHSMITH_STATUS_ROOT"
+        )
+    session_id = str(
+        getattr(args, "session_id", "")
+        or os.environ.get("BENCHSMITH_CONTROLLER_SESSION", "")
+    ).strip()
+    controller_epoch = str(
+        getattr(args, "controller_epoch", "")
+        or os.environ.get("BENCHSMITH_CONTROLLER_EPOCH", "")
+    ).strip()
+    canary_image = str(
+        getattr(args, "container_canary_image", "")
+        or os.environ.get("BENCHSMITH_CANARY_IMAGE", "")
+    ).strip()
+    min_free_gb = float(
+        getattr(args, "min_free_gb", controller_mod.DEFAULT_MIN_FREE_GB)
+    )
+    admission = controller_mod.admit(
+        repo,
+        status_repo,
+        session_id,
+        controller_epoch,
+        canary_image=canary_image,
+        min_free_gb=min_free_gb,
+    )
+    with controller_mod.write_fence(
+        repo, status_repo, session_id, controller_epoch
+    ):
+        return _cmd_fleet(args, repo, status_repo, admission, min_free_gb)
 
-    Plans by default. `--apply` is the only thing that starts a worker, so the
-    same command can always be run first to see what it would do.
-    """
-    repo = Path(args.repo).resolve() if args.repo else Path.cwd()
+
+def _cmd_fleet(
+    args,
+    repo: Path,
+    status_repo: Path,
+    admission: dict | None,
+    min_free_gb: float,
+) -> int:
+    """Discover, dispatch, bind, and persist while the caller holds the fence."""
     cfg = config_mod.load(repo, project_id=args.gsd_project)
     journals, leases = read_journals(repo), Leases(repo).active()
 
@@ -547,7 +632,7 @@ def cmd_fleet(args) -> int:
         return _lease_states[target_repo]
 
     plans, started = [], []
-    run_dir = repo / ".benchsmith" / "fleet"
+    run_dir = status_repo / ".benchsmith" / "fleet"
     claimed: list = []
     table_update = None
     announce_status = False
@@ -599,7 +684,8 @@ def cmd_fleet(args) -> int:
                         "collect",
                         str(plan.get("workItem") or plan.get("task") or ""),
                         mode=str(plan.get("mode") or ""),
-                        state=("failed" if plan.get("ok") is False or not plan.get("session")
+                        state=("blocked" if plan.get("indeterminate") else
+                               "failed" if plan.get("ok") is False or not plan.get("session")
                                else "blocked"),
                         detail=str(
                             plan.get("skipped")
@@ -637,7 +723,10 @@ def cmd_fleet(args) -> int:
         except OSError:
             pass
         update = _status_updates(
-            repo, _fleet_status_patches(), status_repo=repo, announce=announce_status
+            repo,
+            _fleet_status_patches(),
+            status_repo=status_repo,
+            announce=announce_status,
         )
         if table_update is None or update.get("changed") or update.get("error"):
             table_update = update
@@ -670,6 +759,8 @@ def cmd_fleet(args) -> int:
                 plans.append({"task": item.task, "skipped": native["reason"],
                               "state": native["state"], "capability": native})
                 continue
+        if args.apply:
+            controller_mod.verify_target(target, min_free_gb=min_free_gb)
         # Its own working tree, or eight workers share one index and stage over
         # each other long before anything reaches a remote.
         # Claim the task across hosts before spending a worker on it. A local
@@ -716,7 +807,7 @@ def cmd_fleet(args) -> int:
                  "taskId": str(info.get("id") or ""),
                  "repo": target, "worktree": work_in if work_in != target else None,
                  "mode": mode, "sha": str(info.get("sha") or ""),
-                 "validation": str(info.get("validation") or ""), "statusRepo": str(repo)}
+                 "validation": str(info.get("validation") or ""), "statusRepo": str(status_repo)}
         if lease is not None:
             entry["remoteLease"] = lease.ref
         if mode == "scaffold":
@@ -724,7 +815,21 @@ def cmd_fleet(args) -> int:
             entry["proposedName"] = name
             entry["title"] = info.get("title", "")[:90]
         if args.apply:
-            res = dispatch_mod.run(p, apply=True)
+            try:
+                res = dispatch_mod.run(p, apply=True)
+            except Exception:
+                if Path(work_in).resolve() != Path(target).resolve():
+                    try:
+                        wt_mod.release(Path(target), name)
+                    except Exception:  # noqa: BLE001 - preserve the dispatch failure
+                        pass
+                if lease is not None:
+                    try:
+                        lease.release()
+                    except Exception:  # noqa: BLE001 - preserve the dispatch failure
+                        pass
+                    claimed = [c for c in claimed if c[1] != item.task]
+                raise
             # The session id is the only thing that makes a dispatch followable.
             # Returning the raw stdout and leaving the caller to dig it out is
             # how a supervisor loses track of a worker it started.
@@ -737,7 +842,16 @@ def cmd_fleet(args) -> int:
             if sid and not args.no_snooze:
                 entry["snoozed"] = dispatch_mod.snooze(sid)["snoozed"]
             if not sid:
-                entry["warning"] = "started but returned no session id; it cannot be followed"
+                if res.get("ok"):
+                    entry["indeterminate"] = True
+                    entry["warning"] = (
+                        "worker creation reported success without a session id; "
+                        "lease and worktree retained for reconciliation"
+                    )
+                else:
+                    entry["warning"] = (
+                        "worker creation failed without a session id"
+                    )
             entry["error"] = res.get("error") or (res.get("stderr") or "")[:200] or None
             print(f"[{n}/{len(ready)}] {item.task}: started {sid or '(no session id)'}",
                   file=sys.stderr, flush=True)
@@ -748,7 +862,7 @@ def cmd_fleet(args) -> int:
                         sid,
                         work_in,
                         name,
-                        status_repo=str(repo),
+                        status_repo=str(status_repo),
                         submission_id=str(info.get("id") or ""),
                     )
                     entry["leaseBinding"] = lifecycle
@@ -766,7 +880,7 @@ def cmd_fleet(args) -> int:
                             name,
                             sid,
                             "",
-                            status_repo=str(repo),
+                            status_repo=str(status_repo),
                             submission_id=str(info.get("id") or ""),
                         )
                     except OSError as error:
@@ -782,7 +896,7 @@ def cmd_fleet(args) -> int:
                             sid,
                             lease.sha if lease is not None else "",
                             lease.task if lease is not None else name,
-                            status_repo=str(repo),
+                            status_repo=str(status_repo),
                             submission_id=str(info.get("id") or ""),
                         )
                     except OSError as error:
@@ -793,7 +907,10 @@ def cmd_fleet(args) -> int:
                 claimed = [c for c in claimed if c[1] != item.task]
                 started.append({"task": item.task, "session": sid})
             elif lease is not None:
-                lease.release()
+                if entry.get("indeterminate"):
+                    claimed = [c for c in claimed if c[1] != item.task]
+                else:
+                    lease.release()
         else:
             entry["shell"] = p.shell
         plans.append(entry)
@@ -812,6 +929,8 @@ def cmd_fleet(args) -> int:
                "workersPerRepo": by_repo,
                "selected": [p["task"] for p in plans if "skipped" not in p],
                "started": started, "plans": plans, "notes": raw.get("notes") or []}
+    if admission is not None:
+        payload["admission"] = admission
     if needs_board:
         payload["needsGsdBoard"] = needs_board
     if clamp_note:
@@ -822,7 +941,10 @@ def cmd_fleet(args) -> int:
     _persist()
     if args.apply:
         payload["taskStatus"] = table_update or _status_updates(
-            repo, _fleet_status_patches(), status_repo=repo, announce=True
+            repo,
+            _fleet_status_patches(),
+            status_repo=status_repo,
+            announce=True,
         )
     # Anything claimed but never dispatched is released. A lease and a worktree
     # held for a task nobody is working on strands that task from every other
@@ -840,7 +962,7 @@ def cmd_fleet(args) -> int:
     if not args.apply:
         payload["hint"] = "re-run with --apply to start these"
     _out(payload)
-    return 0
+    return 2 if any(plan.get("indeterminate") for plan in plans) else 0
 
 
 def cmd_scaffold(args) -> int:
@@ -1778,6 +1900,22 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_preflight)
 
+    s = sub.add_parser("controller", help="acquire or verify the fenced fleet controller")
+    s.add_argument("action", choices=("acquire", "renew", "verify", "release"))
+    s.add_argument("--repo", required=True, help="canonical task repository")
+    s.add_argument("--status-repo", required=True, help="canonical shared status root")
+    s.add_argument(
+        "--session-id",
+        default=os.environ.get("BENCHSMITH_CONTROLLER_SESSION", ""),
+    )
+    s.add_argument(
+        "--epoch", default=os.environ.get("BENCHSMITH_CONTROLLER_EPOCH", "")
+    )
+    s.add_argument(
+        "--ttl-sec", type=int, default=controller_mod.DEFAULT_TTL_SECONDS
+    )
+    s.set_defaults(fn=cmd_controller)
+
     s = sub.add_parser("probe", help="resolve the platform CLI surface")
     s.set_defaults(fn=cmd_probe)
 
@@ -2044,6 +2182,28 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("fleet", help="discover, order, and dispatch down the priority list")
     s.add_argument("--repo", default="", help="where journals and leases live (default: cwd)")
+    s.add_argument("--status-repo", default="", help="canonical shared task-status root; required with --apply")
+    s.add_argument(
+        "--session-id",
+        default=os.environ.get("BENCHSMITH_CONTROLLER_SESSION", ""),
+        help="exact fenced coordinator session; required with --apply",
+    )
+    s.add_argument(
+        "--controller-epoch",
+        default=os.environ.get("BENCHSMITH_CONTROLLER_EPOCH", ""),
+        help="controller epoch returned by `benchsmith controller acquire`",
+    )
+    s.add_argument(
+        "--container-canary-image",
+        default=os.environ.get("BENCHSMITH_CANARY_IMAGE", ""),
+        help="preloaded local image used for the real container-start admission canary",
+    )
+    s.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=controller_mod.DEFAULT_MIN_FREE_GB,
+        help="minimum free disk before any fleet side effect",
+    )
     s.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                    help=f"concurrent workers (default {DEFAULT_WORKERS}, clamped at {MAX_WORKERS})")
     s.add_argument("--gsd-project", default="")

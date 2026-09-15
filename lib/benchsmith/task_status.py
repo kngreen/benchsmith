@@ -14,9 +14,10 @@ import os
 import re
 import subprocess
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, ContextManager
 from urllib.parse import quote
 
 SCHEMA_VERSION = 1
@@ -489,6 +490,7 @@ def update_many(
     status_repo: str | Path | None = None,
     now: datetime | float | int | str | None = None,
     announce: bool = True,
+    guard: Callable[[], ContextManager[object]] | None = None,
 ) -> dict:
     state_path, markdown_path, lock_path = paths(
         repo, task=task, status_repo=status_repo
@@ -496,7 +498,7 @@ def update_many(
     announced_path = state_path.parent / ANNOUNCED_FILE
     changed_tasks: list[str] = []
     changed_rows: list[dict] = []
-    with _locked(lock_path):
+    with (guard() if guard is not None else nullcontext()), _locked(lock_path):
         document = _load(state_path)
         rows = document["rows"]
         stamp = _timestamp(now)
