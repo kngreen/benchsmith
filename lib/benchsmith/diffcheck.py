@@ -52,9 +52,11 @@ CODE_SUFFIXES = SCRIPT_SUFFIXES | frozenset({
     ".sh", ".swift",
 })
 PATCH_DATA_SUFFIXES = frozenset({
-    ".css", ".csv", ".diff", ".golden", ".html", ".json", ".md", ".out",
-    ".patch", ".snap", ".toml", ".txt", ".xml", ".yaml", ".yml",
+    ".b64", ".bin", ".css", ".csv", ".diff", ".golden", ".gz", ".html",
+    ".json", ".md", ".out", ".patch", ".snap", ".tar", ".tgz", ".toml",
+    ".txt", ".xml", ".yaml", ".yml", ".zip",
 })
+DIRECT_TEST_ASSET_NAMES = frozenset({"dockerfile"})
 
 # Tokens that turn a failing assertion into a passing one.
 WEAKEN_TOKENS = [
@@ -677,9 +679,15 @@ def _test_named_source(path: str) -> bool:
 
 
 def _looks_like_test_source(path: str) -> bool:
+    candidate = Path(path)
+    if (
+        candidate.name.lower() in DIRECT_TEST_ASSET_NAMES
+        or candidate.suffix.lower() in PATCH_DATA_SUFFIXES
+    ):
+        return False
     return bool(
         GRADED.search(path)
-        or "__tests__" in Path(path).parts
+        or "__tests__" in candidate.parts
         or _test_named_source(path)
     )
 

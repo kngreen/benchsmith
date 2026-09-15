@@ -267,6 +267,24 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
                 self._git("reset", "-q", "--hard")
                 self._git("clean", "-qfd")
 
+    def test_direct_verifier_environment_assets_are_not_graded_sources(self) -> None:
+        cases = {
+            "task/tests/Dockerfile": "FROM python:3.12-slim\n",
+            "task/tests/ollo-repo.tar.gz.b64": "Y2xlYW4tc25hcHNob3Q=\n",
+        }
+        for relative, content in cases.items():
+            with self.subTest(path=relative):
+                source = self.repo / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(content)
+                self._git("add", "-A")
+                result = diffcheck.run(self.repo)
+                self.assertEqual(result["diff-ratchet"]["state"], "NOT_RUN")
+                self.assertEqual(result["diff-weakening"]["state"], "NOT_RUN")
+                self.assertFalse(result["diff-ratchet"]["applicable"])
+                self._git("reset", "-q", "--hard")
+                self._git("clean", "-qfd")
+
     def test_direct_unsupported_test_source_is_not_misclassified_as_docs(self) -> None:
         for relative in (
             "task/tests/AuthSpec.scala",
