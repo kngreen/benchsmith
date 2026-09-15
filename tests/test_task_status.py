@@ -80,6 +80,30 @@ class TaskStatusTableTest(unittest.TestCase):
         self.assertEqual(row["updatedAt"], "2026-09-15T03:04:05Z")
         self.assertEqual(row["validation"], "passing")
 
+    def test_render_hides_terminal_history_but_keeps_actionable_rows(self):
+        document = {
+            "rows": {
+                "active": {"task": "active", "status": status.REVISION_HARDENING},
+                "accepted": {"task": "accepted", "status": "terminal: accepted"},
+                "training": {"task": "training", "status": "terminal: training"},
+                "reviewed": {
+                    "task": "reviewed",
+                    "status": "platform: being reviewed",
+                },
+                "unassigned": {
+                    "task": "unassigned",
+                    "status": "awaiting reviewers",
+                },
+            }
+        }
+
+        markdown = status.render(document)
+
+        self.assertIn("active", markdown)
+        for hidden in ("accepted", "training", "reviewed", "unassigned"):
+            self.assertNotIn(f"| {hidden} |", markdown)
+        self.assertEqual(len(document["rows"]), 5)
+
     def test_each_semantic_revision_keeps_its_exact_markdown_snapshot(self):
         first = status.update(
             self.root,

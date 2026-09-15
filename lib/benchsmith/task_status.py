@@ -43,6 +43,15 @@ BLOCKED_INFRA = "blocked: infra"
 BLOCKED_HUMAN = "blocked: needs human"
 BLOCKED_WORKER = "blocked: worker failed"
 
+_HIDDEN_TABLE_STATUSES = frozenset(
+    {
+        "terminal: accepted",
+        "terminal: training",
+        "platform: being reviewed",
+        "awaiting reviewers",
+    }
+)
+
 ROW_FIELDS = (
     "task",
     "submissionId",
@@ -414,7 +423,11 @@ def _link(label: str, url: str) -> str:
 
 
 def render(document: dict) -> str:
-    rows = list((document.get("rows") or {}).values())
+    rows = [
+        row
+        for row in (document.get("rows") or {}).values()
+        if str(row.get("status") or "") not in _HIDDEN_TABLE_STATUSES
+    ]
     rows.sort(
         key=lambda row: (
             _STATUS_ORDER.get(str(row.get("status") or ""), 70),
