@@ -94,15 +94,31 @@ class TaskStatusTableTest(unittest.TestCase):
                     "task": "unassigned",
                     "status": "awaiting reviewers",
                 },
+                "preserved": {
+                    "task": "preserved",
+                    "status": "held: preserved original",
+                },
+                "killed": {"task": "killed", "status": "intake: killed"},
+                "unchanged": {"task": "unchanged", "status": "no change"},
+                "finished": {"task": "finished", "status": "worker: finished"},
             }
         }
 
         markdown = status.render(document)
 
         self.assertIn("active", markdown)
-        for hidden in ("accepted", "training", "reviewed", "unassigned"):
+        for hidden in (
+            "accepted",
+            "training",
+            "reviewed",
+            "unassigned",
+            "preserved",
+            "killed",
+            "unchanged",
+            "finished",
+        ):
             self.assertNotIn(f"| {hidden} |", markdown)
-        self.assertEqual(len(document["rows"]), 5)
+        self.assertEqual(len(document["rows"]), 9)
 
     def test_each_semantic_revision_keeps_its_exact_markdown_snapshot(self):
         first = status.update(
