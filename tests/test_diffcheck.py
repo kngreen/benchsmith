@@ -285,6 +285,18 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
                 self._git("reset", "-q", "--hard")
                 self._git("clean", "-qfd")
 
+    def test_task_local_benchsmith_control_is_not_a_graded_test_source(self) -> None:
+        source = self.repo / "task" / ".benchsmith" / "test_control_runner.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("raise SystemExit(run_control())\n")
+        self._git("add", "-A")
+
+        result = diffcheck.run(self.repo)
+
+        self.assertEqual(result["diff-ratchet"]["state"], "NOT_RUN")
+        self.assertEqual(result["diff-weakening"]["state"], "NOT_RUN")
+        self.assertFalse(result["diff-ratchet"]["applicable"])
+
     def test_direct_unsupported_test_source_is_not_misclassified_as_docs(self) -> None:
         for relative in (
             "task/tests/AuthSpec.scala",

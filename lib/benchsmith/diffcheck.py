@@ -681,7 +681,8 @@ def _test_named_source(path: str) -> bool:
 def _looks_like_test_source(path: str) -> bool:
     candidate = Path(path)
     if (
-        candidate.name.lower() in DIRECT_TEST_ASSET_NAMES
+        ".benchsmith" in candidate.parts
+        or candidate.name.lower() in DIRECT_TEST_ASSET_NAMES
         or candidate.suffix.lower() in PATCH_DATA_SUFFIXES
     ):
         return False
