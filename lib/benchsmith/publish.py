@@ -185,16 +185,218 @@ class Lane:
         }
 
 
+PUBLICATION_EVIDENCE_VERSION = 1
+
+
+def _compose_publication_evidence(
+    repo_root: Path,
+    task: str,
+    candidate_sha: str,
+    *,
+    authenticate_review: bool,
+    authenticate_hook: bool,
+    remote: str,
+    branch: str,
+) -> dict:
+    """Compose current exact-candidate evidence, optionally authenticating its transcript."""
+    from . import critic_receipt as critic_mod
+    from . import gate as gate_mod
+
+    ok, problem = gate_mod.verify_receipt(Path(repo_root), task)
+    if not ok:
+        raise PublishRefused(f"gate receipt is not valid for the candidate: {problem}")
+    gate_body, problem = gate_mod._receipt_body(Path(repo_root), task)
+    if gate_body is None:
+        raise PublishRefused(problem)
+    if str(gate_body.get("head") or "") != candidate_sha:
+        raise PublishRefused("gate receipt is for another candidate SHA")
+    hook_proof = gate_body.get("repositoryHook") or {}
+    if authenticate_hook:
+        hook = gate_mod.authenticate_live_hook(
+            Path(repo_root), task, gate_body, remote=remote, branch=branch
+        )
+        if not hook.get("ok"):
+            raise PublishRefused(
+                "live pre-push hook authentication failed: "
+                + str(hook.get("reason") or "unknown")
+            )
+        hook_proof = hook["proof"]
+
+    review_body, problem = critic_mod.load(Path(repo_root), task, candidate_sha)
+    if review_body is None:
+        raise PublishRefused(problem)
+    if authenticate_review:
+        review_body, problem = critic_mod.verify_live(
+            Path(repo_root), task, candidate_sha, review_body
+        )
+        if review_body is None:
+            raise PublishRefused(f"critic receipt is not authenticated: {problem}")
+    canonical = review_body.get("canonical_review") or {}
+    if canonical.get("decision") != "Accept":
+        raise PublishRefused("canonical review did not accept the exact candidate")
+    if review_body.get("decision") != "Accept":
+        raise PublishRefused("critic review did not accept the exact candidate")
+
+    change = (gate_body.get("artifacts") or {}).get("changeEvidence")
+    if not isinstance(change, dict):
+        raise PublishRefused(
+            "gate receipt predates structured finding/lever evidence; re-run the gate"
+        )
+    levers = change.get("levers")
+    findings = change.get("findings")
+    if not isinstance(levers, list) or not all(isinstance(value, str) for value in levers):
+        raise PublishRefused("gate receipt lever evidence is malformed")
+    if not isinstance(findings, list) or not all(isinstance(value, dict) for value in findings):
+        raise PublishRefused("gate receipt finding evidence is malformed")
+
+    return {
+        "schema_version": PUBLICATION_EVIDENCE_VERSION,
+        "candidate_sha": candidate_sha,
+        "gate": {
+            "digest": str(gate_body["digest"]),
+            "hook_identity": hook_proof.get("identity"),
+        },
+        "reviews": {
+            "receipt_digest": str(review_body["digest"]),
+            "task_id": str(review_body.get("task_id") or ""),
+            "canonical": {
+                "name": str(canonical.get("name") or ""),
+                "decision": str(canonical.get("decision") or ""),
+            },
+            "critic": {
+                "version": str(review_body.get("critic_version") or ""),
+                "decision": str(review_body.get("decision") or ""),
+            },
+        },
+        "change": change,
+    }
+
+
+def publication_evidence(
+    repo_root: Path,
+    task: str,
+    candidate_sha: str,
+    *,
+    remote: str = "origin",
+    branch: str = "",
+) -> dict:
+    """Compose evidence after authenticating the terminal transcript and live hook."""
+    return _compose_publication_evidence(
+        repo_root,
+        task,
+        candidate_sha,
+        authenticate_review=True,
+        authenticate_hook=True,
+        remote=remote,
+        branch=branch,
+    )
+
+
+def verify_publication_evidence(
+    repo_root: Path,
+    task: str,
+    candidate_sha: str,
+    supplied: object,
+    *,
+    authenticate_review: bool = True,
+    authenticate_hook: bool = True,
+    remote: str = "origin",
+    branch: str = "",
+) -> dict:
+    """Require the typed handoff evidence to equal the current local receipts."""
+    if not isinstance(supplied, dict):
+        raise PublishRefused(
+            "legacy ready_to_publish handoff has no publication_evidence schema v1; "
+            "re-run the exact-SHA gate and reviews, then create a new handoff"
+        )
+    if supplied.get("schema_version") != PUBLICATION_EVIDENCE_VERSION:
+        raise PublishRefused(
+            "unsupported publication_evidence schema; regenerate it from current receipts"
+        )
+    if str(supplied.get("candidate_sha") or "") != candidate_sha:
+        raise PublishRefused("publication_evidence is for another candidate SHA")
+    expected = _compose_publication_evidence(
+        Path(repo_root),
+        task,
+        candidate_sha,
+        authenticate_review=authenticate_review,
+        authenticate_hook=authenticate_hook,
+        remote=remote,
+        branch=branch,
+    )
+    if supplied != expected:
+        raise PublishRefused(
+            "publication_evidence does not match the current exact-candidate gate/review receipts"
+        )
+    return expected
+
+
+def verify_handoff_evidence(
+    repo_root: Path,
+    task: str,
+    candidate_sha: str,
+    handoff: dict,
+    *,
+    authenticate_review: bool = True,
+    authenticate_hook: bool = True,
+    remote: str = "origin",
+    branch: str = "",
+) -> dict:
+    evidence = verify_publication_evidence(
+        repo_root,
+        task,
+        candidate_sha,
+        handoff.get("publication_evidence"),
+        authenticate_review=authenticate_review,
+        authenticate_hook=authenticate_hook,
+        remote=remote,
+        branch=branch,
+    )
+    marker = str(handoff.get("gate_receipt") or "")
+    gate_digest = str((evidence.get("gate") or {}).get("digest") or "")
+    if not marker:
+        raise PublishRefused("ready_to_publish handoff has no gate_receipt")
+    if marker not in {gate_digest, f"sha256:{gate_digest}"}:
+        raise PublishRefused("handoff gate_receipt does not match publication_evidence")
+    if handoff.get("change_evidence") != evidence.get("change"):
+        raise PublishRefused(
+            "handoff change_evidence does not match the exact gate receipt"
+        )
+    submission_id = str(handoff.get("submission_id") or "")
+    reviewed_task_id = str((evidence.get("reviews") or {}).get("task_id") or "")
+    if submission_id and submission_id != reviewed_task_id:
+        raise PublishRefused(
+            "review receipt task_id does not match the handoff submission_id"
+        )
+    return evidence
+
+
+def _resolved_publication_target(
+    repo_root: Path, remote: str, branch: str
+) -> tuple[str, str]:
+    from . import gate as gate_mod
+
+    target = gate_mod.resolve_publication_target(
+        Path(repo_root), remote=remote, branch=branch
+    )
+    if not target.get("ok"):
+        raise PublishRefused(str(target.get("reason") or "publication target is unreadable"))
+    if not target.get("configured"):
+        raise PublishRefused("no publication remote or target branch is configured")
+    return str(target["remote"]), str(target["branch"])
+
+
 def inspect_candidate(
     repo_root: Path,
     task: str,
     handoff: dict,
     *,
     remote: str = "origin",
-    branch: str = "main",
+    branch: str = "",
     git=_git,
 ) -> dict:
     """Prove candidate scope and classify exact-tip publication without mutation."""
+    remote, branch = _resolved_publication_target(repo_root, remote, branch)
     if str(handoff.get("state")) != "ready_to_publish":
         raise PublishRefused(
             f"handoff state is {handoff.get('state')!r}, not ready_to_publish"
@@ -215,18 +417,114 @@ def inspect_candidate(
     }
 
 
+def _prepare_rebase(
+    repo_root: Path,
+    task: str,
+    proof,
+    *,
+    commit_sha: str,
+    remote: str,
+    branch: str,
+    review_requests: dict,
+    git,
+) -> dict:
+    """Rebase and carry local receipts while the caller holds the repository lane."""
+    head = proof.remote_base_sha
+    result = git(
+        repo_root,
+        "rebase",
+        "--onto",
+        head,
+        proof.declared_base_sha,
+        proof.candidate_sha,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        git(repo_root, "rebase", "--abort")
+        raise PublishRefused(f"rebase onto {head[:8]} failed: {result.stderr.strip()[:200]}")
+    moved = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
+    git(repo_root, "checkout", "--detach", moved)
+    try:
+        carry_proof = candidate_mod.prove_carry(
+            repo_root,
+            task,
+            source_base=proof.declared_base_sha,
+            source_candidate=proof.candidate_sha,
+            target_base=head,
+            target_candidate=moved,
+            git=git,
+        )
+    except candidate_mod.CandidateTreeChanged:
+        return {
+            "state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
+            "onto": head, "needsRegate": True,
+            "detail": "rebased onto the new head and the task tree changed; re-gate this SHA",
+        }
+    except candidate_mod.CandidateRejected as error:
+        raise PublishRefused(f"rebased candidate stack is not publication-safe: {error}") from error
+
+    from . import critic_receipt as critic_mod
+    from . import gate as gate_mod
+
+    carried = gate_mod.carry_receipt(
+        repo_root,
+        task,
+        moved,
+        remote=remote,
+        branch=branch,
+        defer_hook=True,
+        expected_remote_sha=head,
+        review_requests=review_requests,
+    )
+    if not carried.get("ok"):
+        return {
+            "state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
+            "onto": head, "needsRegate": True,
+            "detail": "task tree is unchanged, but candidate receipt failed: "
+            f"{carried.get('reason', 'unknown')}",
+        }
+    carried_review = critic_mod.carry(repo_root, task, proof.candidate_sha, moved)
+    if not carried_review.get("ok"):
+        return {
+            "state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
+            "onto": head, "needsRegate": False, "needsReview": True,
+            "gateReceipt": carried["receipt"]["digest"],
+            "detail": "task tree is unchanged and gate evidence carried, but exact-SHA "
+            f"review evidence did not: {carried_review.get('reason', 'unknown')}",
+        }
+    receipt = carried["receipt"]["digest"]
+    return {
+        "state": "rebased", "task": task, "from": commit_sha, "newSha": moved,
+        "onto": head, "needsRegate": False, "taskTree": carry_proof.task_tree,
+        "gateReceipt": receipt,
+        "stackProof": carry_proof.as_dict(),
+        "handoffPatch": {
+            "base_sha": head, "commit_sha": moved,
+            "source_base_sha": proof.declared_base_sha,
+            "carried_from_sha": proof.candidate_sha,
+            "gate_receipt": receipt,
+        },
+        "detail": (
+            f"rebased onto {head[:8]}; old and current base task trees match, and the carried "
+            f"task tree is byte-identical ({carry_proof.task_tree[:12]}). Tree-invariant "
+            "evidence was carried and commit-relative controls reran."
+        ),
+    }
+
+
 def confirm_already_published(
     repo_root: Path,
     task: str,
     handoff: dict,
     *,
     remote: str = "origin",
-    branch: str = "main",
+    branch: str = "",
     lane: Lane | None = None,
     git=_git,
 ) -> dict:
     """Re-prove an exact-tip no-op and never fall through to a push."""
     repo_root = Path(repo_root)
+    remote, branch = _resolved_publication_target(repo_root, remote, branch)
     policy = _policy_identity()
     inspection = inspect_candidate(
         repo_root, task, handoff, remote=remote, branch=branch, git=git
@@ -256,7 +554,7 @@ def publish(
     handoff: dict,
     *,
     remote: str = "origin",
-    branch: str = "main",
+    branch: str = "",
     lane: Lane | None = None,
     apply: bool = False,
     git=_git,
@@ -268,6 +566,7 @@ def publish(
 ) -> dict:
     """Verify, claim the lane, record the intent, then push exactly once."""
     repo_root = Path(repo_root)
+    remote, branch = _resolved_publication_target(repo_root, remote, branch)
     lane = lane or Lane(repo_root)
 
     policy = _policy_identity()
@@ -285,28 +584,22 @@ def publish(
             lane=lane,
             git=git,
         )
-    if not handoff.get("gate_receipt"):
-        raise PublishRefused("no gate_receipt; an ungated commit may not be published")
-
-    def _verify_candidate_receipt() -> None:
+    def _cheap_revalidate_candidate_receipt() -> None:
+        verify_handoff_evidence(
+            repo_root,
+            task,
+            commit_sha,
+            handoff,
+            authenticate_review=False,
+            authenticate_hook=False,
+            remote=remote,
+            branch=branch,
+        )
         from . import gate as gate_mod
 
-        ok, why = gate_mod.verify_receipt(repo_root, task)
-        if not ok:
-            raise PublishRefused(f"gate receipt is not valid for the candidate: {why}")
         body, problem = gate_mod._receipt_body(repo_root, task)
         if body is None:
             raise PublishRefused(problem)
-        marker = str(handoff.get("gate_receipt") or "")
-        accepted = {
-            str(body["digest"]),
-            f"sha256:{body['digest']}",
-            str(gate_mod.receipt_path(repo_root, task)),
-        }
-        if marker not in accepted:
-            raise PublishRefused(
-                "handoff gate_receipt does not identify the verified receipt"
-            )
         carried_from = str(handoff.get("carried_from_sha") or "")
         if carried_from and str(body.get("derivedFrom") or "") != carried_from:
             raise PublishRefused(
@@ -318,18 +611,8 @@ def publish(
                 f"handoff commit is {commit_sha[:8]}, but the candidate HEAD is {current[:8]}"
             )
 
-    # Pushing to a task under review changes what the reviewer is looking at,
-    # and their findings then cite a revision that no longer exists. Refused on
-    # a positive read; noted, not blocked, when the platform cannot be reached,
-    # because a deadlock on every push while offline is worse than the risk.
     def _freeze_check(when: str) -> None:
-        """Fail closed. An unreadable status is not permission.
-
-        The earlier version noted the uncertainty and pushed anyway, reasoning
-        that deadlocking while offline was worse. It is not: a blocked push is
-        recoverable in a minute, and a push onto an accepted or training-used
-        task corrupts data that has already shipped. The asymmetry decides it.
-        """
+        """Fail closed when the task cannot be shown publication-eligible."""
         if not check_review:
             return
         from .resolve import publication_eligibility, resolve as _resolve
@@ -349,26 +632,118 @@ def publish(
         if not decision.eligible:
             raise PublishRefused(f"{task} is not publication-eligible: {decision.reason}")
 
-    _freeze_check("before publishing")
-    review_note = ""
+    def _reconcile_or_refuse() -> None:
+        pending = lane.reconcile(repo_root, git=git)
+        if pending["state"] in (LANDED, DIVERGED, UNKNOWN):
+            raise PublishRefused(
+                f"resolve the pending push first ({pending['state']}): {pending['detail']}"
+            )
 
-    pend = lane.reconcile(repo_root, git=git)
-    if pend["state"] in (LANDED, DIVERGED, UNKNOWN):
-        raise PublishRefused(
-            f"resolve the pending push first ({pend['state']}): {pend['detail']}"
-        )
-
-    if not lane.acquire(task):
+    def _acquire_or_refuse() -> None:
+        if lane.acquire(task):
+            return
         held = lane.holder() or {}
         raise PublishRefused(
-            f"the publication lane for this repository is held by {held.get('task', 'another task')}; "
-            "one publisher per repository is what keeps exact-head evidence valid"
+            f"the publication lane for this repository is held by "
+            f"{held.get('task', 'another task')}; one publisher per repository is what "
+            "keeps exact-head evidence valid"
         )
 
-    try:
-        inspection = inspect_candidate(
-            repo_root, task, handoff, remote=remote, branch=branch, git=git
+    review_note = ""
+    proof = inspection["proof"]
+    rebase_result = None
+    if proof.needs_rebase:
+        if not rebase:
+            raise PublishRefused(
+                f"the remote moved to {proof.remote_base_sha[:8]}, but the candidate stack is "
+                "task-only and the old and current remote task trees are byte-identical. "
+                "Re-run with rebase=True to move the commit onto it and carry only proven evidence."
+            )
+
+        from .reviews import requests as _review_requests
+
+        review_requests = _review_requests(task)
+        # Phase one fences every checkout and receipt mutation. Network-backed
+        # review state is snapshotted before the lane and compared after it.
+        _acquire_or_refuse()
+        try:
+            _reconcile_or_refuse()
+            fenced = inspect_candidate(
+                repo_root, task, handoff, remote=remote, branch=branch, git=git
+            )
+            fenced_proof = fenced["proof"]
+            if fenced["alreadyPublished"]:
+                return {
+                    "ok": True,
+                    "state": "already-published",
+                    "task": task,
+                    "commit": fenced_proof.candidate_sha,
+                    "stackProof": fenced_proof.as_dict(),
+                    "publishPolicyFingerprint": policy["digest"],
+                    "nextAction": "watch-exact-sha",
+                }
+            if (
+                not fenced_proof.needs_rebase
+                or fenced_proof.remote_base_sha != proof.remote_base_sha
+            ):
+                raise PublishRefused(
+                    "the remote moved while acquiring the rebase lane; release and retry"
+                )
+            _freeze_check("immediately before rebasing")
+            rebase_result = _prepare_rebase(
+                repo_root,
+                task,
+                fenced_proof,
+                commit_sha=commit_sha,
+                remote=remote,
+                branch=branch,
+                review_requests=review_requests,
+                git=git,
+            )
+        finally:
+            lane.release(task)
+
+        if rebase_result.get("needsRegate") or rebase_result.get("needsReview"):
+            return rebase_result
+        if _review_requests(task) != review_requests:
+            raise PublishRefused(
+                "review findings changed during the rebase phase; retry before publication"
+            )
+        commit_sha = str(rebase_result["newSha"])
+        handoff = {**handoff, **rebase_result["handoffPatch"]}
+
+        # Hook execution and transcript re-fetch happen with no repository lane.
+        evidence = publication_evidence(
+            repo_root, task, commit_sha, remote=remote, branch=branch
         )
+        rebase_result["publicationEvidence"] = evidence
+        rebase_result["handoffPatch"].update(
+            publication_evidence=evidence,
+            change_evidence=evidence["change"],
+        )
+        handoff.update(rebase_result["handoffPatch"])
+    else:
+        verify_handoff_evidence(
+            repo_root, task, commit_sha, handoff, remote=remote, branch=branch
+        )
+
+    # Phase two is short: reacquire, reconcile, re-read the remote and exact local
+    # evidence, then push. A move after phase one is a retry, never another rebase.
+    _acquire_or_refuse()
+
+    try:
+        _reconcile_or_refuse()
+        _freeze_check("inside the final publish lane")
+        try:
+            inspection = inspect_candidate(
+                repo_root, task, handoff, remote=remote, branch=branch, git=git
+            )
+        except PublishRefused as error:
+            if rebase_result is not None:
+                raise PublishRefused(
+                    "the remote moved between the rebase and publish phases; retry without pushing"
+                ) from error
+            raise
         proof = inspection["proof"]
         if inspection["alreadyPublished"]:
             return {
@@ -382,101 +757,18 @@ def publish(
             }
         head = proof.remote_base_sha
         if proof.needs_rebase:
-            if not rebase:
+            if rebase_result is not None:
                 raise PublishRefused(
-                    f"the remote moved to {head[:8]}, but the candidate stack is task-only and "
-                    "the old and current remote task trees are byte-identical. Re-run with "
-                    "rebase=True to move the commit onto it and carry only proven evidence."
+                    "the remote moved between the rebase and publish phases; retry without pushing"
                 )
-            rb = git(
-                repo_root,
-                "rebase",
-                "--onto",
-                head,
-                proof.declared_base_sha,
-                proof.candidate_sha,
-                timeout=600,
+            raise PublishRefused(
+                "the remote moved while the short publish lane was being acquired; "
+                "release and retry so rebase, hook execution, and review authentication "
+                "remain outside the lane"
             )
-            if rb.returncode != 0:
-                git(repo_root, "rebase", "--abort")
-                raise PublishRefused(
-                    f"rebase onto {head[:8]} failed: {rb.stderr.strip()[:200]}"
-                )
-            # First field only: a git wrapper that appends anything would
-            # otherwise put a ref name inside the SHA we publish.
-            moved = (git(repo_root, "rev-parse", "HEAD").stdout.split() or [""])[0]
-            git(repo_root, "checkout", "--detach", moved)
-
-            # Carrying evidence across a rewritten commit requires two independent
-            # byte proofs: the old base task equals the current remote task, and
-            # the old candidate task equals the rebased candidate task. Scope is
-            # checked over both stacks, not just over either tip commit.
-            try:
-                carry_proof = candidate_mod.prove_carry(
-                    repo_root,
-                    task,
-                    source_base=proof.declared_base_sha,
-                    source_candidate=proof.candidate_sha,
-                    target_base=head,
-                    target_candidate=moved,
-                    git=git,
-                )
-            except candidate_mod.CandidateTreeChanged:
-                return {
-                    "state": "rebased",
-                    "task": task,
-                    "from": commit_sha,
-                    "newSha": moved,
-                    "onto": head,
-                    "needsRegate": True,
-                    "detail": (
-                        "rebased onto the new head and the task tree changed, so the "
-                        "receipt no longer describes it. Re-gate this SHA."
-                    ),
-                }
-            except candidate_mod.CandidateRejected as error:
-                raise PublishRefused(
-                    f"rebased candidate stack is not publication-safe: {error}"
-                ) from error
-
-            from . import gate as gate_mod
-
-            carried = gate_mod.carry_receipt(repo_root, task, moved)
-            if not carried.get("ok"):
-                return {
-                    "state": "rebased",
-                    "task": task,
-                    "from": commit_sha,
-                    "newSha": moved,
-                    "onto": head,
-                    "needsRegate": True,
-                    "detail": f"task tree is unchanged, but candidate receipt failed: "
-                    f"{carried.get('reason', 'unknown')}",
-                }
-            receipt = carried["receipt"]["digest"]
-            return {
-                "state": "rebased",
-                "task": task,
-                "from": commit_sha,
-                "newSha": moved,
-                "onto": head,
-                "needsRegate": False,
-                "taskTree": carry_proof.task_tree,
-                "gateReceipt": receipt,
-                "stackProof": carry_proof.as_dict(),
-                "handoffPatch": {
-                    "base_sha": head,
-                    "commit_sha": moved,
-                    "source_base_sha": proof.declared_base_sha,
-                    "carried_from_sha": proof.candidate_sha,
-                    "gate_receipt": receipt,
-                },
-                "detail": (
-                    f"rebased onto {head[:8]}; old and current base task trees match, "
-                    f"and the carried task tree is byte-identical ({carry_proof.task_tree[:12]}). "
-                    "Tree-invariant evidence was carried and commit-relative controls reran."
-                ),
-            }
+        if rebase_result is not None and not apply:
+            _cheap_revalidate_candidate_receipt()
+            return rebase_result
 
         intent = Intent(
             task=task,
@@ -502,14 +794,12 @@ def publish(
             raise PublishRefused(
                 "publish policy changed during this attempt; reclassify the candidate"
             )
-        _verify_candidate_receipt()
+        _cheap_revalidate_candidate_receipt()
 
         # Written before the push, so a crash between here and the next line is
-        # recoverable rather than ambiguous.
-        # Rechecked here, inside the lane and immediately before the push. The
-        # first check happened before the lane was acquired and before a
-        # possible rebase; a task can be accepted in that window.
-        _freeze_check("immediately before the push")
+        # recoverable rather than ambiguous. Expensive transcript/hook work ran
+        # before the lane; inside it we only recheck local digests and remote
+        # coordination state.
         if check_hold:
             from .hold import current as _hold
 
@@ -537,6 +827,10 @@ def publish(
                 remote_lease.assert_owned()
             except Exception as error:  # the lease module supplies the precise cause
                 raise PublishRefused(f"remote lease is not owned: {error}") from error
+        # The live hook and both review receipts are mutable local evidence.
+        # Re-read them after every other pre-push check so a changed hook or
+        # overwritten receipt cannot race the actual push.
+        _cheap_revalidate_candidate_receipt()
         lane.record_intent(intent)
         try:
             pr = git(

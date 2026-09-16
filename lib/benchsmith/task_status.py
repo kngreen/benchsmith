@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Callable, ContextManager
 from urllib.parse import quote
 
+from .identifiers import VALIDATION_PASSING_STATES as _PASSING_VALIDATION
+from .identifiers import validate_sha, validate_task_path
+
 SCHEMA_VERSION = 1
 STATE_DIR = Path(".benchsmith") / "fleet"
 STATE_FILE = "task-status.json"
@@ -40,9 +43,25 @@ READY_GREEN = "ready to submit / green"
 VALIDATING = "validating"
 AWAITING_AGENTIC_REVIEW = "awaiting agentic review"
 AWAITING_HUMAN_REVIEW = "awaiting human review"
+MONITORING_EXTERNAL_UNKNOWN = "monitoring: external signal unknown"
 BLOCKED_INFRA = "blocked: infra"
 BLOCKED_HUMAN = "blocked: needs human"
 BLOCKED_WORKER = "blocked: worker failed"
+
+INTAKE_BLOCKING_STATUSES = frozenset({
+    READY_TO_PUBLISH,
+    VALIDATING,
+    AWAITING_AGENTIC_REVIEW,
+})
+INTAKE_HOLD_CLEARABLE_STATUSES = frozenset({
+    READY_TO_PUBLISH,
+    VALIDATING,
+    AWAITING_AGENTIC_REVIEW,
+    BLOCKED_INFRA,
+    MONITORING_EXTERNAL_UNKNOWN,
+})
+INTAKE_HOLD_CLEARED_SHA = "intakeHoldClearedSha"
+INTAKE_HOLD_CLEAR_REASON = "intakeHoldClearReason"
 
 _HIDDEN_TABLE_STATUSES = frozenset(
     {
@@ -79,13 +98,18 @@ _EVIDENCE_FIELDS = (
     "evidenceUrl",
     "evidenceLabel",
 )
-_STATE_FIELDS = ROW_FIELDS + ("statusSource", "statusSha")
+_CONTROL_FIELDS = (
+    INTAKE_HOLD_CLEARED_SHA,
+    INTAKE_HOLD_CLEAR_REASON,
+)
+_STATE_FIELDS = ROW_FIELDS + ("statusSource", "statusSha") + _CONTROL_FIELDS
 _SOURCE_PRIORITY = {
     "routing": 10,
     "worker": 20,
     "publish": 30,
     "platform": 40,
     "journal": 40,
+    "monitoring": 50,
     "manual": 50,
 }
 
@@ -98,6 +122,7 @@ _STATUS_ORDER = {
     AWAITING_HUMAN_REVIEW: 30,
     AWAITING_AGENTIC_REVIEW: 31,
     VALIDATING: 40,
+    MONITORING_EXTERNAL_UNKNOWN: 41,
     REVISION_REVIEW: 50,
     REVISION_DOCUMENTATION: 51,
     REVISION_HARDENING: 52,
@@ -113,7 +138,6 @@ _DOCUMENTATION = re.compile(
     r"\b(documentation|document|docs?|readme|prose|metadata|wording)\b",
     re.IGNORECASE,
 )
-_PASSING_VALIDATION = frozenset({"completed", "passed", "passing"})
 _INFRA_CLASSES = frozenset({"infra", "not-measured", "platform-stale"})
 
 
@@ -383,7 +407,10 @@ def _accept_evidence(old: dict, patch: dict) -> tuple[bool, bool, str, str]:
     )
     if old_sha and incoming_sha and incoming_sha != old_sha:
         return advances_candidate, advances_candidate, incoming_source, incoming_sha
-    accepted = _SOURCE_PRIORITY.get(incoming_source, 0) >= _SOURCE_PRIORITY.get(
+    accepted = (
+        old.get("status") == MONITORING_EXTERNAL_UNKNOWN
+        and incoming_source == "platform"
+    ) or _SOURCE_PRIORITY.get(incoming_source, 0) >= _SOURCE_PRIORITY.get(
         old_source, 0
     )
     return accepted, False, incoming_source, incoming_sha
@@ -402,12 +429,17 @@ def _normalise(old: dict, patch: dict) -> dict:
     if advances_candidate:
         for field in _EVIDENCE_FIELDS:
             merged[field] = ""
+        for field in _CONTROL_FIELDS:
+            merged[field] = ""
     for field in ROW_FIELDS:
         if field == "task" or field not in patch or patch[field] is None:
             continue
         if field in _EVIDENCE_FIELDS and not accepted:
             continue
         merged[field] = str(patch[field]).strip()
+    for field in _CONTROL_FIELDS:
+        if field in patch and patch[field] is not None:
+            merged[field] = str(patch[field]).strip()
     if touches_evidence and accepted:
         merged["statusSource"] = incoming_source
         merged["statusSha"] = incoming_sha
@@ -792,6 +824,44 @@ def transition_patch(
     else:
         raise StatusTableError(f"unknown task-status event {event!r}")
     return patch
+
+
+def clear_external_signal_hold(
+    repo: str | Path,
+    task: str,
+    sha: str,
+    reason: str,
+    *,
+    status_repo: str | Path | None = None,
+    apply: bool = False,
+) -> dict:
+    """Release one exact-SHA active lifecycle row from blocking fresh intake."""
+    task = validate_task_path(task)
+    sha = validate_sha(sha, "status-clear SHA")
+    if not str(reason or "").strip():
+        raise StatusTableError("status-clear requires a non-empty reason")
+    document = read(repo, task=task, status_repo=status_repo)
+    row = (document.get("rows") or {}).get(task)
+    if not isinstance(row, dict):
+        raise StatusTableError(f"no durable status row exists for {task}")
+    recorded_sha = str(row.get("statusSha") or row.get("sha") or "")
+    if recorded_sha != sha:
+        raise StatusTableError(
+            f"status-clear SHA {sha[:12]} does not match durable row {recorded_sha[:12] or 'missing'}"
+        )
+    if str(row.get("status") or "") not in INTAKE_HOLD_CLEARABLE_STATUSES:
+        raise StatusTableError(
+            f"status {row.get('status')!r} is not an active intake hold"
+        )
+    planned = {
+        "task": task,
+        INTAKE_HOLD_CLEARED_SHA: sha,
+        INTAKE_HOLD_CLEAR_REASON: str(reason).strip(),
+    }
+    if not apply:
+        return {"planned": planned, "applied": False}
+    result = update(repo, planned, task=task, status_repo=status_repo)
+    return {"ok": True, "applied": True, "task": task, "sha": sha, "taskStatus": result}
 
 
 def transition(

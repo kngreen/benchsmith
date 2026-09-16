@@ -32,6 +32,37 @@ class CandidateStackSafetyTest(unittest.TestCase):
         )
         self.safety_mock = self.safety.start()
         self.addCleanup(self.safety.stop)
+        self.publication_verifier = patch.object(
+            publish,
+            "verify_publication_evidence",
+            side_effect=lambda _repo, _task, sha, supplied, **_kwargs: {
+                "schema_version": 1,
+                "candidate_sha": sha,
+                "gate": {"digest": str((supplied or {}).get("gate", {}).get("digest") or "receipt")},
+                "reviews": {},
+                "change": {"mode": "harden", "levers": ["graded"], "findings": []},
+            },
+        )
+        self.publication_verifier.start()
+        self.addCleanup(self.publication_verifier.stop)
+        self.publication_builder = patch.object(
+            publish,
+            "publication_evidence",
+            side_effect=lambda _repo, _task, sha, **_kwargs: {
+                "schema_version": 1,
+                "candidate_sha": sha,
+                "gate": {"digest": gate._receipt_body(self.repo, "task-b")[0]["digest"]},
+                "reviews": {},
+                "change": {"mode": "harden", "levers": ["graded"], "findings": []},
+            },
+        )
+        self.publication_builder_mock = self.publication_builder.start()
+        self.addCleanup(self.publication_builder.stop)
+        self.review_carry = patch(
+            "benchsmith.critic_receipt.carry", return_value={"ok": True}
+        )
+        self.review_carry.start()
+        self.addCleanup(self.review_carry.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.remote = self.root / "remote.git"
@@ -164,7 +195,8 @@ class CandidateStackSafetyTest(unittest.TestCase):
                 check_hold=False,
             )
 
-        resolve_status.assert_called_once_with("task-b", roots=[str(self.repo)])
+        self.assertEqual(resolve_status.call_count, 1)
+        resolve_status.assert_called_with("task-b", roots=[str(self.repo)])
         self.assertFalse(result["applied"])
 
     def test_byte_identical_rebase_carries_receipt_with_explicit_tree_proof(self):
@@ -184,7 +216,183 @@ class CandidateStackSafetyTest(unittest.TestCase):
         self.git("push", "-q", "origin", "main")
         self.git("checkout", "-q", "candidate")
         handoff = self.handoff(source_candidate, self.base, receipt["digest"])
+        lane = publish.Lane(self.repo, run_id="rebase-phases")
+        review_fetch_lane_states = []
+        hook_review_auth_lane_states = []
+        build_evidence = self.publication_builder_mock.side_effect
 
+        def review_requests(*_args, **_kwargs):
+            review_fetch_lane_states.append(bool(lane.holder()))
+            return {"requests": []}
+
+        def publication_evidence(*args, **kwargs):
+            hook_review_auth_lane_states.append(bool(lane.holder()))
+            return build_evidence(*args, **kwargs)
+
+        self.publication_builder_mock.side_effect = publication_evidence
+        with (
+            patch("benchsmith.reviews.requests", side_effect=review_requests),
+            patch(
+                "benchsmith.gate.check_control_manifest",
+                side_effect=self.shadow_controls,
+            ),
+        ):
+            result = publish.publish(
+                self.repo,
+                "task-b",
+                handoff,
+                rebase=True,
+                lane=lane,
+                check_review=False,
+                check_hold=False,
+            )
+
+        self.assertEqual(result["state"], "rebased")
+        self.assertFalse(result["needsRegate"], result)
+        self.assertEqual(review_fetch_lane_states, [False, False])
+        self.assertEqual(hook_review_auth_lane_states, [False])
+        carried_receipt, problem = gate._receipt_body(self.repo, "task-b")
+        self.assertEqual(problem, "")
+        self.assertEqual(carried_receipt["repositoryHook"]["state"], "deferred")
+        self.assertEqual(result["onto"], remote_head)
+        self.assertEqual(result["stackProof"]["baseTaskTree"], self.tree(self.base, "task-b"))
+        self.assertEqual(result["taskTree"], self.tree(source_candidate, "task-b"))
+        carried = {**handoff, **result["handoffPatch"]}
+        proof = candidate.verify_handoff(self.repo, "task-b", carried)
+        self.assertEqual(proof.mode, "carry")
+        self.assertEqual(proof.source_base_sha, self.base)
+        self.assertEqual(proof.carried_from_sha, source_candidate)
+        self.assertEqual(proof.task_tree, self.tree(result["newSha"], "task-b"))
+
+    def test_another_lane_holder_prevents_rebase_or_worktree_mutation(self):
+        self.git("checkout", "-qb", "candidate", self.base)
+        source_candidate = self.commit(
+            "task-b/tests/test_task.py",
+            "def test_task():\n    assert 1 == 1\n",
+            "task B candidate",
+        )
+        receipt = gate.write_receipt(self.repo, "task-b", self.passing_report())
+        self.git("checkout", "-q", "main")
+        self.commit("task-a/instruction.md", "sibling\n", "sibling")
+        self.git("push", "-q", "origin", "main")
+        self.git("checkout", "-q", "candidate")
+        handoff = self.handoff(source_candidate, self.base, receipt["digest"])
+        lane = publish.Lane(self.repo, run_id="blocked-rebase")
+        self.assertTrue(lane.acquire("other-task"))
+        before_head = self.sha("HEAD")
+        before_status = self.git("status", "--porcelain").stdout
+
+        with self.assertRaisesRegex(publish.PublishRefused, "held by other-task"):
+            publish.publish(
+                self.repo,
+                "task-b",
+                handoff,
+                rebase=True,
+                lane=lane,
+                check_review=False,
+                check_hold=False,
+            )
+
+        self.assertEqual(self.sha("HEAD"), before_head)
+        self.assertEqual(self.git("status", "--porcelain").stdout, before_status)
+        self.assertEqual(lane.holder()["task"], "other-task")
+        lane.release("other-task")
+
+    def test_remote_move_between_rebase_phases_refuses_without_push(self):
+        self.git("checkout", "-qb", "candidate", self.base)
+        source_candidate = self.commit(
+            "task-b/tests/test_task.py",
+            "def test_task():\n    assert 1 == 1\n",
+            "task B candidate",
+        )
+        receipt = gate.write_receipt(self.repo, "task-b", self.passing_report())
+        self.git("checkout", "-q", "main")
+        remote_head = self.commit(
+            "task-a/instruction.md", "first sibling\n", "first sibling"
+        )
+        remote_later = self.commit(
+            "task-a/instruction.md", "second sibling\n", "second sibling"
+        )
+        self.git("push", "-q", "origin", f"{remote_head}:main")
+        self.git("checkout", "-q", "candidate")
+        handoff = self.handoff(source_candidate, self.base, receipt["digest"])
+        lane = publish.Lane(self.repo, run_id="two-phase")
+        publish_pushes = []
+
+        def authenticate(_repo, _task, sha, **_kwargs):
+            self.assertIsNone(lane.holder())
+            self.git("push", "-q", "origin", f"{remote_later}:main")
+            return {
+                "schema_version": 1,
+                "candidate_sha": sha,
+                "gate": {"digest": gate._receipt_body(self.repo, "task-b")[0]["digest"]},
+                "reviews": {},
+                "change": {"mode": "harden", "levers": ["graded"], "findings": []},
+            }
+
+        def git(repo, *args, **kwargs):
+            if args and args[0] == "push":
+                publish_pushes.append(args)
+            return publish._git(repo, *args, **kwargs)
+
+        self.publication_builder_mock.side_effect = authenticate
+        with (
+            patch("benchsmith.reviews.requests", return_value={"requests": []}),
+            patch(
+                "benchsmith.gate.check_control_manifest",
+                side_effect=self.shadow_controls,
+            ),
+            self.assertRaisesRegex(
+                publish.PublishRefused, "moved between the rebase and publish phases"
+            ),
+        ):
+            publish.publish(
+                self.repo,
+                "task-b",
+                handoff,
+                rebase=True,
+                apply=True,
+                lane=lane,
+                git=git,
+                check_review=False,
+                check_hold=False,
+            )
+
+        self.assertEqual(publish_pushes, [])
+        self.assertEqual(self.sha("origin/main"), remote_later)
+        self.assertIsNone(lane.holder())
+
+    def test_two_phase_rebase_pushes_only_after_reacquiring_lane(self):
+        self.git("checkout", "-qb", "candidate", self.base)
+        source_candidate = self.commit(
+            "task-b/tests/test_task.py",
+            "def test_task():\n    assert 1 == 1\n",
+            "task B candidate",
+        )
+        receipt = gate.write_receipt(self.repo, "task-b", self.passing_report())
+        self.git("checkout", "-q", "main")
+        remote_head = self.commit(
+            "task-a/instruction.md", "sibling\n", "sibling"
+        )
+        self.git("push", "-q", "origin", "main")
+        self.git("checkout", "-q", "candidate")
+        handoff = self.handoff(source_candidate, self.base, receipt["digest"])
+        lane = publish.Lane(self.repo, run_id="two-phase-success")
+        phases = []
+        build_evidence = self.publication_builder_mock.side_effect
+
+        def authenticate(*args, **kwargs):
+            phases.append(("authenticate", bool(lane.holder())))
+            return build_evidence(*args, **kwargs)
+
+        def git(repo, *args, **kwargs):
+            if args and args[0] == "rebase":
+                phases.append(("rebase", bool(lane.holder())))
+            if args and args[0] == "push":
+                phases.append(("push", bool(lane.holder())))
+            return publish._git(repo, *args, **kwargs)
+
+        self.publication_builder_mock.side_effect = authenticate
         with (
             patch("benchsmith.reviews.requests", return_value={"requests": []}),
             patch(
@@ -197,21 +405,24 @@ class CandidateStackSafetyTest(unittest.TestCase):
                 "task-b",
                 handoff,
                 rebase=True,
+                apply=True,
+                lane=lane,
+                git=git,
                 check_review=False,
                 check_hold=False,
             )
 
-        self.assertEqual(result["state"], "rebased")
-        self.assertFalse(result["needsRegate"], result)
-        self.assertEqual(result["onto"], remote_head)
-        self.assertEqual(result["stackProof"]["baseTaskTree"], self.tree(self.base, "task-b"))
-        self.assertEqual(result["taskTree"], self.tree(source_candidate, "task-b"))
-        carried = {**handoff, **result["handoffPatch"]}
-        proof = candidate.verify_handoff(self.repo, "task-b", carried)
-        self.assertEqual(proof.mode, "carry")
-        self.assertEqual(proof.source_base_sha, self.base)
-        self.assertEqual(proof.carried_from_sha, source_candidate)
-        self.assertEqual(proof.task_tree, self.tree(result["newSha"], "task-b"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(phases[0], ("rebase", True))
+        self.assertIn(("authenticate", False), phases)
+        self.assertEqual(phases[-1], ("push", True))
+        self.assertEqual(self.sha("origin/main"), result["commit"])
+        self.assertNotEqual(result["commit"], source_candidate)
+        self.assertEqual(
+            self.git("merge-base", "--is-ancestor", remote_head, result["commit"]).returncode,
+            0,
+        )
+        self.assertIsNone(lane.holder())
 
     def test_explicit_manual_carry_supports_divergent_histories(self):
         self.git("checkout", "-qb", "source", self.base)
@@ -331,6 +542,49 @@ class CandidateStackSafetyTest(unittest.TestCase):
                 check_hold=False,
             )
 
+    def test_expensive_review_authentication_finishes_before_lane_acquisition(self):
+        candidate_sha = self.commit(
+            "task-b/instruction.md", "task B candidate\n", "task B candidate"
+        )
+        receipt = gate.write_receipt(self.repo, "task-b", self.passing_report())
+        self.assertTrue(receipt["ok"])
+        handoff = self.handoff(candidate_sha, self.base, receipt["digest"])
+        lane = publish.Lane(self.repo, run_id="race")
+        phases = []
+
+        def verify(_repo, _task, _sha, _handoff, *, authenticate_review=True, **_kwargs):
+            phases.append(("live" if authenticate_review else "cheap", bool(lane.holder())))
+            return handoff["publication_evidence"]
+
+        def resolve_status(*_args, **_kwargs):
+            phases.append(("status", bool(lane.holder())))
+            return {"status": "draft"}
+
+        def git(repo, *args, **kwargs):
+            if args and args[0] == "push":
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return publish._git(repo, *args, **kwargs)
+
+        with (
+            patch.object(publish, "verify_handoff_evidence", side_effect=verify),
+            patch("benchsmith.resolve.resolve", side_effect=resolve_status),
+        ):
+            result = publish.publish(
+                self.repo,
+                "task-b",
+                handoff,
+                apply=True,
+                lane=lane,
+                git=git,
+                check_hold=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(phases[0], ("live", False))
+        self.assertIn(("status", True), phases)
+        self.assertEqual(phases[-2:], [("cheap", True), ("cheap", True)])
+        self.assertIsNone(lane.holder())
+
     def test_remote_tip_equal_candidate_returns_already_published_without_push(self):
         candidate_sha = self.commit(
             "task-b/instruction.md", "task B published\n", "task B published"
@@ -376,12 +630,21 @@ class CandidateStackSafetyTest(unittest.TestCase):
         self.assertEqual(self.sha(f"{task_b}^"), task_a)
 
     def handoff(self, commit_sha: str, base_sha: str, receipt: str = "receipt") -> dict:
+        change = {"mode": "harden", "levers": ["graded"], "findings": []}
         return {
             "work_item": "task-b",
             "state": "ready_to_publish",
             "base_sha": base_sha,
             "commit_sha": commit_sha,
             "gate_receipt": receipt,
+            "publication_evidence": {
+                "schema_version": 1,
+                "candidate_sha": commit_sha,
+                "gate": {"digest": receipt},
+                "reviews": {},
+                "change": change,
+            },
+            "change_evidence": change,
             "next_action": "publish",
             "session": "session-test",
         }

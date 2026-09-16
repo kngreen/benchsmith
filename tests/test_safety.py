@@ -77,6 +77,37 @@ class SafetyFingerprintTest(unittest.TestCase):
         )
         self.assertEqual(after_gate["publish_policy"], before["publish_policy"])
 
+        shutil.copy2(
+            safety.installation_root() / "lib" / "benchsmith" / "gate.py",
+            gate,
+        )
+        critic = self.root / "lib" / "benchsmith" / "critic_receipt.py"
+        critic.write_text(critic.read_text() + "\n# critic receipt drift\n")
+        after_critic = {
+            name: safety.component_digest(name, root=self.root)
+            for name in safety._MANIFESTS
+        }
+        self.assertEqual(after_critic["gate"], before["gate"])
+        self.assertEqual(
+            after_critic["controller_dispatch"], before["controller_dispatch"]
+        )
+        self.assertNotEqual(
+            after_critic["publish_policy"], before["publish_policy"]
+        )
+
+    def test_shared_identity_constants_are_covered_by_all_safety_components(self) -> None:
+        before = {
+            name: safety.component_digest(name, root=self.root)
+            for name in safety._MANIFESTS
+        }
+        identifiers = self.root / "lib" / "benchsmith" / "identifiers.py"
+        identifiers.write_text(identifiers.read_text() + "\n# shared policy drift\n")
+        after = {
+            name: safety.component_digest(name, root=self.root)
+            for name in safety._MANIFESTS
+        }
+        self.assertTrue(all(after[name] != before[name] for name in before))
+
     def test_missing_declared_component_fails_closed(self) -> None:
         (self.root / "lib" / "benchsmith" / "publish.py").unlink()
         with self.assertRaisesRegex(safety.SafetyRefused, "manifest path is missing"):

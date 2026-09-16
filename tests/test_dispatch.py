@@ -33,6 +33,24 @@ class DispatchPlacementTest(unittest.TestCase):
         self.assertIn("Do not clone Benchsmith", prompt)
         self.assertNotIn("clone benchsmith themselves", prompt.lower())
 
+    def test_worker_prompt_threads_resolved_publication_branch(self) -> None:
+        with patch(
+            "benchsmith.gate.resolve_publication_target",
+            return_value={
+                "ok": True,
+                "configured": True,
+                "remote": "origin",
+                "branch": "master",
+            },
+        ):
+            plan = dispatch.plan("sample-task", str(self.repo), bootstrap=False)
+
+        prompt = plan.argv[plan.argv.index("--prompt") + 1]
+        self.assertIn("gate --remote origin --branch master --json", prompt)
+        self.assertIn("publication-evidence --remote origin --branch master", prompt)
+        self.assertIn("handoff --repo", prompt)
+        self.assertIn("--branch master", prompt)
+
     def test_review_plan_allows_isolated_read_only_checkout(self) -> None:
         review_repo = self.repo / ".benchsmith-review-checkouts" / "repo"
         review_repo.mkdir(parents=True)

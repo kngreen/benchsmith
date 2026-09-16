@@ -108,6 +108,12 @@ Three things are surfaced rather than swallowed:
   deleted: a wrong guess that deletes loses real work silently, while a wrong guess that keeps
   costs an idea-tier slot.
 
+**Fresh intake is held while platform work exists.** Any actionable revision or draft, plus any
+durable `ready to publish`, `validating`, or `awaiting agentic review` row, appears in
+`freshIntakeBlockedBy`. During that hold fleet does not fetch or dispatch GSD cards. It still
+collects ready handoffs and watches in-flight exact SHAs; the predicate prevents queue expansion,
+not supervision.
+
 ### Dispatch
 
 ```bash
@@ -144,12 +150,12 @@ copies are not Benchsmith installations and never enter author checkout discover
 ### Handoff
 
 A worker returns **one JSON object under 4 KiB** and nothing else — `work_item`, `state`,
-`base_sha`, `commit_sha`, `gate_receipt`, `next_action`, `note`, plus optional exact
-`validation`, `review`, and `evidence_url` fields for the live table. A byte-identical carried
-rebase also names `source_base_sha` and `carried_from_sha`; those are proofs to recompute, not
-claims to trust. A worker that returns its transcript instead is refused: a supervisor holding N
-transcripts runs out of context before the queue drains, which is the failure this design exists
-to prevent.
+`base_sha`, `commit_sha`, `gate_receipt`, `publication_evidence`, structured `change_evidence`,
+`next_action`, and `note`, plus optional `validation`, display-only `review`, and `evidence_url`
+fields for the live table. A byte-identical carried rebase also names `source_base_sha` and
+`carried_from_sha`; those are proofs to recompute, not claims to trust. A worker that returns its
+transcript instead is refused: a supervisor holding N transcripts runs out of context before the
+queue drains, which is the failure this design exists to prevent.
 
 `state=ready_to_publish` **requires full `base_sha` and `commit_sha` values**. Finalization and
 collection resolve the current remote head and inspect every commit from the trusted base to the
@@ -239,13 +245,22 @@ releases it only after confirming that the push landed; unknown and retryable-no
 keep the claim so another worker cannot enter the task during recovery.
 
 Publishing refuses unless all of these hold: the handoff says `ready_to_publish`, it carries full
-`base_sha` and `commit_sha` values, it carries a **`gate_receipt`** (without which the lane's one
-job — that only gated work reaches the remote — was never done), the lane is free, and the whole
-candidate stack is task-only relative to a trusted base. The check starts from the current remote
-when it is already an ancestor of the candidate, so a task-B tip parented on an unpublished task-A
-candidate exposes task A and is rejected even though the tip commit itself is task-B-only. An old
-base is usable only when it is a known ancestor of the current remote and both revisions have the
-same full task tree. Unknown ancestry or an incomparable base blocks.
+`base_sha` and `commit_sha` values, and `publication_evidence` schema v1 exactly matches the
+publisher's current recomposition of the exact-SHA gate and canonical/critic receipts. The critic
+cache is not an authority: finalization and publication re-fetch its terminal Agentcloud transcript
+by session id. The nested gate digest must match `gate_receipt`; the nested change object must match
+structured `change_evidence`. Prose `review` remains display-only. Legacy handoffs fail closed with a
+migration message. A stale-base publish uses two short fenced phases: the first acquires the lane,
+reconciles/rechecks/freeze-checks, then rebases and writes only deferred local carry receipts before
+releasing it. Hook execution and transcript authentication happen outside the lane. The publisher
+then reacquires, reconciles, and cheaply revalidates the remote and exact evidence before pushing; a
+remote move between phases refuses without a push. The lane must be free, and the whole candidate
+stack must be task-only relative to a trusted base. The check starts from the current remote when it
+is already an ancestor of the candidate, so a task-B tip parented on an unpublished task-A candidate
+exposes task A and is rejected even though the tip commit itself is task-B-only. An old base is
+usable only when it is a known
+ancestor of the current remote and both revisions have the same full task tree. Unknown ancestry or
+an incomparable base blocks.
 
 **A rebase does not always need a full re-gate.** When the remote moved, Benchsmith first proves
 the old base task tree is byte-identical to the current remote task tree. After rebasing it proves
@@ -254,8 +269,12 @@ scope. Only then are explicitly whitelisted tree-invariant checks carried (`orac
 `config-integrity`, and `tags`); scope, diff ratchet/weakening, contamination, and review findings
 rerun against the rebased commit. The result returns `needsRegate: false` and includes a
 `handoffPatch` naming the current base, old base, old candidate, new candidate, and new exact-commit
-receipt. A manual/nonlinear carry must supply the same `source_base_sha` and
-`carried_from_sha` proof. The old receipt never stands for a new SHA.
+receipt. The exact-SHA canonical/critic receipt is carried separately only across the same
+byte-identical task-tree proof and retains its source receipt digest and reviewer versions. This is
+intentionally task-scoped: unrelated repository-level changes do not invalidate a review of unchanged
+`<sha>:<task>` bytes. Repo hook identity, gate implementation and publisher policy are independently
+bound and revalidated by the gate/publication evidence. A manual or nonlinear carry must supply the
+same `source_base_sha` and `carried_from_sha` proof. The old receipts never stand for a new SHA.
 
 That matters because **the coordinator has no task oracle and cannot re-gate**. Returning every
 rebase to a worker meant that by the time the worker answered, main had moved again: one task went
@@ -278,9 +297,18 @@ benchsmith watch --repo REPO --task TASK-NAME --sha SHA --pushed-at UNIXTIME
 | State | What it means | What you do |
 |---|---|---|
 | `absent` | the platform has not imported it | wait; at 45 minutes it reports `orphaned` and one `rerun` is authorised |
-| `running` | the wave is in flight | wait |
-| `terminal` | finished, pass **or** fail | start a fresh worker to read every signal |
-| `unknown` | could not read, or an unrecognised status | resolve it; do not treat it as either |
+| `running` | validation or an exact-SHA TBR/Agentic job is explicitly in flight | wait |
+| `terminal` | validation failed, or validation passed and required TBR/Agentic signals are terminal | start a fresh worker to read every signal |
+| `unknown` | task/job data is missing, stale, unreadable, or unrecognised | retry after the reported delay; it ceases to block fresh intake after the bounded hold, or clear that hold explicitly with `status-clear` while preserving the watch row |
+
+```bash
+benchsmith status-clear --repo REPO --task TASK-NAME --sha SHA --reason "..." --apply
+```
+
+The clear is exact-SHA and only releases the intake hold for the current active lifecycle row,
+including a row no longer present in the platform listing. It does not alter the status, fabricate a
+terminal signal, or delete watch evidence; a later candidate SHA clears the exception and blocks
+normally again.
 
 Only `terminal` exits zero. A fresh worker arrives with a clean context and reads the finished
 evidence in one pass, which is strictly better than one that spent an hour watching it accumulate.

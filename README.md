@@ -30,7 +30,9 @@ benchsmith probe                                   # resolve the platform CLI su
 benchsmith install-hooks --repo .                  # pre-push gate
 benchsmith read --task <name> --task-id <id>       # fresh, identity-checked
 benchsmith bar payload.json --target hard-only     # the difficulty verdict
-benchsmith gate --repo . --task <name>             # before every push
+benchsmith gate --repo . --task <name> --json      # exact gate + live hook receipt
+benchsmith critic-receipt --repo . --task <name> --sha <sha> --session-id <session>
+benchsmith publication-evidence --repo . --task <name> --sha <sha>
 benchsmith record --repo . --task <name> --sha <sha> --class in-band --fix "..."
 
 # Personal T-Bench idea board (all mutations require --apply)
@@ -41,6 +43,7 @@ benchsmith ideas harvest --repo . --idea-id 252 --apply
 benchsmith queue --repo . --fetch
 benchsmith status --repo .                         # concise workers; table only when a row changed
 benchsmith task-status --repo .                    # render the durable Markdown table explicitly
+benchsmith status-clear --repo . --task <name> --sha <sha> --reason "..." --apply
 ```
 
 Fleet lifecycle commands maintain `.benchsmith/fleet/task-status.json` and the generated

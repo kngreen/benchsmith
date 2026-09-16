@@ -8,12 +8,13 @@ collection, and the final push cannot disagree about the answer.
 
 from __future__ import annotations
 
-import re
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
-_FULL_SHA = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+from .identifiers import FULL_SHA as _FULL_SHA
+from .identifiers import validate_task_path
+
 _ABSENT = "<absent>"
 
 
@@ -74,21 +75,10 @@ def _run(repo: Path, git, *args: str) -> subprocess.CompletedProcess:
 
 
 def _task_name(task: str) -> str:
-    value = str(task or "")
-    path = PurePosixPath(value)
-    if (
-        not value
-        or value != value.strip()
-        or value.startswith("/")
-        or value.endswith("/")
-        or path.is_absolute()
-        or path.as_posix() != value
-        or value in {".", ".."}
-        or ".." in path.parts
-        or "\\" in value
-    ):
-        raise CandidateRejected(f"task path {task!r} is not one unambiguous relative path")
-    return value
+    try:
+        return validate_task_path(task)
+    except ValueError as error:
+        raise CandidateRejected(str(error)) from error
 
 
 def _commit(repo: Path, value: str, label: str, *, git) -> str:

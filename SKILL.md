@@ -226,6 +226,16 @@ returns `needsGsdBoard` with the exact question. Put it to the user in those ter
 Then re-run with `--gsd-project <id>` and keep going. Do not ask for it pre-emptively, and do not
 silently proceed with fewer workers than asked for.
 
+**Platform work blocks fresh intake.** While any actionable Codimango revision/draft or durable
+`ready to publish` / `validating` / `awaiting agentic review` row exists, the fleet does not fetch or
+dispatch GSD ideas. Existing rows remain collectable and watchable; this is an intake hold, not a
+monitoring hold. Agentic state comes from exact-SHA `job.agenticReview` rows, never a task-list
+summary field. Missing, stale, or unreadable review data is `unknown`, retried on a bounded cadence,
+and stops blocking fresh intake after the recorded hold window. An operator can release that intake
+hold earlier for the same SHA with `benchsmith status-clear --task TASK --sha SHA --reason WHY
+--apply`; the active row and its watch evidence remain unchanged, and a later SHA blocks normally
+again. `freshIntakeBlockedBy` names the active predicate's blockers.
+
 #### Isolation, budget, and knowing when a change worked
 
 **Every task is claimed across hosts before a worker starts.** `fleet --apply` takes
@@ -373,10 +383,16 @@ turns this off.
 
 `collect` reads `<repo>/.benchsmith/handoff/<task>.json` first and falls back to the session
 journal. A `ready_to_publish` handoff is re-proved against the current remote before it is accepted:
-every commit in the candidate stack must be task-only, and unknown ancestry blocks. A rejected
-candidate is surfaced as `blocked`, never copied into the live table as ready. The file is the
-contract: it survives a launcher that loses its pipe, and it means the worker's visible last word
-can be a plain sentence instead of a wire format. Workers finalize with `benchsmith handoff`: it
+every commit in the candidate stack must be task-only, and unknown ancestry blocks. It must also carry
+`publication_evidence` schema v1 plus matching structured `change_evidence`; the publisher recomputes
+that object from the exact-SHA gate and canonical/critic receipts. Legacy handoffs with only
+`gate_receipt` or prose `review` fail closed with a migration error. Stale-base handling uses two
+short lane phases: rebase and local carry mutations are fenced first; hook/transcript authentication
+runs after release; then a second lane acquisition rechecks the remote and exact evidence before any
+push. A remote move between phases refuses without pushing.
+A rejected candidate is surfaced as `blocked`, never copied into the live table as ready. The file
+is the contract: it survives a launcher that loses its pipe, and it means the worker's visible last
+word can be a plain sentence instead of a wire format. Workers finalize with `benchsmith handoff`: it
 atomically renames a handoff containing the exact session and lease token, then releases that token
 with compare-and-swap. A crash after the rename leaves phase `durable` and is safe to replay; phase
 `released` is terminal. Existing handoffs without lease fields remain readable but are not allowed
@@ -574,7 +590,9 @@ scaffold time half these checks legitimately cannot run yet. At the push boundar
 have the same consequence: you do not know the thing you would need to know in order to push.
 Without this, arranging for a check *not to run* was enough to skip it — which made every other
 gate optional. The installed pre-push hook verifies the exact-HEAD receipt produced by that run;
-it does not rerun a weaker predicate.
+it does not rerun a weaker predicate. Receipt creation also fingerprints the exact live pre-push
+hook and executes any active repository-owned hook with Git's candidate/remote tuple. A changed
+hook invalidates the cached receipt before publication; a failing live hook cannot mint one.
 
 **Run preflight first, every session.** Composed skills that are absent must fail loudly: a
 field run spent nine rounds improvising the mechanics by hand because nothing said they were
@@ -911,6 +929,26 @@ check is `not_run`, never a pass.
 
 A golden patch overwritten with a copy of `test_patch` still passes the oracle whenever
 `solve.sh` applies the real solution separately. **Oracle success does not cover this.**
+
+### Publication target
+
+When `--branch` is omitted, `benchsmith gate` resolves and records the remote's advertised default
+branch; workers receive that resolved remote and branch in their gate, evidence, and handoff commands.
+An explicitly named branch must exist. A local repository with neither an executable pre-push hook nor
+a configured publication remote keeps a `not-applicable` hook result rather than assuming `main`.
+
+### Separate-verifier artifact transfer
+
+A task with `tests/Dockerfile` uses a verifier lifecycle separate from the candidate container.
+Before publication it must provide executable, non-symlink `qa/artifact-transfer`. Benchsmith runs
+that task-local contract with `BENCHSMITH_CANDIDATE_SHA` and binds the script digest and successful
+exit to the exact gate receipt. The contract owns the Harbor-equivalent proof that the candidate
+repository can be exported, appears at `/app` after verifier import, and the oracle smokes there.
+Missing, non-executable, stale, timed-out, or failing contracts block. The contract runs from a
+full disposable export of the exact commit with a minimal allowlisted environment; its source
+checkout is compared before and after, and any reach-back mutation is attributed to the contract and
+blocks. This is deliberately not a claim that Benchsmith can infer generic Docker parity from
+arbitrary Dockerfiles.
 
 ### Reward unforgeability
 
@@ -1255,10 +1293,14 @@ exact SHA. It runs `aai-review-flow` (or the track fallback) first and audits th
 pre-supply your own findings — feeding it your conclusions is what it exists to check.
 
 **It writes nothing in the task repository.** Read-only means no task edits, commits, pushes,
-reruns, or author contact. It emits one structured receipt line in its own session transcript;
-`benchsmith critic-receipt --repo REPO --task TASK --sha SHA --session-id SESSION` fetches that
-terminal transcript and stores the verified exact-SHA receipt outside the worktree. An absent,
-malformed, stale, or locally supplied replacement remains an absent review.
+reruns, or author contact. It emits one structured receipt line in its own session transcript; that
+schema includes the canonical reviewer name, exact `Accept` decision and evidence digest as well as
+the critic version and decision. `benchsmith critic-receipt --repo REPO --task TASK --sha SHA
+--session-id SESSION` fetches that terminal transcript and stores the verified exact-SHA receipt
+outside the worktree. `benchsmith publication-evidence` re-fetches that terminal transcript before
+composing it with the current gate receipt, and finalization/publication authenticate it again rather
+than trusting a self-digested cache file. An absent, malformed, stale, pre-v2, locally modified, or
+unreachable transcript remains an absent review.
 
 | Its decision | What benchsmith does |
 |---|---|

@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -53,6 +54,10 @@ def passing_push_report() -> gate_mod.Report:
     report = gate_mod.Report()
     for name in gate_mod.PUSH_REQUIRED:
         report.add(name, gate_mod.PASS, "fixture passed")
+    report.artifacts["artifactTransfer"] = {"required": False}
+    report.artifacts["changeEvidence"] = {
+        "mode": "harden", "levers": ["graded"], "findings": []
+    }
     report.require(gate_mod.PUSH_REQUIRED)
     return report
 
@@ -471,6 +476,22 @@ def scratch_repo(tmp: Path) -> Path:
         ["commit", "-qm", "init"],
     ):
         subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    remote = tmp / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main", str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "push", "-q", "-u", "origin", "main"],
+        check=True,
+        capture_output=True,
+    )
     return repo
 
 
@@ -546,7 +567,13 @@ with tempfile.TemporaryDirectory() as td:
     check("journal reopens with its rounds", len(other.rounds), 4)
 
     rep = gate_mod.run(repo_root=repo, task_dir=task_dir, task_name="mytask")
-    check("normal gate blocks a structurally incomplete task", rep.ok, False)
+    structural = [check for check in rep.checks if check.name == "structural"]
+    check("normal gate records exactly one structural verdict", len(structural), 1)
+    check(
+        "structural validation is explicit whether available or unavailable",
+        structural[0].state in {gate_mod.PASS, gate_mod.FAIL, gate_mod.NOT_RUN},
+        True,
+    )
     check("NOT_RUN reported, not hidden", "oracle" in rep.as_dict()["notRun"], True)
     config_state = next(c.state for c in rep.checks if c.name == "config-integrity")
     check("missing SWE config is inapplicable on other tracks", config_state, "PASS")
@@ -1255,7 +1282,9 @@ _MUTANTS = [
     ("harness allowlist", 'if harness and harness not in AGENTCLOUD_HARNESSES:', 'if False:'),
     ("apply guard", 'if not apply:', 'if False:'),
     ("publishing guard", 'if p.publishing:', 'if False:'),
-    ("commit_sha requirement", 'if not _FULL_SHA.fullmatch(commit_sha):', 'if False:'),
+    ("commit_sha requirement",
+     'commit_sha = validate_sha(doc.get("commit_sha"), "handoff commit_sha")',
+     'commit_sha = str(doc.get("commit_sha") or "")'),
     ("base_sha requirement", 'if not doc.get("base_sha"):', 'if False:'),
     ("state allowlist", 'if state not in HANDOFF_STATES:', 'if False:'),
     ("size cap", 'if len(text) > HANDOFF_LIMIT * 4:', 'if False:'),
@@ -1832,8 +1861,53 @@ check("an unreachable remote is unknown, never not-landed",
 _lane.clear_intent()
 
 # --- publish refusals ---
+_PUBLICATION_CHANGE = {"mode": "harden", "levers": ["graded"], "findings": []}
+
+
+def _publication_fields(sha: str, marker: str) -> dict:
+    digest = marker.removeprefix("sha256:")
+    evidence = {
+        "schema_version": 1,
+        "candidate_sha": sha,
+        "gate": {"digest": digest},
+        "reviews": {},
+        "change": _PUBLICATION_CHANGE,
+    }
+    return {"publication_evidence": evidence, "change_evidence": _PUBLICATION_CHANGE}
+
+
+_saved_publication_verify = pub.verify_publication_evidence
+_saved_publication_build = pub.publication_evidence
+_saved_publication_target = pub._resolved_publication_target
+_publication_verify_calls = []
+
+
+def _verify_publication_fixture(
+    repo,
+    task,
+    sha,
+    supplied,
+    *,
+    authenticate_review,
+    authenticate_hook,
+    remote,
+    branch,
+):
+    _publication_verify_calls.append(
+        (authenticate_review, authenticate_hook, remote, branch)
+    )
+    return supplied
+
+
+pub.verify_publication_evidence = _verify_publication_fixture
+pub.publication_evidence = lambda repo, task, sha, *, remote, branch: _publication_fields(
+    sha, gate_mod._receipt_body(repo, task)[0]["digest"]
+)["publication_evidence"]
+pub._resolved_publication_target = lambda repo, remote, branch: (
+    str(remote or "origin"), str(branch or "main")
+)
 _ok = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
-       "gate_receipt": "sha256:deadbeef"}
+       "gate_receipt": "sha256:deadbeef", **_publication_fields("c" * 40, "sha256:deadbeef")}
 for label, h in [
     ("a handoff that is not ready", {**_ok, "state": "blocked"}),
     ("no commit_sha", {**_ok, "commit_sha": ""}),
@@ -3079,7 +3153,7 @@ finally:
 
 # The push is the moment of harm, so that is where the refusal lives.
 _h2 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
-       "gate_receipt": "r"}
+       "gate_receipt": "r", **_publication_fields("c" * 40, "r")}
 _saved3 = rv._tasks
 try:
     rv._tasks = lambda binary="codimango": _rows("being_reviewed")
@@ -3380,10 +3454,34 @@ for _d in ("mine", "theirs"):
 (_rb / ".gitignore").write_text(".benchsmith/\n")
 _rg("add", "-A"); _rg("commit", "-qm", "base")
 _BASE = _rg("rev-parse", "HEAD").stdout.strip()
+_rb_remote = _rb.parent / "remote.git"
+subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(_rb_remote)], check=True)
+_rg("remote", "add", "origin", str(_rb_remote))
+_rg("push", "-q", "-u", "origin", "main")
 (_rb / "mine" / "tests" / "t.py").write_text("def test():\n    assert 1 == 1\n")
 _rg("add", "-A"); _rg("commit", "-qm", "ours")
 _OURS = _rg("rev-parse", "HEAD").stdout.strip()
 _old_receipt = gate_mod.write_receipt(_rb, "mine", passing_push_report())
+from benchsmith import critic_receipt as _carry_critic  # noqa: E402
+_carry_critic._write(_rb, "mine", _OURS, {
+    "version": _carry_critic.VERSION,
+    "task": "mine",
+    "task_id": "fixture-mine",
+    "sha": _OURS,
+    "canonical_review": {
+        "name": "fixture-canonical@1",
+        "decision": "Accept",
+        "evidence_digest": "a" * 64,
+    },
+    "critic_version": "fixture-critic@1",
+    "session_id": "fixture-session",
+    "decision": "Accept",
+    "evidence_digest": "b" * 64,
+    "reported_evidence_digest": "c" * 64,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "session_evidence_digest": "b" * 64,
+    "source": "agentcloud-session-transcript",
+})
 _rg("checkout", "-q", _BASE)
 (_rb / "theirs" / "tests" / "t.py").write_text("def test():\n    assert 2 == 2\n")
 _rg("add", "-A"); _rg("commit", "-qm", "sibling")
@@ -3406,7 +3504,8 @@ def _remote_at(head):
 
 
 _hh = {"state": "ready_to_publish", "commit_sha": _OURS, "base_sha": _BASE,
-       "gate_receipt": _old_receipt["digest"]}
+       "gate_receipt": _old_receipt["digest"],
+       **_publication_fields(_OURS, _old_receipt["digest"])}
 
 try:
     pub.publish(_rb, "mine", _hh, git=_remote_at(_THEIRS), check_review=False, check_hold=False)
@@ -3481,23 +3580,28 @@ for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"]):
 (_hr / "mytask" / "task.toml").write_text("[t]\n")
 subprocess.run(["git", "-C", str(_hr), "add", "-A"], capture_output=True)
 subprocess.run(["git", "-C", str(_hr), "commit", "-qm", "base"], capture_output=True)
+_hr_remote = _hr.parent / "remote.git"
+subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(_hr_remote)], check=True)
+subprocess.run(["git", "-C", str(_hr), "remote", "add", "origin", str(_hr_remote)], check=True)
+subprocess.run(["git", "-C", str(_hr), "push", "-q", "-u", "origin", "main"], check=True)
 
-_hrp = Path(tempfile.mkdtemp()) / "receipt.json"
+_hrp = Path(tempfile.mkdtemp()) / "legacy-shared-receipt.json"
+_hrp.write_text('{"stale":true}\n')
 os.environ["GATE_RECEIPT"] = str(_hrp)
 try:
     _rep5 = passing_push_report()
-    gate_mod.write_receipt(_hr, "mytask", _rep5)
-    _doc = json.loads(_hrp.read_text())
+    _receipt5 = gate_mod.write_receipt(_hr, "mytask", _rep5)
     _head = subprocess.run(["git", "-C", str(_hr), "rev-parse", "HEAD"],
                            capture_output=True, text=True).stdout.strip()
-    # The repo's hook checks exactly these three things.
-    check("the hook receipt binds to HEAD", _doc["commit"], _head)
-    check("...records cleanliness", _doc["dirty"], False)
-    check("...and every gate passes", all(v == "pass" for v in _doc["gates"].values()), True)
+    check("the durable receipt binds to HEAD", _receipt5["head"], _head)
+    check("...records cleanliness", _receipt5["clean"], True)
+    check("...binds the live hook identity", _receipt5["repositoryHook"]["state"],
+          "not-applicable")
+    check("...does not reuse the legacy shared /tmp path", _hrp.read_text(), '{"stale":true}\n')
 
     _rep6 = passing_push_report()
     next(c for c in _rep6.checks if c.name == "oracle").state = gate_mod.NOT_RUN
-    check("a not-run check cannot replace the hook receipt",
+    check("a not-run check cannot replace the durable receipt",
           gate_mod.write_receipt(_hr, "mytask", _rep6).get("state"), "not_written")
 finally:
     os.environ.pop("GATE_RECEIPT", None)
@@ -3592,7 +3696,7 @@ check("...by archiving its session", "archive" in _calls4[-1], True)
 # in a minute, a push onto an accepted task corrupts data that has shipped.
 
 _hh2 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
-        "gate_receipt": "r"}
+        "gate_receipt": "r", **_publication_fields("c" * 40, "r")}
 _saved5 = rv._tasks
 
 
@@ -4465,7 +4569,7 @@ finally:
 
 # publish must refuse into a held branch, and must refuse when it cannot tell.
 _hh3 = {"state": "ready_to_publish", "commit_sha": "c" * 40, "base_sha": "b" * 40,
-        "gate_receipt": "r"}
+        "gate_receipt": "r", **_publication_fields("c" * 40, "r")}
 _saved8 = rv._tasks
 _saved_verify8 = gate_mod.verify_receipt
 _saved_body8 = gate_mod._receipt_body
@@ -4496,11 +4600,18 @@ try:
     _hmod.current = lambda repo, remote="origin": {"readable": True, "held": False}
     check("a free branch publishes",
           pub.publish(_pr, "t", _hh3, git=_fake_remote("b" * 40))["applied"], False)
+    check("selftest mock observes authenticated review and hook verification",
+          (True, True, "origin", "main") in _publication_verify_calls, True)
+    check("selftest mock observes cheap in-lane verification without authentication",
+          (False, False, "origin", "main") in _publication_verify_calls, True)
     _hmod.current = _origh
 finally:
     rv._tasks = _saved8
     gate_mod.verify_receipt = _saved_verify8
     gate_mod._receipt_body = _saved_body8
+    pub.verify_publication_evidence = _saved_publication_verify
+    pub.publication_evidence = _saved_publication_build
+    pub._resolved_publication_target = _saved_publication_target
 
 # --- rerun must not hardcode a subcommand either ------------------------------
 # Three doc edits have now silently no-oped on a bad anchor while the code
@@ -4532,7 +4643,7 @@ check("...and parses",
 _saved9 = wch._read
 try:
     wch._read = lambda task, binary="codimango": ({"validationCommitSha": "other",
-                                                   "validationStatus": "passing"}, "")
+                                                   "validationStatus": "passing"}, [], "")
     _w1 = wch.state("t", "mine")
     check("a commit the platform has not imported is absent", _w1["state"], wch.ABSENT)
     check("...and names what the platform does have", _w1["platformSha"], "other")
@@ -4543,21 +4654,21 @@ try:
           wch.state("t", "mine", pushed_at=time.time() - 60)["orphaned"], False)
 
     wch._read = lambda task, binary="codimango": ({"validationCommitSha": "mine",
-                                                   "validationStatus": "pending"}, "")
+                                                   "validationStatus": "pending"}, [], "")
     check("an in-flight wave is running", wch.state("t", "mine")["state"], wch.RUNNING)
 
     wch._read = lambda task, binary="codimango": ({"validationCommitSha": "mine",
-                                                   "validationStatus": "failed"}, "")
+                                                   "validationStatus": "failed"}, [], "")
     _term = wch.state("t", "mine")
     check("a finished wave is terminal", _term["state"], wch.TERMINAL)
     # Terminal includes failed: there is something to act on either way.
     check("...including a failed one", _term["validation"], "failed")
 
-    wch._read = lambda task, binary="codimango": ({}, "offline")
+    wch._read = lambda task, binary="codimango": ({}, None, "offline")
     check("an unreadable platform is unknown, not running",
           wch.state("t", "mine")["state"], wch.UNKNOWN)
     wch._read = lambda task, binary="codimango": ({"validationCommitSha": "mine",
-                                                   "validationStatus": "wat"}, "")
+                                                   "validationStatus": "wat"}, [], "")
     check("an unrecognised status is unresolved, not terminal",
           wch.state("t", "mine")["state"], wch.UNKNOWN)
 finally:
@@ -4887,6 +4998,10 @@ subprocess.run(["git", "-C", str(_ri), "commit", "-qm", "one"], check=True)
 subprocess.run(["git", "-C", str(_ri), "remote", "add", "origin", str(_ri_bare)], check=True)
 _ri_one = subprocess.run(["git", "-C", str(_ri), "rev-parse", "HEAD"],
                          capture_output=True, text=True, check=True).stdout.strip()
+subprocess.run(
+    ["git", "-C", str(_ri), "push", "-q", "origin", f"{_ri_one}:refs/heads/main"],
+    check=True,
+)
 _visibility = {"hidden": 2}
 
 
@@ -4985,15 +5100,46 @@ try:
 except dsp.DispatchRefused as _legacy_error:
     check("an unassigned legacy handoff is refused", "assignment is missing" in str(_legacy_error), True)
 
-# Existing receipt JSON remains parseable but cannot authenticate itself after
-# the digest field is removed or its contents are changed.
-_receipt_doc = gate_mod.write_receipt(_ri, "task", passing_push_report())
-_receipt_file = gate_mod.receipt_path(_ri, "task")
-_without_digest = dict(_receipt_doc)
-_without_digest.pop("digest")
-_receipt_file.write_text(json.dumps(_without_digest))
-check("a legacy receipt without a digest is rejected",
-      gate_mod.verify_receipt(_ri, "task")[0], False)
+# A cached authenticated critic receipt cannot authenticate itself after its
+# digest is removed, even when every remaining field has the current v2 shape.
+_old_critic_dir = os.environ.get("BENCHSMITH_CRITIC_RECEIPT_DIR")
+os.environ["BENCHSMITH_CRITIC_RECEIPT_DIR"] = str(_ri_root / "critic-receipts")
+try:
+    _critic_write = _carry_critic._write(_ri, "task", _ri_three, {
+        "version": _carry_critic.VERSION,
+        "task": "task",
+        "task_id": "fixture-task",
+        "sha": _ri_three,
+        "canonical_review": {
+            "name": "fixture-canonical@1",
+            "decision": "Accept",
+            "evidence_digest": "a" * 64,
+        },
+        "critic_version": "fixture-critic@1",
+        "session_id": "fixture-session",
+        "decision": "Accept",
+        "evidence_digest": "b" * 64,
+        "reported_evidence_digest": "c" * 64,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "session_evidence_digest": "b" * 64,
+        "source": "agentcloud-session-transcript",
+    })
+    check("authenticated critic receipt write succeeds", _critic_write["ok"], True)
+    _without_digest = dict(_critic_write["receipt"])
+    check("authenticated critic receipt carries its digest",
+          isinstance(_without_digest.pop("digest"), str), True)
+    Path(_critic_write["path"]).write_text(json.dumps(_without_digest))
+    _missing_digest, _missing_digest_reason = _carry_critic.load(
+        _ri, "task", _ri_three
+    )
+    check("a critic receipt without its digest is rejected", _missing_digest, None)
+    check("missing digest is reported as failed content authentication",
+          _missing_digest_reason, "critic receipt digest does not match its contents")
+finally:
+    if _old_critic_dir is None:
+        os.environ.pop("BENCHSMITH_CRITIC_RECEIPT_DIR", None)
+    else:
+        os.environ["BENCHSMITH_CRITIC_RECEIPT_DIR"] = _old_critic_dir
 
 # Exercise the installed hook with an actual push. The first exact-HEAD receipt
 # passes; the next commit is rejected by that same verifier as stale.
@@ -5002,14 +5148,30 @@ _hook_repo = _hook_root / "work"
 _hook_bare = _hook_root / "remote.git"
 (_hook_repo / "task").mkdir(parents=True)
 subprocess.run(["git", "init", "-q", "-b", "main", str(_hook_repo)], check=True)
-subprocess.run(["git", "init", "-q", "--bare", str(_hook_bare)], check=True)
+subprocess.run(
+    ["git", "init", "--bare", "-q", "-b", "main", str(_hook_bare)], check=True
+)
+_hook_default = subprocess.run(
+    ["git", "-C", str(_hook_bare), "symbolic-ref", "HEAD"],
+    capture_output=True,
+    text=True,
+    check=True,
+).stdout.strip()
+check("the installed-hook fixture advertises main as remote HEAD",
+      _hook_default, "refs/heads/main")
 for _a in (["config", "user.email", "t@t"], ["config", "user.name", "t"],
            ["remote", "add", "origin", str(_hook_bare)]):
     subprocess.run(["git", "-C", str(_hook_repo), *_a], check=True)
 (_hook_repo / "task" / "task.toml").write_text("[task]\n")
 subprocess.run(["git", "-C", str(_hook_repo), "add", "-A"], check=True)
 subprocess.run(["git", "-C", str(_hook_repo), "commit", "-qm", "one"], check=True)
+subprocess.run(
+    ["git", "-C", str(_hook_repo), "push", "-q", "origin", "HEAD:refs/heads/main"],
+    check=True,
+)
 gate_mod.install_hooks(_hook_repo, Path(gate_mod.__file__).resolve().parent)
+(_hook_repo / "task" / "task.toml").write_text("[task]\ncandidate = true\n")
+subprocess.run(["git", "-C", str(_hook_repo), "commit", "-qam", "candidate"], check=True)
 _old_task_env = os.environ.get("BENCHSMITH_TASK")
 _old_receipt_env = os.environ.get("BENCHSMITH_RECEIPT_DIR")
 os.environ["BENCHSMITH_TASK"] = "task"
@@ -5451,6 +5613,11 @@ _critic_document = {
     "task_id": "task-123",
     "sha": _critic_sha,
     "critic_version": "critic-v1",
+    "canonical_review": {
+        "name": "review-task-swebench-v2@1",
+        "decision": "Accept",
+        "evidence_digest": "b" * 64,
+    },
     "session_id": "session-123",
     "decision": "Accept",
     "evidence_digest": "a" * 64,

@@ -126,6 +126,36 @@ it runs the benchmark once per fixture; its absence is reported, never treated a
 leaves no trace — the gate simply stops running it and goes green faster. The roster is the only
 thing that notices, which is why a **missing roster is itself a finding**, not a reason to skip.
 
+The repository hook bridge uses a mode-0700 temporary directory and a mode-0600 receipt, passes its
+path only to that hook process, and deletes the whole directory on success or failure. There is no
+shared `/tmp/gate-receipt-<task>.json`. A private outer-authority marker can defer a nested
+`gate --verify-receipt` arm only when its mode, owner, token, repository, task and exact HEAD match,
+and the recorded issuer PID is still a live ancestor of the verifier process. This is process-tree
+hardening, not a credential boundary against code that already controls such an ancestor. Canonical
+and chained hooks therefore avoid recursion while every sibling command still executes.
+
+The top-level hook identity covers the executable Git invokes; Benchsmith deliberately does not
+parse shell to discover and hash arbitrary sourced helpers, because static shell parsing would claim
+coverage it cannot prove. Mitigation: evidence authentication reruns the current outer hook, Git runs
+the current hook again on the real push, and any top-level hook identity change invalidates the
+cached gate receipt.
+
+When `--branch` is omitted, the gate resolves and records the publication remote's advertised
+default branch instead of assuming `main`. An explicitly named missing branch still fails closed. A
+repository with neither an executable pre-push hook nor a configured publication remote retains the
+local-only `not-applicable` hook result.
+
+### 15c-4. Separate-verifier artifact transfer
+
+A task with `tests/Dockerfile` must provide executable, non-symlink `qa/artifact-transfer`. The gate
+runs that task-local contract from a full disposable export of the exact candidate, with only an
+allowlisted environment, and stores its content digest and result in the gate receipt. The source
+checkout is compared before and after; any reach-back mutation is a contract failure. The contract
+must exercise the repository's Harbor-equivalent export/import path, prove the candidate repository
+is present at `/app`, and smoke the oracle there. Missing or stale proof blocks publication.
+Benchsmith does not infer a universal Docker command or claim more parity than the task's executable
+contract proved.
+
 ### 15d. The formatters
 
 The scratch and base-tree clones also carry a `.githooks/pre-commit` running prettier and eslint

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from benchsmith.gate import FAIL, PASS, Report, check_structural
+from benchsmith.gate import FAIL, NOT_RUN, PASS, Report, check_structural
 
 
 class StructuralGateTest(unittest.TestCase):
@@ -21,6 +21,18 @@ class StructuralGateTest(unittest.TestCase):
             returncode = 0
 
         return Result()
+
+    @patch("benchsmith.gate.subprocess.run", side_effect=FileNotFoundError("codimango"))
+    def test_unavailable_upstream_is_not_a_pass_and_blocks_when_required(self, _run):
+        report = Report()
+
+        check_structural(self.task, report)
+        self.assertEqual(report.checks[0].state, NOT_RUN)
+        self.assertTrue(report.ok)
+
+        report.require(("structural",))
+        self.assertFalse(report.ok)
+        self.assertEqual(report.as_dict()["blockedByNotRun"], ["structural"])
 
     @patch("benchsmith.gate.subprocess.run")
     def test_upstream_warning_is_preserved_without_blocking(self, run):

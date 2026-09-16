@@ -14,13 +14,17 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
+import tempfile
 import tomllib
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import safety
+from .identifiers import validate_sha, validate_task_path
 from .journal import Journal, surface_hashes
 
 REQUIRED_TAGS = ("benchsmith-v1", "aai-labs", "semi-synthetic", "private_repos_1p")
@@ -39,13 +43,15 @@ TIMEOUT = "TIMEOUT"
 # Checks whose absence makes a push unsafe rather than merely unmeasured. These
 # are the ones where NOT_RUN and FAIL have the same consequence: you do not know
 # the thing you would have to know in order to push.
-PUSH_REQUIRED = ("oracle", "scope", "config-integrity", "tags",
+PUSH_REQUIRED = ("oracle", "artifact-transfer", "scope", "config-integrity", "tags",
                  "diff-ratchet", "diff-weakening", "contamination",
                  # A repair that addressed nothing is not a repair.
                  "review-findings")
 CONTROL_REQUIRED = ("control-manifest", "obligation-witnesses", "mutation-adequacy",
                     "metamorphic-variation", "verifier-closure")
-INAPPLICABLE_PUSH_CHECKS = frozenset({"diff-ratchet", "diff-weakening"})
+INAPPLICABLE_PUSH_CHECKS = frozenset({
+    "artifact-transfer", "diff-ratchet", "diff-weakening",
+})
 
 
 @dataclass
@@ -431,6 +437,8 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
     Corrective rounds are exempt and batch freely; they are not claiming to have
     moved anything.
     """
+    change = report.artifacts.setdefault("changeEvidence", {})
+    change.update(mode=mode, levers=[])
     if mode != "harden":
         report.add("single-lever", NOT_RUN, f"mode is {mode!r}; batching corrective work is allowed")
         return
@@ -457,6 +465,7 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
         report.add("single-lever", PASS, "initial scaffold; no measured round to attribute")
         return
     hit = levers_touched(cs.paths, task_name)
+    change["levers"] = sorted(hit)
     if len(hit) > 1:
         report.add("single-lever", FAIL,
                    "moves " + ", ".join(sorted(hit)) + " in one hardening round; "
@@ -464,7 +473,7 @@ def check_single_lever(repo_root: Path, task_name: str, mode: str, report: Repor
     elif not hit:
         report.add("single-lever", PASS, "no difficulty lever moved")
     else:
-        report.add("single-lever", PASS, f"one lever: {hit.pop()}")
+        report.add("single-lever", PASS, f"one lever: {next(iter(hit))}")
 
 
 TOML_AUTHOR = re.compile(
@@ -522,7 +531,14 @@ def check_fixture_corpus(task_dir: Path, report: Report, runner=None) -> None:
                res["detail"])
 
 
-def check_findings(task_name: str, journal, report: Report, *, binary: str = "codimango") -> None:
+def check_findings(
+    task_name: str,
+    journal,
+    report: Report,
+    *,
+    binary: str = "codimango",
+    request_snapshot: dict | None = None,
+) -> None:
     """A repair round must address what the reviewer asked for.
 
     The whole point of `needs_revision` is that a person named something wrong.
@@ -530,18 +546,31 @@ def check_findings(task_name: str, journal, report: Report, *, binary: str = "co
     verified the change it claims to have made -- it never wrote down what the
     change was, or how it would know it worked.
     """
+    findings = journal.data.get("findings") or {}
+    report.artifacts.setdefault("changeEvidence", {})["findings"] = [
+        {
+            "id": str(fid),
+            "state": str(row.get("state") or ""),
+            "closedBy": str(row.get("closedBy") or ""),
+        }
+        for fid, row in sorted(findings.items())
+        if isinstance(row, dict)
+    ]
     from .reviews import requests, unaddressed
 
-    try:
-        req = requests(task_name, binary=binary)
-    except Exception as e:  # noqa: BLE001
-        # Unreadable is genuinely unknown, and non-blocking here on purpose:
-        # `publish` already refuses outright when it cannot read a task's
-        # status, so the needs_revision case stays fail-closed at the one place
-        # it matters, without blocking every unrelated draft push.
-        report.add("review-findings", NOT_RUN, f"could not read the reviews: {e}",
-                   blocking=False)
-        return
+    if request_snapshot is not None:
+        req = request_snapshot
+    else:
+        try:
+            req = requests(task_name, binary=binary)
+        except Exception as e:  # noqa: BLE001
+            # Unreadable is genuinely unknown, and non-blocking here on purpose:
+            # `publish` already refuses outright when it cannot read a task's
+            # status, so the needs_revision case stays fail-closed at the one place
+            # it matters, without blocking every unrelated draft push.
+            report.add("review-findings", NOT_RUN, f"could not read the reviews: {e}",
+                       blocking=False)
+            return
     if not req.get("requests"):
         # PASS, not NOT_RUN. "Every requested change is addressed" is true when
         # there are no requests, and calling it unmeasured made the push gate
@@ -809,6 +838,155 @@ def check_oracle(oracle_cmd: list[str] | None, report: Report) -> None:
     )
 
 
+def check_artifact_transfer(task_dir: Path, report: Report, runner=None) -> None:
+    """Run a task-owned Harbor-equivalent smoke in an isolated exact-HEAD export."""
+    task_dir = Path(task_dir).resolve()
+    try:
+        repo_root = Path(_git(task_dir, "rev-parse", "--show-toplevel")).resolve()
+        task_name = validate_task_path(task_dir.relative_to(repo_root).as_posix())
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        report.add("artifact-transfer", FAIL, f"task path is unsafe: {error}")
+        return
+    dockerfile = task_dir / "tests" / "Dockerfile"
+    contract = task_dir / "qa" / "artifact-transfer"
+    artifact = {"required": dockerfile.is_file(), "contract": "qa/artifact-transfer"}
+    report.artifacts["artifactTransfer"] = artifact
+    if not dockerfile.is_file():
+        report.add(
+            "artifact-transfer", NOT_RUN,
+            "no tests/Dockerfile; separate-verifier transfer proof is not applicable",
+            blocking=False,
+        )
+        return
+    if contract.is_symlink():
+        report.add(
+            "artifact-transfer", FAIL,
+            "qa/artifact-transfer must be a tracked task-local executable, not a symlink",
+        )
+        return
+    if not contract.is_file():
+        report.add(
+            "artifact-transfer", NOT_RUN,
+            "tests/Dockerfile requires executable qa/artifact-transfer to prove the task-local "
+            "/app export/import/oracle lifecycle",
+        )
+        return
+    if not os.access(contract, os.X_OK):
+        report.add("artifact-transfer", NOT_RUN, "qa/artifact-transfer is not executable")
+        return
+
+    try:
+        candidate_sha = _git(repo_root, "rev-parse", "HEAD")
+        source_status = _git(repo_root, "status", "--porcelain", "--untracked-files=all")
+    except (OSError, subprocess.CalledProcessError) as error:
+        report.add("artifact-transfer", NOT_RUN, f"could not bind transfer contract: {error}")
+        return
+
+    result = None
+    setup_problem = ""
+    with tempfile.TemporaryDirectory(prefix="benchsmith-transfer-") as temporary:
+        root = Path(temporary)
+        snapshot = root / "repo"
+        snapshot.mkdir(mode=0o700)
+        archive = subprocess.Popen(
+            ["git", "-C", str(repo_root), "archive", "--format=tar", candidate_sha],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        extracted = subprocess.run(
+            ["tar", "-xf", "-", "-C", str(snapshot)],
+            stdin=archive.stdout,
+            capture_output=True,
+            timeout=300,
+        )
+        if archive.stdout is not None:
+            archive.stdout.close()
+        archive_stderr = archive.communicate(timeout=30)[1]
+        if archive.returncode or extracted.returncode:
+            detail = (archive_stderr or extracted.stderr or b"").decode(errors="replace")[:180]
+            setup_problem = f"could not create disposable exact-SHA export: {detail}"
+        else:
+            snapshot_task = snapshot / task_name
+            snapshot_contract = snapshot_task / "qa" / "artifact-transfer"
+            if not snapshot_contract.is_file() or snapshot_contract.is_symlink():
+                setup_problem = "qa/artifact-transfer is absent or a symlink in the committed snapshot"
+            elif not os.access(snapshot_contract, os.X_OK):
+                setup_problem = "qa/artifact-transfer is not executable in the committed snapshot"
+            else:
+                contract_digest = "sha256:" + hashlib.sha256(
+                    snapshot_contract.read_bytes()
+                ).hexdigest()
+                home = root / "home"
+                scratch = root / "tmp"
+                home.mkdir(mode=0o700)
+                scratch.mkdir(mode=0o700)
+                env = {
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": str(home),
+                    "TMPDIR": str(scratch),
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                    "BENCHSMITH_ARTIFACT_TRANSFER_SCHEMA": "1",
+                    "BENCHSMITH_CANDIDATE_SHA": candidate_sha,
+                    "BENCHSMITH_REPO": str(snapshot),
+                    "BENCHSMITH_TASK": task_name,
+                    "BENCHSMITH_TASK_DIR": str(snapshot_task),
+                }
+                run_contract = runner or subprocess.run
+                try:
+                    result = run_contract(
+                        [str(snapshot_contract)], cwd=snapshot_task, env=env,
+                        capture_output=True, text=True, timeout=3600,
+                    )
+                except subprocess.TimeoutExpired:
+                    report.add("artifact-transfer", TIMEOUT, "qa/artifact-transfer timed out")
+                except OSError as error:
+                    setup_problem = f"could not execute qa/artifact-transfer: {error}"
+                artifact.update(
+                    candidateSha=candidate_sha,
+                    contractDigest=contract_digest,
+                    environment=sorted(env),
+                )
+
+    try:
+        after_head = _git(repo_root, "rev-parse", "HEAD")
+        after_status = _git(repo_root, "status", "--porcelain", "--untracked-files=all")
+    except (OSError, subprocess.CalledProcessError) as error:
+        report.add(
+            "artifact-transfer", FAIL,
+            f"could not verify source checkout after qa/artifact-transfer: {error}",
+        )
+        return
+    if after_head != candidate_sha or after_status != source_status:
+        report.add(
+            "artifact-transfer", FAIL,
+            "qa/artifact-transfer mutated the source checkout; the contract ran only against "
+            "a disposable export and must not reach back into its source",
+        )
+        return
+    if any(check.name == "artifact-transfer" for check in report.checks):
+        return
+    if setup_problem:
+        report.add("artifact-transfer", NOT_RUN, setup_problem)
+        return
+    if result is None:
+        report.add("artifact-transfer", NOT_RUN, "qa/artifact-transfer produced no result")
+        return
+    artifact["exitCode"] = result.returncode
+    output = (result.stderr or result.stdout or "").strip().splitlines()
+    detail = output[-1][:160] if output else ""
+    report.add(
+        "artifact-transfer",
+        PASS if result.returncode == 0 else FAIL,
+        (
+            f"disposable /app export/import/oracle contract passed for {candidate_sha[:12]}"
+            if result.returncode == 0
+            else f"qa/artifact-transfer failed ({result.returncode})"
+            + (f": {detail}" if detail else "")
+        ),
+    )
+
+
 def run(
     *,
     repo_root: Path,
@@ -819,8 +997,13 @@ def run(
     require: tuple[str, ...] | None = None,
     hook_specs: list | None = None,
 ) -> Report:
+    task_name = validate_task_path(task_name)
+    repo_root = Path(repo_root).resolve()
+    task_dir = Path(task_dir).resolve()
+    if task_dir != (repo_root / task_name).resolve():
+        raise ValueError("task_dir does not match the validated task path")
     report = Report()
-    journal = Journal.open(Path(repo_root), task_name)
+    journal = Journal.open(repo_root, task_name)
     check_tags(task_dir, report)
     check_difficulty(task_dir, measured, report)
     check_config_integrity(task_dir, report)
@@ -843,6 +1026,7 @@ def run(
     check_diff(repo_root, report)
     check_formatting(repo_root, report, hook_specs)
     check_hygiene(task_dir, report)
+    check_artifact_transfer(task_dir, report)
     check_oracle(oracle_cmd, report)
     h = surface_hashes(task_dir)
     report.add("graded-hash", PASS, f"{h['gradedHash']} ({h['gradedFiles']} files)", blocking=False)
@@ -873,6 +1057,7 @@ def receipt_path(repo_root: Path, task_name: str) -> Path:
     very receipt just written -- the check would fail on its own side effect.
     Keyed by repo path so two checkouts of the same repo cannot share one.
     """
+    task_name = validate_task_path(task_name)
     key = hashlib.sha256(str(Path(repo_root).resolve()).encode()).hexdigest()[:12]
     base = Path(os.environ.get("BENCHSMITH_RECEIPT_DIR", Path.home() / ".cache" / "benchsmith" / "receipts"))
     return base / key / f"{task_name}.receipt.json"
@@ -891,7 +1076,374 @@ def canonical_receipt(repo_root: Path) -> Path | None:
     return None
 
 
-HOOK_RECEIPT = "/tmp/gate-receipt-{task}.json"
+HOOK_PROOF_VERSION = 2
+OUTER_HOOK_AUTHORITY = "BENCHSMITH_OUTER_HOOK_AUTHORITY"
+OUTER_HOOK_STATE = "BENCHSMITH_OUTER_HOOK_STATE"
+
+
+def _live_process_ancestor(ancestor_pid: object) -> bool:
+    """Return true only when the recorded issuer is a live strict ancestor."""
+    try:
+        wanted = int(ancestor_pid)
+    except (TypeError, ValueError):
+        return False
+    if wanted <= 1:
+        return False
+    current = os.getpid()
+    seen: set[int] = set()
+    while current > 1 and current not in seen:
+        seen.add(current)
+        try:
+            raw = Path(f"/proc/{current}/stat").read_text()
+            fields = raw[raw.rfind(")") + 2 :].split()
+            parent = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            try:
+                probe = subprocess.run(
+                    ["ps", "-o", "ppid=", "-p", str(current)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                parent = int(probe.stdout.strip()) if probe.returncode == 0 else 0
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                return False
+        if parent == wanted:
+            return Path(f"/proc/{wanted}").is_dir()
+        current = parent
+    return False
+
+
+def nested_hook_is_authorized(repo_root: Path, task_name: str) -> bool:
+    """Accept only a nested verify-receipt arm started by our private hook run."""
+    token = os.environ.get(OUTER_HOOK_AUTHORITY, "")
+    state_path = Path(os.environ.get(OUTER_HOOK_STATE, ""))
+    if not token or not state_path.is_file():
+        return False
+    try:
+        validated_task = validate_task_path(task_name)
+        parent_stat = state_path.parent.stat()
+        state_stat = state_path.stat()
+        parent_mode = stat.S_IMODE(parent_stat.st_mode)
+        mode = stat.S_IMODE(state_stat.st_mode)
+        document = json.loads(state_path.read_text())
+        current = _git(Path(repo_root), "rev-parse", "HEAD")
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return False
+    return bool(
+        parent_mode == 0o700
+        and mode == 0o600
+        and parent_stat.st_uid == os.getuid()
+        and state_stat.st_uid == os.getuid()
+        and document.get("token") == token
+        and document.get("task") == validated_task
+        and document.get("repo") == str(Path(repo_root).resolve())
+        and document.get("head") == current
+        and _live_process_ancestor(document.get("pid"))
+        and str(Path(os.environ.get("GATE_RECEIPT", "")).parent) == str(state_path.parent)
+    )
+
+
+def live_hook_identity(repo_root: Path) -> dict:
+    """Identify the exact pre-push hook Git would execute in this checkout."""
+    repo_root = Path(repo_root).resolve()
+    try:
+        raw = _git(repo_root, "rev-parse", "--git-path", "hooks/pre-push")
+    except (OSError, subprocess.CalledProcessError) as error:
+        return {"version": HOOK_PROOF_VERSION, "error": f"hook path is unreadable: {error}"}
+    path = Path(raw)
+    if not path.is_absolute():
+        path = repo_root / path
+    path = path.absolute()
+    identity = {
+        "version": HOOK_PROOF_VERSION,
+        "path": str(path),
+        "present": path.exists() or path.is_symlink(),
+        "executable": bool(path.exists() and os.access(path, os.X_OK)),
+        "symlink": path.is_symlink(),
+    }
+    if path.is_symlink():
+        try:
+            identity["linkTarget"] = os.readlink(path)
+        except OSError as error:
+            identity["error"] = f"hook symlink is unreadable: {error}"
+            return identity
+    if identity["present"]:
+        try:
+            identity["contentDigest"] = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            identity["error"] = f"hook content is unreadable: {error}"
+    return identity
+
+
+def resolve_publication_target(
+    repo_root: Path,
+    *,
+    remote: str = "origin",
+    branch: str = "",
+) -> dict:
+    """Resolve an omitted branch from the remote's actual default."""
+    repo_root = Path(repo_root).resolve()
+    remote = str(remote or "origin").strip()
+    requested = str(branch or "").strip()
+    try:
+        remote_url = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "--push", remote],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {
+            "ok": False,
+            "configured": False,
+            "remote": remote,
+            "branch": requested,
+            "reason": f"publication remote {remote!r} is unreadable: {error}",
+        }
+    if remote_url.returncode != 0:
+        if requested:
+            return {
+                "ok": False,
+                "configured": False,
+                "remote": remote,
+                "branch": requested,
+                "reason": f"publication remote {remote!r} is not configured",
+            }
+        return {"ok": True, "configured": False, "remote": remote, "branch": ""}
+    if requested:
+        return {
+            "ok": True,
+            "configured": True,
+            "remote": remote,
+            "branch": requested,
+            "remoteUrl": remote_url.stdout.strip(),
+        }
+
+    try:
+        symbolic = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "--quiet", "--short",
+             f"refs/remotes/{remote}/HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        symbolic = None
+    prefix = f"{remote}/"
+    resolved = symbolic.stdout.strip() if symbolic is not None else ""
+    if symbolic is not None and symbolic.returncode == 0 and resolved.startswith(prefix):
+        resolved = resolved[len(prefix):]
+    else:
+        try:
+            advertised = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-remote", "--symref", remote, "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return {
+                "ok": False,
+                "configured": True,
+                "remote": remote,
+                "branch": "",
+                "reason": f"could not read the default branch for publication remote {remote!r}: {error}",
+            }
+        resolved = ""
+        if advertised.returncode == 0:
+            for line in advertised.stdout.splitlines():
+                if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                    resolved = line[len("ref: refs/heads/") : -len("\tHEAD")]
+                    break
+    if not resolved:
+        return {
+            "ok": False,
+            "configured": True,
+            "remote": remote,
+            "branch": "",
+            "reason": f"could not resolve the default branch for publication remote {remote!r}",
+        }
+    return {
+        "ok": True,
+        "configured": True,
+        "remote": remote,
+        "branch": resolved,
+        "remoteUrl": remote_url.stdout.strip(),
+    }
+
+
+def _run_live_hook(
+    repo_root: Path,
+    task_name: str,
+    head: str,
+    hook_receipt: Path,
+    authority_path: Path,
+    authority_token: str,
+    *,
+    remote: str,
+    branch: str,
+) -> tuple[dict | None, str]:
+    """Execute the exact active foreign pre-push hook against the candidate."""
+    identity = live_hook_identity(repo_root)
+    if identity.get("error"):
+        return None, str(identity["error"])
+    proof = {
+        "version": HOOK_PROOF_VERSION,
+        "identity": identity,
+        "candidateSha": head,
+        "remote": remote,
+        "branch": branch,
+    }
+    try:
+        remote_url = _git(repo_root, "remote", "get-url", "--push", remote)
+    except (OSError, subprocess.CalledProcessError) as error:
+        return None, f"live pre-push hook proof could not resolve remote {remote}: {error}"
+    remote_ref = f"refs/heads/{branch}"
+    remote_result = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-remote", "--heads", remote, remote_ref],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if remote_result.returncode != 0:
+        return None, "live pre-push hook proof could not read the target remote"
+    fields = remote_result.stdout.split()
+    if len(fields) != 2 or fields[1] != remote_ref:
+        return None, f"target branch {remote}/{branch} does not exist; refusing hook attestation"
+    remote_sha = fields[0]
+    proof["remoteSha"] = remote_sha
+    if not identity.get("present") or not identity.get("executable"):
+        proof["state"] = "not-applicable"
+        return proof, ""
+
+    hook_path = Path(str(identity["path"]))
+    try:
+        hook_path.read_text(errors="replace")
+    except OSError as error:
+        return None, f"live pre-push hook is unreadable: {error}"
+
+    local_ref = subprocess.run(
+        ["git", "-C", str(repo_root), "symbolic-ref", "-q", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.strip() or "HEAD"
+    env = os.environ.copy()
+    env.update(
+        GATE_RECEIPT=str(hook_receipt),
+        BENCHSMITH_TASK=task_name,
+        BENCHSMITH_CANDIDATE_SHA=head,
+        **{
+            OUTER_HOOK_AUTHORITY: authority_token,
+            OUTER_HOOK_STATE: str(authority_path),
+        },
+    )
+    try:
+        result = subprocess.run(
+            [str(hook_path), remote, remote_url],
+            cwd=repo_root,
+            env=env,
+            input=f"{local_ref} {head} {remote_ref} {remote_sha}\n",
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "live pre-push hook timed out"
+    except OSError as error:
+        return None, f"live pre-push hook could not run: {error}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        return None, "live pre-push hook failed" + (f": {detail[-1][:200]}" if detail else "")
+    if live_hook_identity(repo_root) != identity:
+        return None, "live pre-push hook changed while it was being verified"
+    try:
+        after_head = _git(repo_root, "rev-parse", "HEAD")
+        dirty = bool(_git(repo_root, "status", "--porcelain"))
+    except (OSError, subprocess.CalledProcessError) as error:
+        return None, f"candidate changed during live hook proof: {error}"
+    if after_head != head or dirty:
+        return None, "live pre-push hook changed the exact candidate or dirtied the worktree"
+    proof.update(
+        state="passed",
+        outputDigest="sha256:" + hashlib.sha256(
+            ((result.stdout or "") + "\0" + (result.stderr or "")).encode()
+        ).hexdigest(),
+    )
+    return proof, ""
+
+
+def authenticate_live_hook(
+    repo_root: Path,
+    task_name: str,
+    receipt: dict,
+    *,
+    remote: str = "",
+    branch: str = "",
+) -> dict:
+    """Re-run the current outer hook from an already validated gate receipt."""
+    repo_root = Path(repo_root)
+    task_name = validate_task_path(task_name)
+    recorded = receipt.get("repositoryHook") or {}
+    bound_remote = str(recorded.get("remote") or "")
+    bound_branch = str(recorded.get("branch") or "")
+    requested_remote = str(remote or bound_remote)
+    requested_branch = str(branch or bound_branch)
+    if bound_remote and requested_remote != bound_remote:
+        return {"ok": False, "reason": "publication remote differs from the gate receipt"}
+    if bound_branch and requested_branch != bound_branch:
+        return {"ok": False, "reason": "publication branch differs from the gate receipt"}
+    if not bound_branch:
+        identity = live_hook_identity(repo_root)
+        if (
+            recorded.get("state") == "not-applicable"
+            and not identity.get("error")
+            and not identity.get("executable")
+        ):
+            return {"ok": True, "proof": recorded}
+        return {"ok": False, "reason": "gate receipt has no configured publication target"}
+    head = str(receipt.get("head") or "")
+    checks = receipt.get("checks") or {}
+    required = receipt.get("requiredChecks") or []
+    inapplicable = receipt.get("inapplicableChecks") or []
+    gates = {
+        name: {
+            PASS: "pass", FAIL: "fail", NOT_RUN: "not_run", TIMEOUT: "timeout"
+        }.get(checks.get(name), str(checks.get(name) or "").lower())
+        for name in required
+    }
+    document = {
+        "task": task_name,
+        "commit": head,
+        "dirty": False,
+        "gates": gates,
+        "inapplicable": inapplicable,
+        "source": "benchsmith-authentication",
+    }
+    with tempfile.TemporaryDirectory(prefix="benchsmith-hook-") as private_dir:
+        private = Path(private_dir)
+        private.chmod(0o700)
+        hook_path = private / "receipt.json"
+        hook_path.write_text(json.dumps(document, indent=1))
+        hook_path.chmod(0o600)
+        authority_path = private / "authority.json"
+        authority_token = secrets.token_hex(32)
+        authority_path.write_text(json.dumps({
+            "token": authority_token,
+            "repo": str(repo_root.resolve()),
+            "task": task_name,
+            "head": head,
+            "pid": os.getpid(),
+        }))
+        authority_path.chmod(0o600)
+        proof, problem = _run_live_hook(
+            repo_root, task_name, head, hook_path, authority_path, authority_token,
+            remote=requested_remote, branch=requested_branch,
+        )
+        if proof is None:
+            return {"ok": False, "reason": problem}
+        return {"ok": True, "proof": proof}
 
 
 def _push_policy(artifacts: dict) -> list[str]:
@@ -920,7 +1472,7 @@ def _receipt_requirements(report: Report) -> tuple[list[str], list[str]]:
 
 
 def _emit_hook_receipt(
-    repo_root: Path,
+    path: Path,
     task_name: str,
     report: Report,
     head: str,
@@ -928,8 +1480,7 @@ def _emit_hook_receipt(
     required_checks: list[str],
     inapplicable_checks: list[str],
 ) -> str:
-    """Also write the receipt the repo's own pre-push hook reads."""
-    path = Path(os.environ.get("GATE_RECEIPT") or HOOK_RECEIPT.format(task=task_name))
+    """Write the private, ephemeral receipt consumed by the live hook."""
     by_name = {check.name: check for check in report.checks}
     gates = {}
     for name in required_checks:
@@ -950,14 +1501,29 @@ def _emit_hook_receipt(
             "note": "gate names are benchsmith's checks, not the repo's G1-G5; "
                     "not_run and timeout are not pass",
         }, indent=1))
+        path.chmod(0o600)
     except OSError:
         return ""
     return str(path)
 
 
-def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_from: str = "") -> dict:
-    """Bind a passing gate run to an exact clean HEAD."""
+def write_receipt(
+    repo_root: Path,
+    task_name: str,
+    report: Report,
+    *,
+    derived_from: str = "",
+    remote: str = "origin",
+    branch: str = "",
+    defer_hook: bool = False,
+    expected_remote_sha: str = "",
+) -> dict:
+    """Bind a passing gate run and the repository hook to an exact clean HEAD."""
     repo_root = Path(repo_root)
+    try:
+        task_name = validate_task_path(task_name)
+    except ValueError as error:
+        return {"state": "not_written", "reason": str(error)}
     try:
         head = _git(repo_root, "rev-parse", "HEAD")
         tree = _git(repo_root, "rev-parse", "HEAD^{tree}")
@@ -980,35 +1546,97 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
         return {"state": "not_written",
                 "reason": "push-required checks are not PASS: " + ", ".join(unsafe)}
 
-    hook_path = Path(
-        os.environ.get("GATE_RECEIPT") or HOOK_RECEIPT.format(task=task_name)
-    )
-    hook_path.unlink(missing_ok=True)
     try:
         gate_fingerprint = safety.snapshot("gate")["digest"]
         publish_fingerprint = safety.snapshot("publish_policy")["digest"]
     except safety.SafetyRefused as error:
         return {"state": "not_written", "reason": str(error)}
 
-    # The task repos ship their own pre-push hook, and it reads a receipt at
-    # $GATE_RECEIPT (default /tmp/gate-receipt-<task>.json) with `commit`,
-    # `dirty` and a `gates` map that must be all-pass. Benchsmith wrote its
-    # receipt somewhere else in its own shape, so every benchsmith-gated push
-    # was rejected by the repo's hook -- two systems enforcing the same rule and
-    # refusing to believe each other.
-    #
-    # The emitted gates are benchsmith's own check names, not the repo's G1-G5.
-    # Renaming them to match would claim checks that did not run; a reader of
-    # this receipt sees exactly what was verified.
-    _emit_hook_receipt(
-        repo_root,
-        task_name,
-        report,
-        head.strip(),
-        dirty,
-        required_checks,
-        inapplicable_checks,
-    )
+    identity = live_hook_identity(repo_root)
+    if identity.get("error"):
+        return {"state": "not_written", "reason": str(identity["error"])}
+    target = resolve_publication_target(repo_root, remote=remote, branch=branch)
+    if not target.get("ok"):
+        return {"state": "not_written", "reason": str(target.get("reason") or "")}
+    resolved_remote = str(target.get("remote") or "")
+    resolved_branch = str(target.get("branch") or "")
+
+    hook_proof = None
+    if not target.get("configured"):
+        if identity.get("present") and identity.get("executable"):
+            return {
+                "state": "not_written",
+                "reason": "an executable pre-push hook exists but no publication target is configured",
+            }
+        hook_proof = {
+            "version": HOOK_PROOF_VERSION,
+            "identity": identity,
+            "candidateSha": head,
+            "remote": "",
+            "branch": "",
+            "remoteSha": "",
+            "state": "not-applicable",
+        }
+    elif defer_hook:
+        if not derived_from:
+            return {
+                "state": "not_written",
+                "reason": "live hook execution may be deferred only for a derived carry receipt",
+            }
+        try:
+            remote_sha = validate_sha(expected_remote_sha, "expected remote SHA")
+        except ValueError as error:
+            return {"state": "not_written", "reason": str(error)}
+        hook_proof = {
+            "version": HOOK_PROOF_VERSION,
+            "identity": identity,
+            "candidateSha": head,
+            "remote": resolved_remote,
+            "branch": resolved_branch,
+            "remoteSha": remote_sha,
+            "state": "deferred",
+        }
+    else:
+        with tempfile.TemporaryDirectory(prefix="benchsmith-hook-") as private_dir:
+            private = Path(private_dir)
+            private.chmod(0o700)
+            hook_path = private / "receipt.json"
+            authority_path = private / "authority.json"
+            authority_token = secrets.token_hex(32)
+            authority_path.write_text(json.dumps({
+                "token": authority_token,
+                "repo": str(repo_root.resolve()),
+                "task": task_name,
+                "head": head,
+                "pid": os.getpid(),
+            }))
+            authority_path.chmod(0o600)
+            emitted_hook = _emit_hook_receipt(
+                hook_path,
+                task_name,
+                report,
+                head.strip(),
+                dirty,
+                required_checks,
+                inapplicable_checks,
+            )
+            if not emitted_hook:
+                return {
+                    "state": "not_written",
+                    "reason": "could not write the private receipt consumed by the live pre-push hook",
+                }
+            hook_proof, hook_problem = _run_live_hook(
+                repo_root,
+                task_name,
+                head.strip(),
+                hook_path,
+                authority_path,
+                authority_token,
+                remote=resolved_remote,
+                branch=resolved_branch,
+            )
+            if hook_proof is None:
+                return {"state": "not_written", "reason": hook_problem}
 
     body = {
         "task": task_name,
@@ -1018,6 +1646,7 @@ def write_receipt(repo_root: Path, task_name: str, report: Report, *, derived_fr
         "ok": True,
         "gateFingerprint": gate_fingerprint,
         "publishPolicyFingerprint": publish_fingerprint,
+        "repositoryHook": hook_proof,
         "checks": {c.name: c.state for c in report.checks},
         "requiredChecks": required_checks,
         "inapplicableChecks": inapplicable_checks,
@@ -1069,6 +1698,31 @@ def _receipt_body(repo_root: Path, task_name: str) -> tuple[dict | None, str]:
         return None, "gate implementation changed; re-run the gate"
     if publish_fingerprint != current_publish:
         return None, "publish policy changed; re-run the gate"
+    hook_proof = body.get("repositoryHook")
+    if not isinstance(hook_proof, dict):
+        return None, "receipt predates live pre-push hook binding; re-run the gate"
+    recorded_hook = hook_proof.get("identity")
+    if not isinstance(recorded_hook, dict):
+        return None, "receipt live pre-push hook identity is malformed"
+    current_hook = live_hook_identity(repo_root)
+    if current_hook.get("error"):
+        return None, str(current_hook["error"])
+    if recorded_hook != current_hook:
+        return None, "live pre-push hook changed; re-run the gate"
+    hook_state = str(hook_proof.get("state") or "")
+    if hook_state not in {"passed", "not-applicable", "deferred"}:
+        return None, "receipt has no usable live pre-push hook proof"
+    if hook_state == "deferred":
+        if not body.get("derivedFrom"):
+            return None, "only a derived carry receipt may defer live hook execution"
+        if not hook_proof.get("remote") or not hook_proof.get("branch"):
+            return None, "deferred live hook proof has no bound publication target"
+        try:
+            validate_sha(str(hook_proof.get("remoteSha") or ""), "deferred hook remote SHA")
+        except ValueError as error:
+            return None, str(error)
+    if str(hook_proof.get("candidateSha") or "") != str(body.get("head") or ""):
+        return None, "live pre-push hook proof is for another candidate"
     if not body.get("ok"):
         return None, "receipt records a failing gate"
     policy = set(_push_policy(body.get("artifacts") or {}))
@@ -1144,11 +1798,21 @@ def verify_receipt(repo_root: Path, task_name: str) -> tuple[bool, str]:
     return (True, f"{body['source']} receipt {body['digest']} for {head[:8]}")
 
 
-CARRYABLE_CHECKS = frozenset({"oracle", "config-integrity", "tags"})
+CARRYABLE_CHECKS = frozenset({"oracle", "artifact-transfer", "config-integrity", "tags"})
 RERUN_ON_CARRY = frozenset(PUSH_REQUIRED) - CARRYABLE_CHECKS
 
 
-def carry_receipt(repo_root: Path, task_name: str, candidate: str) -> dict:
+def carry_receipt(
+    repo_root: Path,
+    task_name: str,
+    candidate: str,
+    *,
+    remote: str = "origin",
+    branch: str = "",
+    defer_hook: bool = False,
+    expected_remote_sha: str = "",
+    review_requests: dict | None = None,
+) -> dict:
     """Issue an exact-candidate receipt from whitelisted tree-invariant evidence."""
     repo_root = Path(repo_root)
     body, problem = _receipt_body(repo_root, task_name)
@@ -1167,24 +1831,54 @@ def carry_receipt(repo_root: Path, task_name: str, candidate: str) -> dict:
         return {"ok": False, "reason": "task tree changed; receipt evidence cannot be carried"}
 
     prior = body.get("checks") or {}
-    unavailable = sorted(name for name in CARRYABLE_CHECKS if prior.get(name) != PASS)
+    prior_artifacts = body.get("artifacts") or {}
+    artifact_required = bool((prior_artifacts.get("artifactTransfer") or {}).get("required"))
+    carryable = set(CARRYABLE_CHECKS)
+    if not artifact_required:
+        carryable.discard("artifact-transfer")
+    unavailable = sorted(name for name in carryable if prior.get(name) != PASS)
     if unavailable:
         return {"ok": False, "reason": "prior receipt lacks carryable evidence: " +
                 ", ".join(unavailable)}
 
     report = Report()
-    for name in sorted(CARRYABLE_CHECKS):
+    for artifact_name in ("artifactTransfer", "changeEvidence"):
+        artifact = prior_artifacts.get(artifact_name)
+        if isinstance(artifact, dict):
+            report.artifacts[artifact_name] = dict(artifact)
+    for name in sorted(carryable):
         report.add(name, PASS,
                    f"carried from {original[:12]} over identical task tree {before[:12]}")
+    if not artifact_required:
+        report.add(
+            "artifact-transfer",
+            NOT_RUN,
+            "no tests/Dockerfile in the byte-identical task tree",
+            blocking=False,
+        )
     check_scope(repo_root, task_name, report)
     check_diff(repo_root, report)
     check_contamination(repo_root, report)
-    check_findings(task_name, Journal.open(repo_root, task_name), report)
+    check_findings(
+        task_name,
+        Journal.open(repo_root, task_name),
+        report,
+        request_snapshot=review_requests,
+    )
     check_control_manifest(repo_root, repo_root / task_name, task_name, report)
     report.require(PUSH_REQUIRED)
     if not report.ok:
         return {"ok": False, "reason": "candidate controls did not pass", "report": report.as_dict()}
-    receipt = write_receipt(repo_root, task_name, report, derived_from=original)
+    receipt = write_receipt(
+        repo_root,
+        task_name,
+        report,
+        derived_from=original,
+        remote=remote,
+        branch=branch,
+        defer_hook=defer_hook,
+        expected_remote_sha=expected_remote_sha,
+    )
     if not receipt.get("ok"):
         return {"ok": False, "reason": receipt.get("reason", "receipt was not written")}
     return {"ok": True, "receipt": receipt, "carried": sorted(CARRYABLE_CHECKS),

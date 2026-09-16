@@ -636,7 +636,8 @@ class TaskStatusTableTest(unittest.TestCase):
         self.assertEqual(rows["active-task"]["status"], "revision: hardening")
         self.assertEqual(rows["active-task"]["workerSession"], "session-active")
         self.assertEqual(rows["active-task"]["submissionId"], "101")
-        self.assertEqual(rows["queued-task"]["status"], "next in queue")
+        self.assertEqual(payload["watches"][0]["task"], "queued-task")
+        self.assertNotIn("queued-task", rows)
 
     def test_fleet_native_skip_preserves_published_exact_sha_state(self):
         task_name = "ollo-ios-attempt-outbox-replay"
@@ -649,6 +650,9 @@ class TaskStatusTableTest(unittest.TestCase):
                 "status": "draft",
                 "validationStatus": "passing",
                 "validationCommitSha": SHA,
+                "tbdReviewStatus": "pass",
+                "tbdReviewDetails": {"instance_id": f"tbr-{SHA[:7]}"},
+                "agenticReview": {"status": "completed", "commitSha": SHA},
             }
         ]
         status.transition(
@@ -674,7 +678,19 @@ class TaskStatusTableTest(unittest.TestCase):
                 {"ok": True}
             )
             cli.controller_mod.verify_target = lambda *args, **kwargs: {"ok": True}
-            cli.sources.discover = lambda **kwargs: {"tasks": task_rows, "notes": []}
+            cli.sources.discover = lambda **kwargs: {
+                "tasks": task_rows,
+                "jobsByTask": {
+                    task_name: [{
+                        "id": "agentic-job",
+                        "status": "completed",
+                        "stage": "agentic-review",
+                        "config": {"commitSha": SHA},
+                        "agenticReview": {"verdict": "GOOD"},
+                    }]
+                },
+                "notes": [],
+            }
             cli.resolve_mod.resolve = lambda task, rows=None: {
                 "task": task,
                 "id": "9396",
@@ -729,8 +745,11 @@ class TaskStatusTableTest(unittest.TestCase):
         self.assertFalse(payload["taskStatus"]["rowChanged"])
         self.assertEqual(status.read(self.root), before)
 
+    @patch("benchsmith.publish.verify_handoff_evidence")
     @patch("benchsmith.dispatch.candidate_mod.verify_handoff")
-    def test_handoff_and_collect_do_not_repost_an_unchanged_table(self, _verify):
+    def test_handoff_and_collect_do_not_repost_an_unchanged_table(self, _verify, publication):
+        change = {"mode": "harden", "levers": ["graded"], "findings": []}
+        publication.return_value = {"change": change}
         dispatch.write_assignment(
             self.root,
             "task-one",
@@ -748,6 +767,14 @@ class TaskStatusTableTest(unittest.TestCase):
                     "base_sha": "b" * 40,
                     "commit_sha": SHA,
                     "gate_receipt": "receipt",
+                    "publication_evidence": {
+                        "schema_version": 1,
+                        "candidate_sha": SHA,
+                        "gate": {"digest": "receipt"},
+                        "reviews": {},
+                        "change": change,
+                    },
+                    "change_evidence": change,
                     "next_action": "publish",
                     "note": "gated and ready",
                     "evidence_url": "https://www.internalfb.com/intern/paste/P1/",

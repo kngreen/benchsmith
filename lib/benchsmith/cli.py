@@ -16,6 +16,7 @@ import subprocess
 import time
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from . import fixtures as fixtures_mod
@@ -48,7 +49,8 @@ from . import sources
 from . import stats as stats_mod
 from . import task_status as task_status_mod
 from .queue import (DEFAULT_WORKERS, MAX_WORKERS, Leases, build_queue, changes,
-                    fingerprint, read_journals, render, render_changes)
+                    fingerprint, fresh_intake_blockers, read_journals, render,
+                    render_changes)
 from .adapter import Identity, Platform, Unresolved, discover
 from .bar import evaluate
 from .journal import Journal, git_trailers, surface_hashes
@@ -350,6 +352,13 @@ def cmd_record(args) -> int:
 def cmd_gate(args) -> int:
     repo = Path(args.repo).resolve()
     if args.verify_receipt:
+        if gate_mod.nested_hook_is_authorized(repo, args.task):
+            _out({
+                "ok": True,
+                "deferredToOuterHook": True,
+                "reason": "nested verify-receipt deferred to the active outer hook",
+            })
+            return 0
         ok, why = gate_mod.verify_receipt(repo, args.task)
         _out({"ok": ok, "reason": why})
         return 0 if ok else 1
@@ -363,14 +372,27 @@ def cmd_gate(args) -> int:
         require=(gate_mod.PUSH_REQUIRED if args.require_push_set
                  else tuple(x for x in (args.require or "").split(",") if x)),
     )
-    receipt = gate_mod.write_receipt(repo, args.task, report) if report.ok else None
+    receipt = (
+        gate_mod.write_receipt(
+            repo,
+            args.task,
+            report,
+            remote=getattr(args, "remote", "origin"),
+            branch=getattr(args, "branch", ""),
+        )
+        if report.ok
+        else None
+    )
+    receipt_ok = bool(receipt and receipt.get("ok"))
     if args.json:
-        _out({**report.as_dict(), "receipt": receipt})
+        _out({**report.as_dict(), "receipt": receipt, "publicationReady": receipt_ok})
     else:
         print(report.render())
-        if receipt and receipt.get("digest"):
+        if receipt_ok:
             print(f"  receipt {receipt['digest']} ({receipt['source']}) for {receipt['head'][:8]}")
-    return 0 if report.ok else 1
+        elif report.ok:
+            print(f"  RECEIPT FAIL — {receipt.get('reason', 'publication evidence was not written')}")
+    return 0 if report.ok and receipt_ok else 1
 
 
 def cmd_queue(args) -> int:
@@ -383,11 +405,13 @@ def cmd_queue(args) -> int:
     else:
         raw = json.loads(Path(args.input).read_text()) if args.input else {}
     tasks = raw.get("tasks") if isinstance(raw, dict) else raw
+    status_rows = (task_status_mod.peek(repo).get("rows") or {})
     items = build_queue(
         tasks or [],
         journals=read_journals(repo),
         leases=Leases(repo).active(),
         ideas=raw.get("ideas") if isinstance(raw, dict) else None,
+        status_rows=status_rows,
     )
     ready = [i for i in items if i.dispatchable]
 
@@ -413,6 +437,7 @@ def cmd_queue(args) -> int:
         "changes": ch if ch["changed"] else None,
         "changeBrief": render_changes(ch) or None,
         "dispatchable": len(ready),
+        "freshIntakeBlockedBy": fresh_intake_blockers(items, status_rows),
         "gsd": raw.get("gsd") if isinstance(raw, dict) else None,
         "notes": raw.get("notes") if isinstance(raw, dict) else [],
         "next": [i.as_dict() for i in ready[: args.workers]],
@@ -550,6 +575,18 @@ def _active_table_leases(
     return claims
 
 
+def _status_epoch(row: dict, source: dict) -> float | None:
+    value = row.get("updatedAt") or source.get("validationUpdatedAt") or source.get("updatedAt")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 @dataclass
 class FleetSnapshot:
     raw: dict
@@ -558,6 +595,7 @@ class FleetSnapshot:
     waiting: list
     watches: list[dict]
     publications: list[dict]
+    fresh_intake_blockers: list[str]
     needs_board: dict | None
     workers: int
     clamp_note: str | None
@@ -585,18 +623,19 @@ def _discover_fleet(
     ).items():
         leases.setdefault(task, owner)
 
-    def classify(raw: dict) -> tuple[list, list[dict], list[dict]]:
-        items = build_queue(
-            raw.get("tasks") or [],
-            journals=journals,
-            leases=leases,
-            ideas=raw.get("ideas") or [],
-        )
+    def classify(raw: dict) -> tuple[list, list[dict], list[dict], list[str]]:
         status_reader = (
             task_status_mod.read if reap_expired_leases else task_status_mod.peek
         )
         status_rows = (
             status_reader(repo, status_repo=status_repo).get("rows") or {}
+        )
+        items = build_queue(
+            raw.get("tasks") or [],
+            journals=journals,
+            leases=leases,
+            ideas=raw.get("ideas") or [],
+            status_rows=status_rows,
         )
         raw_by_name = {
             str(row.get("name") or row.get("id") or ""): row
@@ -609,39 +648,68 @@ def _discover_fleet(
         }
         watches: list[dict] = []
         publications: list[dict] = []
+        released_intake_holds: set[str] = set()
+        jobs_by_task = raw.get("jobsByTask") or {}
+        job_problems = raw.get("jobProblems") or {}
         for item in items:
             row = status_rows.get(item.task) or {}
             status = str(row.get("status") or "")
-            sha = str(row.get("sha") or "")
             source = raw_by_id.get(str(row.get("submissionId") or "")) or raw_by_name.get(item.task) or {}
-            if status == task_status_mod.VALIDATING and sha:
-                watched = watch_mod.classify(source, sha)
-                watched["task"] = item.task
-                if watched.get("state") != watch_mod.TERMINAL:
-                    item.skip = f"exact-SHA watch: {watched.get('reason') or watched.get('state')}"
-                    watches.append(watched)
-            elif status == task_status_mod.READY_TO_PUBLISH:
+            sha = str(row.get("sha") or source.get("validationCommitSha") or "")
+            platform_watch = (
+                item.status == "draft"
+                and item.validation in (watch_mod.PENDING_STATES | watch_mod.PASSING_VALIDATION)
+            )
+            if status == task_status_mod.READY_TO_PUBLISH:
                 item.skip = "candidate is ready for coordinator publication"
                 publications.append({"task": item.task, "sha": sha, "state": "ready"})
             elif status == task_status_mod.READY_GREEN:
                 item.skip = "task is ready to submit"
-        return items, watches, publications
+            elif (
+                status in {
+                    task_status_mod.VALIDATING,
+                    task_status_mod.AWAITING_AGENTIC_REVIEW,
+                    task_status_mod.MONITORING_EXTERNAL_UNKNOWN,
+                }
+                or platform_watch
+            ) and sha:
+                watched = watch_mod.classify(
+                    source,
+                    sha,
+                    jobs=jobs_by_task.get(item.task),
+                    jobs_problem=str(job_problems.get(item.task) or ""),
+                    pushed_at=_status_epoch(row, source),
+                )
+                watched["task"] = item.task
+                if watched.get("state") != watch_mod.TERMINAL:
+                    item.skip = f"exact-SHA watch: {watched.get('reason') or watched.get('state')}"
+                    watches.append(watched)
+                if watched.get("blocksFreshIntake") is False:
+                    released_intake_holds.add(item.task)
+        blockers = fresh_intake_blockers(
+            items, status_rows, released=released_intake_holds
+        )
+        if not blockers:
+            for item in items:
+                if item.skip.startswith("fresh intake held while"):
+                    item.skip = ""
+        return items, watches, publications, blockers
 
     raw = sources.discover(cfg=cfg, with_gsd=False)
     source = (raw.get("sourceStatus") or {}).get("codimango")
     source_ok = True if source is None else bool(source.get("ok"))
     source_error = "" if source_ok else str(source.get("reason") or "Codimango source is unreadable")
-    items, watches, publications = classify(raw)
+    items, watches, publications, intake_blockers = classify(raw)
     ready = [item for item in items if item.dispatchable]
     needs_board = None
 
-    if source_ok and len(ready) < args.workers and not args.no_gsd:
+    if source_ok and not intake_blockers and len(ready) < args.workers and not args.no_gsd:
         if cfg.configured:
             raw = sources.discover(cfg=cfg, with_gsd=True)
             source = (raw.get("sourceStatus") or {}).get("codimango")
             source_ok = True if source is None else bool(source.get("ok"))
             source_error = "" if source_ok else str(source.get("reason") or "Codimango source is unreadable")
-            items, watches, publications = classify(raw)
+            items, watches, publications, intake_blockers = classify(raw)
             ready = [item for item in items if item.dispatchable]
         else:
             needs_board = {
@@ -668,6 +736,7 @@ def _discover_fleet(
         waiting=ready[workers:],
         watches=watches,
         publications=publications,
+        fresh_intake_blockers=intake_blockers,
         needs_board=needs_board,
         workers=workers,
         clamp_note=clamp_note,
@@ -686,6 +755,7 @@ def _idle_fleet_payload(snapshot: FleetSnapshot) -> dict:
         "admission": {"skipped": True, "reason": "no worker-dispatch action"},
         "watches": snapshot.watches,
         "publicationReady": snapshot.publications,
+        "freshIntakeBlockedBy": snapshot.fresh_intake_blockers,
         "plans": [],
         "started": [],
         "notes": snapshot.raw.get("notes") or [],
@@ -1092,6 +1162,7 @@ def _cmd_fleet(
                "actionable": snapshot.actionable,
                "watches": snapshot.watches,
                "publicationReady": snapshot.publications,
+               "freshIntakeBlockedBy": snapshot.fresh_intake_blockers,
                "workers": workers, "applied": bool(args.apply),
                # Named because it is the only thing that serialises: one publish
                # lane per repository. It is held for a push and released before
@@ -1808,6 +1879,24 @@ def cmd_watch(args) -> int:
     return 0 if res["state"] == watch_mod.TERMINAL else 1
 
 
+def cmd_status_clear(args) -> int:
+    """Release an exact-SHA active intake hold without altering its evidence row."""
+    try:
+        result = task_status_mod.clear_external_signal_hold(
+            Path(args.repo).resolve(),
+            args.task,
+            args.sha,
+            args.reason,
+            status_repo=getattr(args, "status_repo", "") or None,
+            apply=args.apply,
+        )
+    except (ValueError, task_status_mod.StatusTableError) as error:
+        _out({"ok": False, "reason": str(error)})
+        return 2
+    _out(result)
+    return 0
+
+
 def cmd_collect(args) -> int:
     """Read one worker's handoff — from disk first, then the session journal."""
     res = dispatch_mod.collect(args.session_id, repo=args.repo, task=args.task)
@@ -1872,7 +1961,7 @@ def cmd_handoff(args) -> int:
             args.task,
             document,
             remote=args.remote,
-            branch=getattr(args, "branch", "main"),
+            branch=getattr(args, "branch", ""),
         )
     except dispatch_mod.CandidateHandoffRefused as error:
         handoff = error.handoff or document
@@ -2089,8 +2178,30 @@ def cmd_publish(args) -> int:
 
 def cmd_critic_receipt(args) -> int:
     result = critic_mod.ingest(Path(args.repo).resolve(), args.task, args.sha, args.session_id)
+    if result.get("ok"):
+        try:
+            result["publicationEvidence"] = publish_mod.publication_evidence(
+                Path(args.repo).resolve(), args.task, args.sha
+            )
+        except publish_mod.PublishRefused as error:
+            result["publicationEvidenceError"] = str(error)
     _out(result)
     return 0 if result.get("ok") else 1
+
+
+def cmd_publication_evidence(args) -> int:
+    """Compose the only typed object accepted by ready-to-publish handoffs."""
+    try:
+        evidence = publish_mod.publication_evidence(
+            Path(args.repo).resolve(), args.task, args.sha,
+            remote=getattr(args, "remote", "origin"),
+            branch=getattr(args, "branch", ""),
+        )
+    except publish_mod.PublishRefused as error:
+        _out({"ok": False, "reason": str(error)})
+        return 1
+    _out({"ok": True, "publicationEvidence": evidence, "changeEvidence": evidence["change"]})
+    return 0
 
 
 def cmd_controls(args) -> int:
@@ -2222,6 +2333,10 @@ def main(argv: list[str] | None = None) -> int:
     s = common(sub.add_parser("gate", help="run the pre-push gate"))
     s.add_argument("--measured", default=None)
     s.add_argument("--oracle", default=os.environ.get("BENCHSMITH_ORACLE", ""))
+    s.add_argument("--remote", default="origin",
+                   help="remote whose live pre-push hook contract is exercised")
+    s.add_argument("--branch", default="",
+                   help="target branch; omitted resolves the remote's default branch")
     s.add_argument("--json", action="store_true")
     s.add_argument("--verify-receipt", action="store_true",
                    help="check an existing receipt against the exact clean HEAD")
@@ -2430,6 +2545,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="coordinator checkout holding the shared task-status table")
     s.set_defaults(fn=cmd_watch)
 
+    s = common(sub.add_parser(
+        "status-clear", help="release an exact-SHA active lifecycle intake hold"
+    ))
+    s.add_argument("--sha", required=True)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--status-repo", default="")
+    s.add_argument("--apply", action="store_true")
+    s.set_defaults(fn=cmd_status_clear)
+
     s = sub.add_parser("collect", help="read a worker session and return its handoff")
     s.add_argument("--session-id", required=True)
     s.add_argument("--repo", default="", help="read the handoff file from here first")
@@ -2441,7 +2565,7 @@ def main(argv: list[str] | None = None) -> int:
     s = common(sub.add_parser("handoff", help="persist a terminal handoff and release its lease"))
     s.add_argument("input", nargs="?", default="-")
     s.add_argument("--remote", default="origin")
-    s.add_argument("--branch", default="main")
+    s.add_argument("--branch", default="")
     s.set_defaults(fn=cmd_handoff)
 
     s = sub.add_parser("resolve", help="task name, id, or submissions URL -> a bound task")
@@ -2508,7 +2632,7 @@ def main(argv: list[str] | None = None) -> int:
     s = common(sub.add_parser("publish", help="the single publication lane for this repository"))
     s.add_argument("--handoff", default="", help="worker handoff JSON (default: stdin)")
     s.add_argument("--remote", default="origin")
-    s.add_argument("--branch", default="main")
+    s.add_argument("--branch", default="")
     s.add_argument("--run-id", default="")
     s.add_argument("--apply", action="store_true", help="actually push")
     s.add_argument("--allow-review-status", default="",
@@ -2524,6 +2648,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--session-id", required=True)
     s.add_argument("--sha", required=True)
     s.set_defaults(fn=cmd_critic_receipt)
+
+    s = common(sub.add_parser(
+        "publication-evidence", help="compose exact-SHA gate and review evidence for handoff"
+    ))
+    s.add_argument("--sha", required=True)
+    s.add_argument("--remote", default="origin")
+    s.add_argument("--branch", default="")
+    s.set_defaults(fn=cmd_publication_evidence)
 
     s = common(sub.add_parser("controls", help="resolve declared, detected, and required controls"))
     s.set_defaults(fn=cmd_controls)

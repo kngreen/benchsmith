@@ -20,7 +20,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .resolve import publication_eligibility, work_eligibility
-from .watch import PENDING_STATES, TERMINAL_STATES
+from .task_status import (
+    INTAKE_BLOCKING_STATUSES as ACTIVE_LIFECYCLE_STATUSES,
+    INTAKE_HOLD_CLEARED_SHA,
+)
+from .identifiers import (
+    VALIDATION_PASSING_STATES,
+    VALIDATION_PENDING_STATES as PENDING_STATES,
+    VALIDATION_TERMINAL_STATES as TERMINAL_STATES,
+    validate_task_path,
+)
 
 # Lower sorts first. Cheapest evidence first: a reviewer who already said what is
 # wrong beats a measurement you have not taken yet.
@@ -36,6 +45,10 @@ TIER_IDEA = 70           # most expensive: intake, screen, scaffold
 # work exists; a platform row is work that demonstrably exists.
 GSD_TIERS = {"gsd_review": TIER_GSD_REVIEW, "gsd_scaffold": TIER_GSD_SCAFFOLD,
              "idea": TIER_IDEA}
+FRESH_INTAKE_TIERS = frozenset(GSD_TIERS.values())
+ACTIVE_PLATFORM_TIERS = frozenset({
+    TIER_REVISION, TIER_DRAFT_FAILED, TIER_DRAFT_PENDING, TIER_DRAFT_PASSING,
+})
 
 TIER_NAMES = {
     TIER_REVISION: "needs_revision",
@@ -72,8 +85,8 @@ DEFAULT_WORKERS = 8
 # warning rather than refused: the caller may know something this does not.
 MAX_WORKERS = 15
 
-PASSING_VALIDATION = frozenset({"completed", "passing", "passed"})
-FAILING_VALIDATION = frozenset(TERMINAL_STATES) - PASSING_VALIDATION
+PASSING_VALIDATION = VALIDATION_PASSING_STATES
+FAILING_VALIDATION = TERMINAL_STATES - PASSING_VALIDATION
 
 
 @dataclass
@@ -83,6 +96,7 @@ class Item:
     reason: str
     status: str = ""
     validation: str = ""
+    sha: str = ""
     journal_status: str = ""
     claimed_by: str | None = None
     skip: str = ""
@@ -102,6 +116,7 @@ class Item:
             "reason": self.reason,
             "status": self.status,
             "validation": self.validation,
+            "sha": self.sha,
             "journalStatus": self.journal_status,
             "claimedBy": self.claimed_by,
             "skip": self.skip,
@@ -154,8 +169,46 @@ def read_journals(repo_root: Path) -> dict[str, str]:
     return out
 
 
+def fresh_intake_blockers(
+    items: list[Item],
+    status_rows: dict | None = None,
+    *,
+    released: set[str] | None = None,
+) -> list[str]:
+    """Name existing actionable work that must drain before board intake starts."""
+    released = released or set()
+    rows = status_rows or {}
+
+    def explicitly_cleared(task: str, expected_sha: str | None = None) -> bool:
+        row = rows.get(task) or {}
+        cleared_sha = str(row.get(INTAKE_HOLD_CLEARED_SHA) or "")
+        row_sha = str(row.get("statusSha") or row.get("sha") or "")
+        return bool(
+            cleared_sha
+            and cleared_sha == row_sha
+            and (expected_sha is None or cleared_sha == expected_sha)
+        )
+
+    blocked = {
+        item.task
+        for item in items
+        if item.tier in ACTIVE_PLATFORM_TIERS
+        and item.task not in released
+        and not explicitly_cleared(item.task, item.sha)
+    }
+    for task, row in rows.items():
+        if (
+            str((row or {}).get("status") or "") in ACTIVE_LIFECYCLE_STATUSES
+            and str(task) not in released
+            and not explicitly_cleared(str(task))
+        ):
+            blocked.add(str(task))
+    return sorted(blocked)
+
+
 def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
-                leases: dict[str, str] | None = None, ideas: list[dict] | None = None) -> list[Item]:
+                leases: dict[str, str] | None = None, ideas: list[dict] | None = None,
+                status_rows: dict | None = None) -> list[Item]:
     """Deterministic prioritised backlog. Pure: no IO, no clock, no network."""
     journals, leases = journals or {}, leases or {}
     items: list[Item] = []
@@ -164,6 +217,11 @@ def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
         name = str(t.get("name") or t.get("id") or "")
         if not name:
             continue
+        try:
+            validate_task_path(name)
+            path_problem = ""
+        except ValueError as error:
+            path_problem = str(error)
         status = str(t.get("status") or "")
         validation = str(t.get("validationStatus") or "")
         tiered = _tier(status, validation)
@@ -180,11 +238,15 @@ def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
             )
         jstatus = journals.get(name, "")
         item = Item(task=name, tier=tier, reason=reason, status=status,
-                    validation=validation, journal_status=jstatus,
+                    validation=validation,
+                    sha=str(t.get("validationCommitSha") or t.get("commitSha") or ""),
+                    journal_status=jstatus,
                     claimed_by=leases.get(name), work_eligible=work.eligible,
                     publication_eligible=publication.eligible,
                     publication_reason=publication.reason)
-        if jstatus in TERMINAL:
+        if path_problem:
+            item.skip = path_problem
+        elif jstatus in TERMINAL:
             item.skip = f"journal says {jstatus}"
         elif jstatus in NEEDS_HUMAN:
             item.skip = f"journal says {jstatus}: needs a human before redispatch"
@@ -210,15 +272,30 @@ def build_queue(tasks: list[dict], journals: dict[str, str] | None = None,
         item = Item(task=name, tier=tier,
                     reason=str(idea.get("title") or "")[:80] or "unscaffolded idea",
                     claimed_by=leases.get(name))
+        try:
+            validate_task_path(name)
+        except ValueError as error:
+            item.skip = str(error)
         # A suspected duplicate is queued and marked, never dropped. There is no
         # link field between a board card and a platform task, so the match is a
         # guess -- and a wrong guess that deletes loses real work silently.
-        if idea.get("duplicateOf"):
+        if not item.skip and idea.get("duplicateOf"):
             item.skip = f"probably duplicates {idea['duplicateOf']}; confirm before dispatch"
-        elif idea.get("unmappedSection"):
+        elif not item.skip and idea.get("unmappedSection"):
             item.skip = (f"section {idea['unmappedSection']!r} is not in the section map; "
                          "confirm it is work before dispatch")
         items.append(item)
+
+    blockers = fresh_intake_blockers(items, status_rows)
+    if blockers:
+        reason = (
+            "fresh intake held while existing platform/publication work is actionable: "
+            + ", ".join(blockers[:4])
+            + (f" (+{len(blockers) - 4} more)" if len(blockers) > 4 else "")
+        )
+        for item in items:
+            if item.tier in FRESH_INTAKE_TIERS and not item.skip:
+                item.skip = reason
 
     # Stable and total: tier, then name. Never insertion order -- a coordinator
     # that restarts must compute the identical plan.
@@ -242,7 +319,7 @@ class Leases:
         return d
 
     def _path(self, task: str) -> Path:
-        return self.dir() / f"{task}.lease"
+        return self.dir() / f"{validate_task_path(task)}.lease"
 
     def owner(self) -> str:
         return f"{socket.gethostname()}:{os.getpid()}"

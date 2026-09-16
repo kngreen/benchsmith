@@ -195,9 +195,14 @@ the track requires, and treat a missing row as a missing pass:
 
 `review-critic` comes from a trusted receipt, not an operator-supplied row.
 `codimango-review-critic` runs in a separate session (§10a) and emits task ID, exact SHA, critic
-version, isolated session ID, decision, evidence digest, and timestamp. Benchsmith fetches that
-terminal transcript and stores the receipt outside the task worktree. Missing, malformed, stale,
-or locally substituted content leaves the row absent.
+version, isolated session ID, decision, evidence digest, and timestamp. Benchsmith caches that
+receipt outside the task worktree, but the cache and its self-digest are not authority: publication
+and handoff finalization re-fetch the terminal session transcript by session ID and require it to
+reproduce the exact canonical+critic evidence. A tree-identical rebase re-authenticates the source
+session and verifies both task trees before accepting the derived receipt. If more events were
+appended after ingestion without changing the receipt block, verification still fails closed with an
+actionable instruction to re-ingest the session and regenerate the handoff. Missing, malformed,
+stale, unreachable, or locally substituted content leaves the row absent.
 
 The gate passes only when every required row is `state: completed`, `matchesActive: true`,
 `selection: exact-head`, `stale: false`, and a passing `verdict`. Any other combination is the

@@ -805,6 +805,144 @@ class ControllerTest(unittest.TestCase):
 
         self.assertEqual([item.task for item in snapshot.ready], ["T1"])
 
+    def test_fleet_does_not_fetch_or_dispatch_fresh_intake_while_platform_work_exists(self) -> None:
+        args = self.fleet_args(self.repo, str(self.status))
+        args.no_gsd = False
+        args.workers = 3
+        config = SimpleNamespace(
+            configured=True,
+            sections={},
+            assignee="",
+            as_dict=lambda: {"configured": True},
+        )
+        calls = []
+
+        def discover(*, with_gsd, **_kwargs):
+            calls.append(with_gsd)
+            if with_gsd:
+                self.fail("fresh GSD intake must not run while a draft/revision row exists")
+            return {
+                "tasks": [{
+                    "name": "existing-revision",
+                    "id": "201",
+                    "status": "needs_revision",
+                    "validationStatus": "failed",
+                }],
+                "ideas": [],
+                "notes": [],
+                "sourceStatus": {"codimango": {"ok": True}},
+            }
+
+        with (
+            patch.object(cli.config_mod, "load", return_value=config),
+            patch.object(cli.sources, "discover", side_effect=discover),
+        ):
+            snapshot = cli._discover_fleet(
+                args, self.repo, self.status, reap_expired_leases=False
+            )
+
+        self.assertEqual(calls, [False])
+        self.assertEqual(snapshot.fresh_intake_blockers, ["existing-revision"])
+        self.assertEqual([item.task for item in snapshot.ready], ["existing-revision"])
+
+    def test_status_clear_releases_absent_active_rows_without_deleting_them(self) -> None:
+        args = self.fleet_args(self.repo, str(self.status))
+        args.no_gsd = False
+        args.workers = 2
+        config = SimpleNamespace(
+            configured=True,
+            sections={},
+            assignee="",
+            as_dict=lambda: {"configured": True},
+        )
+
+        def run_discovery(calls):
+            def discover(*, with_gsd, **_kwargs):
+                calls.append(with_gsd)
+                return {
+                    "tasks": [],
+                    "ideas": ([{"name": "T1", "kind": "idea", "title": "seed"}]
+                              if with_gsd else []),
+                    "notes": [],
+                    "sourceStatus": {"codimango": {"ok": True}},
+                }
+
+            with (
+                patch.object(cli.config_mod, "load", return_value=config),
+                patch.object(cli.sources, "discover", side_effect=discover),
+            ):
+                return cli._discover_fleet(
+                    args, self.repo, self.status, reap_expired_leases=False
+                )
+
+        for index, active_status in enumerate(
+            (task_status.VALIDATING, task_status.READY_TO_PUBLISH), start=1
+        ):
+            with self.subTest(status=active_status):
+                task = f"absent-active-{index}"
+                sha = str(index) * 40
+                task_status.update(
+                    self.repo,
+                    {
+                        "task": task,
+                        "status": active_status,
+                        "statusSource": "publish" if active_status == task_status.VALIDATING
+                        else "worker",
+                        "sha": sha,
+                        "validation": "running" if active_status == task_status.VALIDATING
+                        else "",
+                    },
+                    status_repo=self.status,
+                )
+
+                before_calls = []
+                before = run_discovery(before_calls)
+                self.assertEqual(before_calls, [False])
+                self.assertIn(task, before.fresh_intake_blockers)
+                self.assertEqual(before.ready, [])
+
+                with self.assertRaisesRegex(
+                    task_status.StatusTableError, "does not match"
+                ):
+                    task_status.clear_external_signal_hold(
+                        self.repo,
+                        task,
+                        "f" * 40,
+                        "platform row no longer lists this task",
+                        status_repo=self.status,
+                        apply=True,
+                    )
+
+                cleared = task_status.clear_external_signal_hold(
+                    self.repo,
+                    task,
+                    sha,
+                    "platform row no longer lists this task",
+                    status_repo=self.status,
+                    apply=True,
+                )
+                self.assertTrue(cleared["ok"])
+                row = task_status.read(
+                    self.repo, status_repo=self.status
+                )["rows"][task]
+                self.assertEqual(row["status"], active_status)
+                self.assertEqual(row["sha"], sha)
+                self.assertEqual(
+                    row[task_status.INTAKE_HOLD_CLEARED_SHA], sha
+                )
+
+                after_calls = []
+                after = run_discovery(after_calls)
+                self.assertEqual(after_calls, [False, True])
+                self.assertEqual(after.fresh_intake_blockers, [])
+                self.assertEqual([item.task for item in after.ready], ["T1"])
+                self.assertIn(
+                    task,
+                    task_status.read(
+                        self.repo, status_repo=self.status
+                    )["rows"],
+                )
+
     def test_preview_source_failure_fails_before_admission(self) -> None:
         args = self.fleet_args(self.repo, str(self.status))
         with (
@@ -827,6 +965,99 @@ class ControllerTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(controller.ControllerRefused, "source is unreadable"):
                 cli.cmd_fleet(args)
+
+    def test_expired_unknown_external_signal_does_not_block_fresh_intake(self) -> None:
+        task = "task-signal-unknown"
+        sha = "a" * 40
+        task_status.update(
+            self.repo,
+            {
+                "task": task,
+                "status": task_status.AWAITING_AGENTIC_REVIEW,
+                "statusSource": "platform",
+                "sha": sha,
+                "validation": "passing",
+            },
+            status_repo=self.status,
+            now="2026-09-15T00:00:00Z",
+        )
+        args = self.fleet_args(self.repo, str(self.status))
+        args.no_gsd = False
+        args.workers = 2
+        config = SimpleNamespace(
+            configured=True, sections={}, assignee="", as_dict=lambda: {"configured": True}
+        )
+        calls = []
+
+        def discover(*, with_gsd, **_kwargs):
+            calls.append(with_gsd)
+            return {
+                "tasks": [{
+                    "name": task,
+                    "id": "901",
+                    "status": "draft",
+                    "validationStatus": "passing",
+                    "validationCommitSha": sha,
+                }],
+                "jobsByTask": {},
+                "jobProblems": {task: "job service unavailable"},
+                "ideas": ([{"name": "T1", "kind": "idea", "title": "new work"}]
+                          if with_gsd else []),
+                "notes": [],
+                "sourceStatus": {"codimango": {"ok": True}},
+            }
+
+        with (
+            patch.object(cli.config_mod, "load", return_value=config),
+            patch.object(cli.sources, "discover", side_effect=discover),
+        ):
+            snapshot = cli._discover_fleet(
+                args, self.repo, self.status, reap_expired_leases=False
+            )
+
+        self.assertEqual(calls, [False, True])
+        self.assertEqual(snapshot.fresh_intake_blockers, [])
+        self.assertEqual([item.task for item in snapshot.ready], ["T1"])
+        self.assertEqual(snapshot.watches[0]["state"], "unknown")
+        self.assertFalse(snapshot.watches[0]["blocksFreshIntake"])
+
+    def test_fleet_ready_to_publish_is_collected_before_old_platform_watch(self) -> None:
+        task = "task-ready"
+        sha = "c" * 40
+        task_status.update(
+            self.repo,
+            {
+                "task": task,
+                "status": task_status.READY_TO_PUBLISH,
+                "statusSource": "worker",
+                "sha": sha,
+            },
+            status_repo=self.status,
+        )
+        args = self.fleet_args(self.repo, str(self.status))
+        row = {
+            "name": task,
+            "id": "103",
+            "status": "draft",
+            "validationStatus": "passing",
+            "validationCommitSha": "d" * 40,
+        }
+        with patch.object(
+            cli.sources,
+            "discover",
+            return_value={
+                "tasks": [row],
+                "notes": [],
+                "sourceStatus": {"codimango": {"ok": True}},
+            },
+        ):
+            snapshot = cli._discover_fleet(
+                args, self.repo, self.status, reap_expired_leases=False
+            )
+
+        self.assertEqual(snapshot.watches, [])
+        self.assertEqual(snapshot.publications, [{"task": task, "sha": sha, "state": "ready"}])
+        self.assertEqual(snapshot.ready, [])
 
     def test_fleet_validating_row_is_watched_without_worker_admission(self) -> None:
         task = "task-validating"

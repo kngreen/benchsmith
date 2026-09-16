@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 
+from .identifiers import VALIDATION_PASSING_STATES
 from .resolve import work_eligibility
 
 
@@ -72,6 +73,27 @@ def fetch_codimango(binary: str = "codimango") -> tuple[list[dict], list[str]]:
         # an empty one.
         return [], ["codimango response had no `tasks` key; treating as unknown, not empty"]
     return rows, []
+
+
+def fetch_codimango_jobs(
+    task: dict, binary: str = "codimango"
+) -> tuple[list[dict] | None, str]:
+    """Read complete job rows for one task, including real Agentic review payloads."""
+    try:
+        from .adapter import Identity, Platform, discover
+
+        name = str(task.get("name") or "")
+        task_id = str(task.get("id") or task.get("taskId") or "")
+        task_uuid = str(task.get("uuid") or task.get("taskUuid") or "")
+        if not name or not (task_id or task_uuid):
+            return None, "task row lacks name or platform identity for job lookup"
+        platform = Platform(
+            discover(binary),
+            Identity(task_name=name, task_id=task_id, task_uuid=task_uuid),
+        )
+        return platform.jobs(), ""
+    except Exception as error:  # noqa: BLE001
+        return None, f"{type(error).__name__}: {error}"
 
 
 def fetch_gsd(cfg, limit: int = 200) -> tuple[list[dict], list[str]]:
@@ -234,6 +256,17 @@ def discover(*, binary: str = "codimango", cfg=None, with_gsd: bool = True,
     notes = list(fetch_notes)
     tasks, n2 = normalise_codimango(tasks, require_owner=require_owner)
     notes += n2
+    jobs_by_task: dict[str, list[dict]] = {}
+    job_problems: dict[str, str] = {}
+    for task in tasks:
+        if str(task.get("validationStatus") or "").lower() not in VALIDATION_PASSING_STATES:
+            continue
+        name = str(task.get("name") or "")
+        jobs, problem = fetch_codimango_jobs(task, binary=binary)
+        if jobs is None:
+            job_problems[name] = problem or "job rows are unavailable"
+        else:
+            jobs_by_task[name] = jobs
     ideas: list[dict] = []
     if with_gsd and cfg is not None:
         rows, n3 = fetch_gsd(cfg)
@@ -244,6 +277,8 @@ def discover(*, binary: str = "codimango", cfg=None, with_gsd: bool = True,
         notes += n4
     return {
         "tasks": tasks,
+        "jobsByTask": jobs_by_task,
+        "jobProblems": job_problems,
         "ideas": ideas,
         "notes": notes,
         "sourceStatus": source_status,

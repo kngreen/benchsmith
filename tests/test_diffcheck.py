@@ -33,6 +33,13 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
         (self.repo / "task" / "instruction.md").write_text("initial instruction\n")
         self._git("add", "-A")
         self._git("commit", "-qm", "base")
+        self.remote = Path(self.tempdir.name) / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-q", "-b", "main", str(self.remote)],
+            check=True,
+        )
+        self._git("remote", "add", "origin", str(self.remote))
+        self._git("push", "-q", "-u", "origin", "main")
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -376,12 +383,13 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
         self.assertTrue(all(not check.required for check in diff_checks.values()))
 
         receipt_dir = Path(self.tempdir.name) / "receipts"
-        hook_receipt = Path(self.tempdir.name) / "hook-receipt.json"
+        legacy_shared = Path(self.tempdir.name) / "predictable-hook-receipt.json"
+        legacy_shared.write_text('{"stale":true}\n')
         with mock.patch.dict(
             os.environ,
             {
                 "BENCHSMITH_RECEIPT_DIR": str(receipt_dir),
-                "GATE_RECEIPT": str(hook_receipt),
+                "GATE_RECEIPT": str(legacy_shared),
             },
         ):
             receipt = gate.write_receipt(self.repo, "task", report)
@@ -391,11 +399,10 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
                 {"diff-ratchet", "diff-weakening"},
             )
             self.assertTrue(gate.verify_receipt(self.repo, "task")[0])
-            emitted = json.loads(hook_receipt.read_text())
-            self.assertNotIn("diff-ratchet", emitted["gates"])
-            self.assertNotIn("diff-weakening", emitted["gates"])
+            self.assertEqual(receipt["repositoryHook"]["state"], "not-applicable")
+            self.assertEqual(legacy_shared.read_text(), '{"stale":true}\n')
 
-    def test_fingerprint_failure_removes_hook_receipt(self) -> None:
+    def test_fingerprint_failure_does_not_touch_legacy_shared_hook_receipt(self) -> None:
         report = gate.Report()
         for name in gate.PUSH_REQUIRED:
             report.add(name, gate.PASS, "fixture")
@@ -406,7 +413,7 @@ class ScriptPatchDiffCheckTest(unittest.TestCase):
             receipt = gate.write_receipt(self.repo, "task", report)
 
         self.assertEqual(receipt["state"], "not_written")
-        self.assertFalse(hook_receipt.exists())
+        self.assertEqual(hook_receipt.read_text(), '{"stale":true}\n')
 
     def test_legacy_receipt_without_fingerprints_requires_regate(self) -> None:
         report = gate.Report()

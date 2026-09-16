@@ -25,6 +25,7 @@ from pathlib import Path
 
 from . import candidate as candidate_mod
 from . import safety
+from .identifiers import validate_sha, validate_task_path
 
 # Probed against the live API, not assumed: `--harness` accepts `codex` and
 # `native`; `claude` and `metacode` are rejected by agentcloud\wire\HarnessKind.
@@ -38,7 +39,6 @@ AGENTCLOUD_HARNESSES = frozenset({"codex", "native"})
 DEFAULT_HARNESS = ""
 
 HANDOFF_LIMIT = 4096
-_FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 # The one host benchsmith is installed on. A worker that lands anywhere else
 # cannot run it: the repository is private, so the "just clone it" fallback
@@ -58,9 +58,10 @@ PROXY_PREAMBLE = (
 # holding N full transcripts is the context-exhaustion the fleet audit measured
 # at 550-724K input tokens per call, most of it spent waiting.
 HANDOFF_FIELDS = (
-    "work_item", "state", "base_sha", "commit_sha", "gate_receipt", "next_action", "note",
-    "source_base_sha", "carried_from_sha", "lease_token", "lease_task", "session",
-    "finalization", "submission_id", "validation", "review", "evidence_url", "status_repo",
+    "work_item", "state", "base_sha", "commit_sha", "gate_receipt", "publication_evidence",
+    "change_evidence", "next_action", "note", "source_base_sha", "carried_from_sha",
+    "lease_token", "lease_task", "session", "finalization", "submission_id", "validation",
+    "review", "evidence_url", "status_repo",
 )
 
 # Where a worker also writes its answer. Stdout is not durable: a launcher that
@@ -87,6 +88,13 @@ HANDOFF_STATES = frozenset({
 MODE_LABELS = {"harden": "harden", "repair": "revise", "revise": "revise",
                "scaffold": "scaffold", "review": "review"}
 MODE_ALIASES = {"revise": "repair"}
+
+
+def _safe_task(task: str) -> str:
+    try:
+        return validate_task_path(task)
+    except ValueError as error:
+        raise DispatchRefused(str(error)) from error
 
 
 def mode_label(mode: str) -> str:
@@ -139,6 +147,7 @@ def resume_block(repo: str, task: str) -> str:
     """
     import json as _json
 
+    task = _safe_task(task)
     path = Path(repo).expanduser() / ".benchsmith" / f"{task}.json"
     try:
         data = _json.loads(path.read_text())
@@ -205,7 +214,14 @@ def bootstrap_block(root: str | None = None, checkout: str = "") -> str:
     )
 
 
-def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
+def scaffold_prompt(
+    info: dict,
+    repo: str,
+    slug: str,
+    *,
+    publication_remote: str = "",
+    publication_branch: str = "",
+) -> str:
     """The brief for an IDEA, which is not a task yet.
 
     A GSD card has no slug, no directory and no oracle. Handing it to the repair
@@ -213,6 +229,12 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
     T288273925, where dispatch bound the card number as though it were a task
     name. An idea goes through intake and scaffolding, and intake can say KILL.
     """
+    target_args = (
+        f" --remote {shlex.quote(publication_remote)} --branch "
+        f"{shlex.quote(publication_branch)}"
+        if publication_remote and publication_branch
+        else ""
+    )
     return (
         f"This is an IDEA CARD, not an existing task. {info.get('gsd', '')} has no task "
         f"directory, no oracle and no measurements. Do NOT run the repair or hardening "
@@ -235,13 +257,18 @@ def scaffold_prompt(info: dict, repo: str, slug: str) -> str:
         "the oracle passes and the unchanged base fails, commit, and run the gate. If you cannot "
         "get that far, report `state=blocked` and say where you stopped; do not report a skeleton "
         "as a result.\n\n"
-        "YOU MAY NOT PUSH. Prepare the commit, run the gate, and stop.\n\n"
+        "YOU MAY NOT PUSH. Prepare the commit, run "
+        f"`\"$BENCHSMITH_BIN\" gate{target_args} --json`, and stop.\n\n"
         "**Finalize through the CLI; do not write the handoff file directly.** Pipe the JSON "
-        f"below to `$BENCHSMITH_BIN handoff --repo {shlex.quote(repo)} --task {shlex.quote(slug)}`. "
+        f"below to `$BENCHSMITH_BIN handoff --repo {shlex.quote(repo)} --task "
+        f"{shlex.quote(slug)}{target_args}`. "
         "It durably renames the handoff before releasing this worker's exact lease.\n\n"
         "```json\n"
         '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
-        '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
+        '"base_sha":"...","commit_sha":"...","gate_receipt":"...",'
+        '"publication_evidence":{"schema_version":1,"candidate_sha":"...","gate":{},"reviews":{},"change":{}},'
+        '"change_evidence":{"mode":"harden|repair","levers":[],"findings":[]},'
+        '"next_action":"...",'
         '"source_base_sha":"optional old base for a carried rebase",'
         '"carried_from_sha":"optional old candidate for a carried rebase",'
         '"note":"<=200 chars","validation":"...","review":"...","evidence_url":"https://..."}\n'
@@ -295,6 +322,8 @@ def review_prompt(task: str, repo: str, *, track: str = "", due: str = "") -> st
         "reconciling that costs more than the review saved.\n\n"
         "End the review with one machine-readable line produced from your actual evidence: "
         "`BENCHSMITH_CRITIC_RECEIPT={\"task_id\":\"...\",\"sha\":\"<full SHA>\","
+        "\"canonical_review\":{\"name\":\"<reviewer/version>\",\"decision\":\"Accept\","
+        "\"evidence_digest\":\"<64 lowercase hex>\"},"
         "\"critic_version\":\"...\",\"session_id\":\"<this session>\","
         "\"decision\":\"Accept|Request changes|Reject\","
         "\"evidence_digest\":\"<64 lowercase hex>\",\"timestamp\":\"<ISO-8601>\"}`. "
@@ -308,9 +337,24 @@ def review_prompt(task: str, repo: str, *, track: str = "", due: str = "") -> st
     )
 
 
-def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "hard-preferred",
-                  bootstrap: bool = False, resume: bool = True) -> str:
+def worker_prompt(
+    task: str,
+    repo: str,
+    *,
+    mode: str = "harden",
+    target: str = "hard-preferred",
+    bootstrap: bool = False,
+    resume: bool = True,
+    publication_remote: str = "",
+    publication_branch: str = "",
+) -> str:
     """The instruction a stage-3 worker gets. Deliberately narrow."""
+    target_args = (
+        f" --remote {shlex.quote(publication_remote)} --branch "
+        f"{shlex.quote(publication_branch)}"
+        if publication_remote and publication_branch
+        else ""
+    )
     return (
         (bootstrap_block(checkout=repo) if bootstrap else "")
         + (resume_block(repo, task) if resume else "")
@@ -326,18 +370,27 @@ def worker_prompt(task: str, repo: str, *, mode: str = "harden", target: str = "
         'Run `"$BENCHSMITH_BIN" preflight` first and honour what it says degrades.\n'
         f"BENCHSMITH_MODE={mode}. BENCHSMITH_TARGET={target}.\n"
         "\n"
-        'YOU MAY NOT PUSH. Prepare the commit, run `"$BENCHSMITH_BIN" gate`, and stop.\n'
+        "YOU MAY NOT PUSH. Prepare the commit, run "
+        f"`\"$BENCHSMITH_BIN\" gate{target_args} --json`, and stop.\n"
+        "A ready publication also needs the exact-SHA canonical + critic receipt from a fresh "
+        "review session. Use `benchsmith publication-evidence"
+        f"{target_args}` after both receipts exist; do not "
+        "put a prose review claim in place of its returned object.\n"
         
         "Pushing is owned by the coordinator's single publish lane; a worker that "
         "pushes creates the contention this design exists to remove.\n"
         "\n"
         "Do not work on any other task, and do not read another task's files.\n\n"
         "**Finalize through the CLI; do not write the handoff file directly.** Pipe the JSON "
-        f"below to `$BENCHSMITH_BIN handoff --repo {shlex.quote(repo)} --task {shlex.quote(task)}`. "
+        f"below to `$BENCHSMITH_BIN handoff --repo {shlex.quote(repo)} --task "
+        f"{shlex.quote(task)}{target_args}`. "
         "It durably renames the handoff before releasing this worker's exact lease.\n\n"
         "```json\n"
         '{"work_item":"...","state":"ready_to_publish|awaiting_validation|blocked|needs_human|no_change|failed",'
-        '"base_sha":"...","commit_sha":"...","gate_receipt":"...","next_action":"...",'
+        '"base_sha":"...","commit_sha":"...","gate_receipt":"...",'
+        '"publication_evidence":{"schema_version":1,"candidate_sha":"...","gate":{},"reviews":{},"change":{}},'
+        '"change_evidence":{"mode":"harden|repair","levers":[],"findings":[]},'
+        '"next_action":"...",'
         '"source_base_sha":"optional old base for a carried rebase",'
         '"carried_from_sha":"optional old candidate for a carried rebase",'
         '"note":"<=200 chars","validation":"...","review":"...","evidence_url":"https://..."}\n'
@@ -361,7 +414,7 @@ def _placeholder(task: str) -> str:
 
 
 def _exists(repo: str, task: str) -> bool:
-    return (Path(repo).expanduser() / task / "task.toml").is_file()
+    return (Path(repo).expanduser() / _safe_task(task) / "task.toml").is_file()
 
 
 def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DEFAULT_HARNESS,
@@ -378,9 +431,23 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
         # A local worker already has the files. A remote one does not.
         bootstrap = backend == "agentcloud"
     mode = MODE_ALIASES.get(mode, mode)
+    task = _safe_task(task)
     bad = _placeholder(task)
     if bad:
         raise DispatchRefused(bad)
+    publication_remote = ""
+    publication_branch = ""
+    if mode != "review" and repo:
+        from . import gate as gate_mod
+
+        publication = gate_mod.resolve_publication_target(Path(repo), remote="origin")
+        if not publication.get("ok"):
+            raise DispatchRefused(
+                str(publication.get("reason") or "publication target is unreadable")
+            )
+        if publication.get("configured"):
+            publication_remote = str(publication.get("remote") or "")
+            publication_branch = str(publication.get("branch") or "")
     if mode not in {"review", "scaffold"} and repo and _exists(repo, task):
         from .passatk import capability
 
@@ -407,8 +474,16 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
                 f"{repo}/{task} already exists; scaffolding over a real task would overwrite it. "
                 "Choose a different name, or dispatch it as a task rather than an idea"
             )
-        prompt = ((bootstrap_block(checkout=repo) if bootstrap else "")
-                  + scaffold_prompt(idea, repo, task))
+        prompt = (
+            (bootstrap_block(checkout=repo) if bootstrap else "")
+            + scaffold_prompt(
+                idea,
+                repo,
+                task,
+                publication_remote=publication_remote,
+                publication_branch=publication_branch,
+            )
+        )
     elif mode == "review":
         pass  # prompt already built above
     else:
@@ -420,7 +495,15 @@ def plan(task: str, repo: str, *, backend: str = "agentcloud", harness: str = DE
                 "checkout. If it is an idea, dispatch it with mode=scaffold; if the name is "
                 "wrong, resolve the reference first"
             )
-        prompt = worker_prompt(task, repo, mode=mode, target=target, bootstrap=bootstrap)
+        prompt = worker_prompt(
+            task,
+            repo,
+            mode=mode,
+            target=target,
+            bootstrap=bootstrap,
+            publication_remote=publication_remote,
+            publication_branch=publication_branch,
+        )
     notes: list[str] = []
     if bootstrap:
         notes.append(f"worker is pinned to {HOST} and uses the installed Benchsmith checkout")
@@ -735,6 +818,7 @@ def collect(sid: str, *, repo: str = "", task: str = "", runner=None) -> dict:
     # survives a lost pipe, and reading it costs one stat instead of walking a
     # journal. Session text is the fallback, not the contract.
     if repo and task:
+        task = _safe_task(task)
         path = Path(repo).expanduser() / HANDOFF_DIR / f"{task}.json"
         try:
             doc = parse_handoff(path.read_text())
@@ -812,15 +896,22 @@ def parse_handoff(text: str) -> dict:
         doc = json.loads(text[start : end + 1])
     except json.JSONDecodeError as e:
         raise DispatchRefused(f"handoff is not valid JSON: {e}") from e
+    if doc.get("work_item") is not None:
+        try:
+            doc["work_item"] = validate_task_path(str(doc.get("work_item") or ""))
+        except ValueError as error:
+            raise DispatchRefused(str(error)) from error
     state = str(doc.get("state") or "")
     if state not in HANDOFF_STATES:
         raise DispatchRefused(f"unknown handoff state {state!r}; expected one of {sorted(HANDOFF_STATES)}")
     if state in {"ready_to_publish", "awaiting_validation"}:
-        commit_sha = str(doc.get("commit_sha") or "")
-        if not _FULL_SHA.fullmatch(commit_sha):
+        try:
+            commit_sha = validate_sha(doc.get("commit_sha"), "handoff commit_sha")
+        except ValueError as error:
             raise CandidateHandoffRefused(
-                f"state={state} requires a full commit_sha for exact-SHA handling", doc
-            )
+                f"state={state} requires a full commit_sha for exact-SHA handling: {error}", doc
+            ) from error
+        doc["commit_sha"] = commit_sha
     if state == "ready_to_publish":
         if not doc.get("base_sha"):
             raise CandidateHandoffRefused(
@@ -847,7 +938,7 @@ def _atomic_json(path: Path, document: dict) -> None:
 
 
 def assignment_path(repo: str | Path, task: str) -> Path:
-    return Path(repo) / ASSIGNMENT_DIR / f"{task}.json"
+    return Path(repo) / ASSIGNMENT_DIR / f"{_safe_task(task)}.json"
 
 
 def write_assignment(
@@ -884,7 +975,7 @@ def finalize_handoff(
     document: dict,
     *,
     remote: str = "origin",
-    branch: str = "main",
+    branch: str = "",
     lease_runner=None,
 ) -> dict:
     """Persist a terminal handoff, then release its exact lease by CAS.
@@ -894,6 +985,7 @@ def finalize_handoff(
     recoverable, and a missing lease is observed only after the handoff exists.
     """
     parsed = parse_handoff(json.dumps(document))
+    task = _safe_task(task)
     state = str(parsed.get("state") or "")
     if state == "in_progress":
         raise DispatchRefused("in_progress is not a terminal handoff")
@@ -941,11 +1033,36 @@ def finalize_handoff(
             parsed.pop(field, None)
 
     if state == "ready_to_publish":
+        from . import gate as gate_mod
+        from . import publish as publish_mod
+
+        target = gate_mod.resolve_publication_target(
+            Path(repo), remote=remote, branch=branch
+        )
+        if not target.get("ok"):
+            raise CandidateHandoffRefused(
+                str(target.get("reason") or "publication target is unreadable"), parsed
+            )
+        if target.get("configured"):
+            remote = str(target["remote"])
+            branch = str(target["branch"])
+        else:
+            # Finalization is durable local state, not a push. Repositories with
+            # no publication target retain the historical local-only path.
+            branch = "main"
         try:
             candidate_mod.verify_handoff(
                 Path(repo), task, parsed, remote=remote, branch=branch
             )
-        except candidate_mod.CandidateRejected as error:
+            publish_mod.verify_handoff_evidence(
+                Path(repo),
+                task,
+                str(parsed.get("commit_sha") or ""),
+                parsed,
+                remote=remote,
+                branch=branch,
+            )
+        except (candidate_mod.CandidateRejected, publish_mod.PublishRefused) as error:
             raise CandidateHandoffRefused(str(error), parsed) from error
 
     finalization = dict(parsed.get("finalization") or {})
